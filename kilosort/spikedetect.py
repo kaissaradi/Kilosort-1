@@ -81,7 +81,13 @@ def extract_wPCA_wTEMP(ops, bfile, nt=61, twav_min=20, Th_single_ch=6, nskip=25,
         if nthread is not None:
             new_nthread = min(int(nthread), new_nthread)
         os.environ['OMP_NUM_THREADS'] = str(new_nthread)
-        model = KMeans(n_clusters=ops['settings']['n_templates'], n_init = 10).fit(clips)
+        # Single-threaded fit: with multiple OpenMP threads the reduction order
+        # (and therefore wTEMP) varies run-to-run at float32 ulp level, which
+        # is enough to move a handful of threshold-straddling spikes and break
+        # sort reproducibility. k is tiny, so one thread costs nothing.
+        from threadpoolctl import threadpool_limits
+        with threadpool_limits(limits=1):
+            model = KMeans(n_clusters=ops['settings']['n_templates'], n_init = 10).fit(clips)
         wTEMP = torch.from_numpy(model.cluster_centers_).to(device).float()
         wTEMP = wTEMP / (wTEMP**2).sum(1).unsqueeze(1)**.5
         if nthread is not None:
@@ -276,11 +282,16 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
 
             t_shift = ibatch * bfile.batch_downsampling * (ops['batch_size']/ops['fs'])
             # Build all six columns on-device and move them in one transfer.
-            col0 = (xy[:,1].double() - nt)/ops['fs'] + t_shift
+            # The sample->seconds conversion happens on the host afterwards:
+            # GPU float64 division can differ from numpy's by 1 ulp, and spike
+            # times must stay bit-identical to the original per-column code.
+            col1 = xy[:,1].double()
             cols = torch.stack(
-                (col0, yct.double(), amp.double(), imax.double(),
-                 torch.full_like(col0, ibatch), xy[:,0].double()), dim=1)
-            st[k:k+nsp] = cols.cpu().numpy()
+                (col1, yct.double(), amp.double(), imax.double(),
+                 torch.full_like(col1, ibatch), xy[:,0].double()), dim=1)
+            cols = cols.cpu().numpy()
+            cols[:,0] = (cols[:,0] - nt)/ops['fs'] + t_shift
+            st[k:k+nsp] = cols
 
             k = k + nsp
             if clear_cache:
