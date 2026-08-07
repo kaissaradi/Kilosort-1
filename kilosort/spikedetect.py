@@ -136,6 +136,64 @@ def template_centers(ops):
     return ops
 
 
+def _template_match_body(Bsl, weigh, iC, iC2_flat, nC2, Nfilt):
+    """One time-chunk of the template_match loop: gather, project, reduce.
+
+    Factored out only so torch.compile can fuse it. The statements are the
+    stock ones in the stock order -- see the notes in template_match for why
+    the max/gather pair must not be rewritten.
+    """
+    A = torch.einsum('ijk, jklm-> iklm', weigh, Bsl[iC])
+    A = A.transpose(1,2)
+    A = A.reshape(-1, Nfilt, Bsl.shape[-1])
+    Aa, imax = torch.max(A.abs(), 0)
+    sgn = torch.gather(A, 0, imax.unsqueeze(0)).squeeze(0).sign()
+    imax = (1+imax) * sgn
+    Amax = torch.max(Aa.index_select(0, iC2_flat).view(nC2, Nfilt, -1), 0)[0]
+    return Aa, imax, Amax
+
+
+# The loop above is memory-bound, but it moves its intermediates at only
+# ~23 GB/s -- far under this card's peak. That is not a bandwidth limit, it is
+# per-op HBM round-tripping, which Inductor fusion removes: ~1.25x on
+# template_match, bit-identical to eager on an RTX A2000 (verified against the
+# full 10.2 GB benchmark, see HANDOFF.md).
+#
+# Bit-identity is a property of the generated kernels, so it is NOT guaranteed
+# on a different GPU or torch build. Set KILOSORT_NO_COMPILE=1 to force the
+# eager path; validate counts before trusting the compiled path on new hardware.
+_TM_BODY = None
+
+def _template_match_body_dispatch(*args):
+    """Compiled loop body, falling back to eager if Inductor is unusable."""
+    global _TM_BODY
+    if _TM_BODY is None:
+        if os.environ.get('KILOSORT_NO_COMPILE'):
+            _TM_BODY = _template_match_body
+        else:
+            try:
+                # coordinate_descent_tuning tiles these reductions harder. Set
+                # once, here, and NOT per call: wrapping every call in
+                # _icfg.patch() costs more than the tuning wins (40 calls per
+                # batch made the compiled path slower than eager).
+                import torch._inductor.config as _icfg
+                _icfg.coordinate_descent_tuning = True
+                # dynamic=False: the ragged last chunk gets its own graph rather
+                # than forcing a slower dynamic-shape kernel for every chunk.
+                _TM_BODY = torch.compile(_template_match_body, dynamic=False)
+            except Exception as e:
+                logger.info(f'torch.compile unavailable, using eager: {e}')
+                _TM_BODY = _template_match_body
+    try:
+        return _TM_BODY(*args)
+    except Exception as e:
+        if _TM_BODY is _template_match_body:
+            raise
+        logger.warning(f'torch.compile failed, falling back to eager: {e}')
+        _TM_BODY = _template_match_body
+        return _TM_BODY(*args)
+
+
 def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda')):
     nt = ops['nt']
     nt0 = ops['settings']['nt0min']
@@ -156,29 +214,26 @@ def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda')):
     iC2_flat = iC2.reshape(-1)
     nC2 = iC2.shape[0]
 
+    # NOTE on the body: do not replace its max/gather pair with a max/min pair.
+    # That rewrite is 1.46x faster on that statement but resolves exact
+    # positive/negative magnitude ties (dense at the zero-padded batch edges)
+    # toward the positive branch, where torch.max resolves toward whichever
+    # index it reaches first. It passed a 12-batch bit-identity self-test and a
+    # 60 s end-to-end run, then changed the full-file result: +567 spikes,
+    # -25 good units, -3.2% clean yield. The gather is bit-identical by
+    # construction: it reads the same one element per output position as the
+    # stock three-way advanced index.
+    #
+    # Storing Aa/imax/Amax from inside the compiled region was tried and is
+    # slower (1.16x vs 1.25x) -- the copy_ into strided views costs more than
+    # the round-trip it saves.
     for t in range(niter):
-        A = torch.einsum('ijk, jklm-> iklm', weigh, B[iC,:, nb*t:nb*(t+1)])
-        A = A.transpose(1,2)
-        A = A.reshape(-1, Nfilt, A.shape[-1])
-        w = A.shape[-1]
-
-        # NOTE: do not replace this with a max/min pair. That rewrite is 1.46x
-        # faster on this statement but resolves exact positive/negative
-        # magnitude ties (dense at the zero-padded batch edges) toward the
-        # positive branch, where torch.max resolves toward whichever index it
-        # reaches first. It passed a 12-batch bit-identity self-test and a 60 s
-        # end-to-end run, then changed the full-file result: +567 spikes,
-        # -25 good units, -3.2% clean yield.
-        Aa, imax = torch.max(A.abs(), 0)
-        # gather reads the same one element per output position as the stock
-        # three-way advanced index, so this is bit-identical by construction.
-        sgn = torch.gather(A, 0, imax.unsqueeze(0)).squeeze(0).sign()
-        imax = (1+imax) * sgn
-
-        As[:, nb*t:nb*(t+1)] = Aa
-        imaxs[:, nb*t:nb*(t+1)] = imax
-        Amax = torch.max(Aa.index_select(0, iC2_flat).view(nC2, Nfilt, w), 0)[0]
-        Amaxs[:, nb*t:nb*(t+1)] = Amax
+        lo, hi = nb*t, min(nb*(t+1), NT)
+        Aa, imax, Amax = _template_match_body_dispatch(
+            B[:, :, lo:hi], weigh, iC, iC2_flat, nC2, Nfilt)
+        As[:, lo:hi] = Aa
+        imaxs[:, lo:hi] = imax
+        Amaxs[:, lo:hi] = Amax
 
     Amaxs[:,:nt] = 0
     Amaxs[:,-nt:] = 0
