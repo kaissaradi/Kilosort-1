@@ -150,21 +150,34 @@ def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda')):
     As    = torch.zeros((Nfilt, NT), device=device)
     Amaxs = torch.zeros((Nfilt, NT), device=device)
     imaxs = torch.zeros((Nfilt, NT), dtype = torch.int64, device=device)
-    ti = torch.arange(Nfilt, device = device)
-    tj = torch.arange(nb, device = device)
+    # iC2 is (nC2, Nfilt); flattening it lets the neighbour max below use
+    # index_select, which reaches the same elements on a faster path than
+    # advanced indexing.
+    iC2_flat = iC2.reshape(-1)
+    nC2 = iC2.shape[0]
 
     for t in range(niter):
-        A = torch.einsum('ijk, jklm-> iklm', weigh, B[iC,:, nb*t:nb*(t+1)])        
+        A = torch.einsum('ijk, jklm-> iklm', weigh, B[iC,:, nb*t:nb*(t+1)])
         A = A.transpose(1,2)
         A = A.reshape(-1, Nfilt, A.shape[-1])
-        
-        #Aa, imax = torch.max(A, 0) 
+        w = A.shape[-1]
+
+        # NOTE: do not replace this with a max/min pair. That rewrite is 1.46x
+        # faster on this statement but resolves exact positive/negative
+        # magnitude ties (dense at the zero-padded batch edges) toward the
+        # positive branch, where torch.max resolves toward whichever index it
+        # reaches first. It passed a 12-batch bit-identity self-test and a 60 s
+        # end-to-end run, then changed the full-file result: +567 spikes,
+        # -25 good units, -3.2% clean yield.
         Aa, imax = torch.max(A.abs(), 0)
-        imax = (1+imax) * A[imax, ti.unsqueeze(-1), tj[:A.shape[-1]]].sign()
+        # gather reads the same one element per output position as the stock
+        # three-way advanced index, so this is bit-identical by construction.
+        sgn = torch.gather(A, 0, imax.unsqueeze(0)).squeeze(0).sign()
+        imax = (1+imax) * sgn
 
         As[:, nb*t:nb*(t+1)] = Aa
         imaxs[:, nb*t:nb*(t+1)] = imax
-        Amax = torch.max(Aa[iC2], 0)[0]
+        Amax = torch.max(Aa.index_select(0, iC2_flat).view(nC2, Nfilt, w), 0)[0]
         Amaxs[:, nb*t:nb*(t+1)] = Amax
 
     Amaxs[:,:nt] = 0
