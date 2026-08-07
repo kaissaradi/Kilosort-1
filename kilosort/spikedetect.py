@@ -253,12 +253,15 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
                 mininterval=60 if progress_bar else None)
     # repeat performance log after every 10 minutes of data
     log_skip = int(600 / (ops['batch_size'] / ops['fs']))
+    # Prefetch: a worker thread reads batch i+1 from disk while batch i runs
+    # on the GPU. Yields exactly what padded_batch_to_torch(i, ops) returns.
+    batches = bfile.iter_batches(ops)
     try:
         for ibatch in prog:
             if ibatch % log_skip == 0:
                 log_performance(logger, 'debug', f'Batch {ibatch} of {nb-1} ({100*(ibatch/nb):.1f}%)')
 
-            X = bfile.padded_batch_to_torch(ibatch, ops)
+            X = next(batches)
             xy, imax, amp, adist = template_match(X, ops, iC, iC2, weigh, device=device)
             yct = yweighted(yc, iC, adist, xy, device=device)
             nsp = len(xy)
@@ -272,12 +275,12 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
             tF[k:k+nsp] = xfeat.transpose(0,1).cpu().numpy()
 
             t_shift = ibatch * bfile.batch_downsampling * (ops['batch_size']/ops['fs'])
-            st[k:k+nsp,0] = ((xy[:,1].cpu().numpy()-nt)/ops['fs'] + t_shift)
-            st[k:k+nsp,1] = yct.cpu().numpy()
-            st[k:k+nsp,2] = amp.cpu().numpy()
-            st[k:k+nsp,3] = imax.cpu().numpy()
-            st[k:k+nsp,4] = ibatch
-            st[k:k+nsp,5] = xy[:,0].cpu().numpy()
+            # Build all six columns on-device and move them in one transfer.
+            col0 = (xy[:,1].double() - nt)/ops['fs'] + t_shift
+            cols = torch.stack(
+                (col0, yct.double(), amp.double(), imax.double(),
+                 torch.full_like(col0, ibatch), xy[:,0].double()), dim=1)
+            st[k:k+nsp] = cols.cpu().numpy()
 
             k = k + nsp
             if clear_cache:

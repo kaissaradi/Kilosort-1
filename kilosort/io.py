@@ -786,8 +786,14 @@ class BinaryRWFile:
         self.batch_downsampling = downsampling
         self.n_batches = np.int64(self.n_batches_raw / self.batch_downsampling)
 
-    def padded_batch_to_torch(self, ibatch, return_inds=False):
-        """ read batches from file """
+    def _read_padded_raw(self, ibatch):
+        """Disk/numpy half of `padded_batch_to_torch`.
+
+        Contains no torch or CUDA calls, so it is safe to run in a background
+        thread (see `iter_batches`). Returns the contiguous (n_chan, nsamp)
+        array along with the scaled batch index and batch edges, to be passed
+        to `_padded_to_torch`.
+        """
         ibatch *= self.batch_downsampling
         bstart, bend = self._get_batch_edges(ibatch)
         data = self.file[bstart : bend]
@@ -804,6 +810,19 @@ class BinaryRWFile:
         if self.shift is not None:
             data = data + self.shift
 
+        # Force the memmap pages to be read (and the transpose materialised)
+        # here rather than lazily inside the device transfer, so that a
+        # prefetching thread absorbs the disk wait instead of the GPU loop.
+        data = np.ascontiguousarray(data)
+
+        return data, ibatch, bstart, bend
+
+    def _padded_to_torch(self, data, ibatch, bstart, bend):
+        """Device half of `padded_batch_to_torch`.
+
+        `ibatch` must already be scaled by batch_downsampling, as returned by
+        `_read_padded_raw`.
+        """
         nsamp = data.shape[-1]
         X = torch.zeros((self.n_chan_bin, self.NT + 2*self.nt), device=self.device)
 
@@ -824,7 +843,39 @@ class BinaryRWFile:
             else:
                 X[:] = torch.from_numpy(data).to(self.device).float()
 
-        inds = [bstart, bend]
+        return X, [bstart, bend]
+
+    def _filtered_from_raw(self, raw, ops=None, ibatch=None, skip_preproc=False):
+        """Turn a `_read_padded_raw` result into the final batch tensor.
+
+        Overridden by BinaryFiltered to also apply preprocessing; here the
+        extra arguments are accepted for interface compatibility.
+        """
+        X, _ = self._padded_to_torch(*raw)
+        return X
+
+    def iter_batches(self, ops=None, skip_preproc=False):
+        """Yield `padded_batch_to_torch(i, ...)` for every batch, prefetched.
+
+        A single worker thread reads batch i+1 from disk (numpy/memmap only,
+        no CUDA) while the caller works on batch i, overlapping disk latency
+        with GPU compute. Results are identical to calling
+        `padded_batch_to_torch` sequentially.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        n_batches = int(self.n_batches)
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(self._read_padded_raw, 0)
+            for ibatch in range(n_batches):
+                raw = future.result()
+                if ibatch + 1 < n_batches:
+                    future = executor.submit(self._read_padded_raw, ibatch + 1)
+                yield self._filtered_from_raw(raw, ops, ibatch, skip_preproc)
+
+    def padded_batch_to_torch(self, ibatch, return_inds=False):
+        """ read batches from file """
+        X, inds = self._padded_to_torch(*self._read_padded_raw(ibatch))
         if return_inds:
             return X, inds
         else:
@@ -1034,6 +1085,12 @@ class BinaryFiltered(BinaryRWFile):
             X = torch.from_numpy(samples.T).to(self.device).float()
         return self.filter(X)
         
+    def _filtered_from_raw(self, raw, ops=None, ibatch=None, skip_preproc=False):
+        # `ibatch` here is the caller's unscaled batch index, matching what
+        # padded_batch_to_torch passes to filter() (used for drift lookup).
+        X, _ = self._padded_to_torch(*raw)
+        return self.filter(X, ops, ibatch, skip_preproc=skip_preproc)
+
     def padded_batch_to_torch(self, ibatch, ops=None, return_inds=False,
                               skip_preproc=False):
         if return_inds:

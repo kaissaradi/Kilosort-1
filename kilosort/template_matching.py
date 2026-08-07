@@ -75,12 +75,15 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
         mininterval=60 if progress_bar else None
         )
     
+    # Prefetch: a worker thread reads batch i+1 from disk while batch i runs
+    # on the GPU. Yields exactly what padded_batch_to_torch(i, ops) returns.
+    batches = bfile.iter_batches(ops)
     try:
         for ibatch in prog:
             if ibatch % 100 == 0:
                 log_performance(logger, 'debug', f'Batch {ibatch}')
 
-            X = bfile.padded_batch_to_torch(ibatch, ops)
+            X = next(batches)
             stt, amps, th_amps, Xres = run_matching(ops, X, U, ctc, device=device)
             xfeat = Xres[iCC[:, iU[stt[:,1:2]]],stt[:,:1] + tiwave] @ ops['wPCA'].T
             xfeat += amps * Ucc[:,stt[:,1]]
