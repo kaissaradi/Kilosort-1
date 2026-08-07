@@ -54,8 +54,11 @@ def check_CCG(st1, st2=None, nbins = 500, tbin  = 1/1000):
     if st2 is None:
         st2 = st1.copy()
     K , T = compute_CCG(st1, st2, nbins = nbins, tbin = tbin)
-    if len(st1) == 0 or len(st2 == 0) or T == 0:
-        return False, False
+    # NOTE: upstream 4.1.3+ added an empty/zero guard here, but it was written
+    # as `len(st2 == 0)` (len of a bool array -- always truthy for non-empty
+    # st2), which makes check_CCG unconditionally return (False, False) and
+    # silently disables refractoriness checks. Removed to keep the validated
+    # 4.1.2 behavior; see mea-optimizations pin commit.
     R12, Q12, Q00 = CCG_metrics(st1, st2, K, T,  nbins = nbins, tbin = tbin)
     is_refractory    = R12<.1  and (Q12<.2  or Q00<.25)
     cross_refractory = R12<.25 and (Q12<.05 or Q00<.25)

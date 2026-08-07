@@ -651,7 +651,7 @@ class BinaryRWFile:
         a, b = self._get_batch_edges(self.n_batches_raw-1)
         batch_size = b - a - self.nt
         if batch_size < self.nt:
-            self.n_batches_raw -= 1
+            self.n_batches -= 1  # 4.1.2-compat: see mea-optimizations pin commit
             self.imax -= batch_size
 
         self.set_downsampling(batch_downsampling)
@@ -797,7 +797,6 @@ class BinaryRWFile:
         ibatch *= self.batch_downsampling
         bstart, bend = self._get_batch_edges(ibatch)
         data = self.file[bstart : bend]
-        data = data.T
 
         if self.dtype == 'uint16':
             # Shift data to +/- 2**15
@@ -810,10 +809,13 @@ class BinaryRWFile:
         if self.shift is not None:
             data = data + self.shift
 
-        # Force the memmap pages to be read (and the transpose materialised)
-        # here rather than lazily inside the device transfer, so that a
+        # Force the memmap pages to be read here, in file order (sequential
+        # copy), rather than lazily inside the device transfer, so that a
         # prefetching thread absorbs the disk wait instead of the GPU loop.
+        # The transpose stays a view: torch's multithreaded copy handles it
+        # during the device transfer, exactly as before.
         data = np.ascontiguousarray(data)
+        data = data.T
 
         return data, ibatch, bstart, bend
 
