@@ -17,6 +17,47 @@ from kilosort.utils import log_performance
 logger = logging.getLogger(__name__)
 
 
+# Query rows per chunk for the GPU kNN. Bounds the (KNN_CHUNK x n_nodes)
+# distance block: n_nodes is capped by max_sub=25000, so at 4096 this is
+# ~410 MB peak extra device memory.
+KNN_CHUNK = 4096
+
+
+def _knn_gpu(Xd, Xsub, n_neigh, device):
+    """Exact brute-force kNN, ranked the way faiss.IndexFlatL2 ranks.
+
+    faiss ranks by -2<x,y> + ||y||^2, dropping the per-row-constant ||x||^2
+    because it cannot change the ordering. We compute the same expression in
+    the same float32 precision, so rounding behaviour on near-duplicate spikes
+    is comparable rather than merely "close". Tie-breaking between exactly
+    equidistant neighbors is not guaranteed identical to faiss (both answers
+    are correct kNN); validated empirically on full-length sorts.
+
+    Returns kn as int64 (n_samples, n_neigh), indices into Xsub, nearest first.
+    """
+    # On Ampere, float32 matmul may silently run in TF32 (10-bit mantissa).
+    # That is a real loss of precision in the distances and would change which
+    # neighbors are selected for spikes that sit close together. Force true
+    # fp32 for the duration.
+    prev_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        q = torch.from_numpy(Xd).to(device)
+        b = torch.from_numpy(Xsub).to(device)
+        bsq = (b * b).sum(1)
+
+        out = torch.empty((q.shape[0], n_neigh), dtype=torch.int64, device=device)
+        for i in range(0, q.shape[0], KNN_CHUNK):
+            blk = q[i:i + KNN_CHUNK]
+            score = blk @ b.T
+            score.mul_(2.0).sub_(bsq)
+            out[i:i + KNN_CHUNK] = torch.topk(score, n_neigh, dim=1,
+                                              largest=True, sorted=True).indices
+        return out.cpu().numpy()
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = prev_tf32
+
+
 def neigh_mat(Xd, nskip=1, n_neigh=10, max_sub=25000):
     # Xd is spikes by PCA features in a local neighborhood
     # finding n_neigh neighbors of each spike to a subset of every nskip spike
@@ -44,11 +85,13 @@ def neigh_mat(Xd, nskip=1, n_neigh=10, max_sub=25000):
     Xsub = np.ascontiguousarray(Xsub)
 
     # exact neighbor search ("brute force")
-    # results is dn and kn
     # kn is n_spikes by n_neigh, contains integer indices into Xsub
-    index = faiss.IndexFlatL2(dim)   # build the index
-    index.add(Xsub)    # add vectors to the index
-    _, kn = index.search(Xd, n_neigh)     # actual search
+    if torch.cuda.is_available():
+        kn = _knn_gpu(Xd, Xsub, n_neigh, torch.device('cuda'))
+    else:
+        index = faiss.IndexFlatL2(dim)   # build the index
+        index.add(Xsub)    # add vectors to the index
+        _, kn = index.search(Xd, n_neigh)     # actual search
 
     # create sparse matrix version of kn with ones where the neighbors are
     # M is n_samples by n_nodes, adjacency matrix
@@ -118,10 +161,39 @@ def Mstats(M, device=torch.device('cuda')):
     return m, ki, kj
 
 
+# Convergence is tested every this many iterations in cluster(). The test
+# needs a GPU->CPU sync (~50 us), so it is amortized rather than run every
+# iteration; the loop typically converges long before the 200-iter budget.
+CHECK_EVERY = 5
+
+
+def _counts_into(buf, idx_flat, ones, pen_row, pen_col, scale):
+    """buf[r, c] = count of (r, c) in idx_flat, minus scale * pen_row[r] * pen_col[c].
+
+    Mirrors `coo(...).to_dense() - scale * (pen_row.unsqueeze(-1) * pen_col)`
+    exactly, but writes the penalty into the reused buffer and accumulates the
+    counts on top of it instead of allocating intermediates. (-scale)*x ==
+    -(scale*x) in IEEE, so folding the sign in is exact.
+    """
+    if pen_row is None:
+        buf.zero_()
+    else:
+        torch.mul(pen_row.unsqueeze(-1), pen_col, out=buf)
+        buf.mul_(-scale)
+    buf.view(-1).scatter_add_(0, idx_flat, ones)
+    return buf
+
+
 def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
             nclust=200, seed=1, niter=200, lam=0, device=torch.device('cuda'),
-            verbose=False):    
-
+            verbose=False):
+    # Numerically exact rewrite of the alternating-assignment loop:
+    # scatter_add_ into two preallocated float64 buffers replaces the per-call
+    # COO build/coalesce/densify (float64 matches the promotion stock gets
+    # from ki/kj being numpy doubles, so results are bit-identical), and the
+    # loop exits early once iclust reaches a fixed point -- the map
+    # iclust -> isub -> iclust is deterministic, so every later iteration is
+    # a no-op.
     if kn is None:
         # kn: n_spikes by n_neigh with integer indices into the spike subset
         #     used for neighbor-finding determined by nskip.
@@ -139,45 +211,65 @@ def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
     n_spikes, n_neigh = kn.shape
     nsub = M.shape[1]  # number of spikes in neighbor-finding subset
 
-    # rows_neigh, tones2 are just used to build properly formatted indices for
-    # use by assign_isub and assign_iclust
-    rows_neigh = torch.arange(n_spikes, device=device).unsqueeze(-1).tile((1,n_neigh))
-    tones2 = torch.ones((n_spikes, n_neigh), device=device)
-
-    if verbose:
-        logger.debug(f'Xg: {Xg.nbytes / (2**20):.2f} MB, shape: {Xg.shape}')
-        logger.debug(f'kn: {kn.nbytes / (2**20):.2f} MB, shape: {kn.shape}')
-        logger.debug(f'rows_neigh: {rows_neigh.nbytes / (2**20):.2f} MB')
-        logger.debug(f'tones2: {tones2.nbytes / (2**20):.2f} MB')
-        log_performance(logger, header='clustering_qr.cluster, after var init')
-
     if iclust is None:
-        iclust_init =  kmeans_plusplus(Xg, niter=nclust, seed=seed, 
+        iclust_init =  kmeans_plusplus(Xg, niter=nclust, seed=seed,
                                        device=device, verbose=verbose)
         iclust = iclust_init.clone()
     else:
         iclust_init = iclust.clone()
-        
+
+    # Reused across all 2*niter assignments.
+    bufS = torch.empty((nsub, nclust), dtype=torch.float64, device=device)
+    bufN = torch.empty((n_spikes, nclust), dtype=torch.float64, device=device)
+    ones_e = torch.ones(n_spikes * n_neigh, dtype=torch.float64, device=device)
+    rows_off = torch.arange(n_spikes, device=device).unsqueeze(-1) * nclust
+
+    scale = lam / m
+    prev = None
+    # The exit test compares iclust against its value CHECK_EVERY iterations
+    # earlier, which detects any cycle of period p dividing CHECK_EVERY. That
+    # is exact as long as CHECK_EVERY divides niter: the sequence is periodic
+    # from the detection point on, and p divides the remaining iterations, so
+    # the value stock would land on at index niter is the one we already have.
+    can_exit = (niter % CHECK_EVERY == 0)
+
     for t in range(niter):
-        # given iclust, reassign isub
-        isub = assign_isub(iclust, kn, tones2, nclust, nsub, lam, m,
-                           ki, kj,device=device)
-        # given mu and isub, reassign iclust
-        iclust = assign_iclust(rows_neigh, isub, kn, tones2, nclust, lam, m,
-                               ki, kj, device=device)
-        
+        # given iclust, reassign isub (rows are subset nodes, cols clusters)
+        idxS = (kn * nclust + iclust.unsqueeze(-1)).flatten()
+        kN = torch.bincount(iclust, minlength=nclust).double() if lam > 0 else None
+        _counts_into(bufS, idxS, ones_e,
+                     kj if lam > 0 else None, kN, scale)
+        isub = torch.argmax(bufS, 1)
+
+        # given isub, reassign iclust (rows are spikes, cols clusters)
+        idxN = (rows_off + isub[kn]).flatten()
+        kN = torch.bincount(isub, minlength=nclust).double() if lam > 0 else None
+        _counts_into(bufN, idxN, ones_e,
+                     ki if lam > 0 else None, kN, scale)
+        iclust = torch.argmax(bufN, 1)
+
+        if can_exit and (t + 1) % CHECK_EVERY == 0:
+            if prev is not None and torch.equal(prev, iclust):
+                break
+            prev = iclust.clone()
+
     if verbose:
         logger.debug(f'isub: {isub.nbytes / (2**20):.2f} MB, shape: {isub.shape}')
         log_performance(logger, header='clustering_qr.cluster, after isub loop')
-    
-    _, iclust = torch.unique(iclust, return_inverse=True)    
-    nclust = iclust.max() + 1
-    isub = assign_isub(iclust, kn, tones2, nclust , nsub, lam, m,ki,kj, device=device)
 
-    iclust = iclust.cpu().numpy()
-    isub = isub.cpu().numpy()
+    del bufN
+    _, iclust = torch.unique(iclust, return_inverse=True)
+    nclust = int(iclust.max()) + 1
 
-    return iclust, isub, M, iclust_init
+    # Final isub at the reduced cluster count, same as stock's trailing call.
+    bufS = bufS[:, :nclust].contiguous()
+    idxS = (kn * nclust + iclust.unsqueeze(-1)).flatten()
+    kN = torch.bincount(iclust, minlength=nclust).double() if lam > 0 else None
+    _counts_into(bufS, idxS, ones_e,
+                 kj if lam > 0 else None, kN, scale)
+    isub = torch.argmax(bufS, 1)
+
+    return iclust.cpu().numpy(), isub.cpu().numpy(), M, iclust_init
 
 
 def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'), verbose=False):
