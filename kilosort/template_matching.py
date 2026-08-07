@@ -100,11 +100,12 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
                 tF  = torch.cat((tF,  torch.zeros_like(tF)), 0)
 
             t_shift = ibatch * bfile.batch_downsampling * (ops['batch_size'])
-            stt = stt.double()
-            st[k:k+nsp,0] = ((stt[:,0]-nt) + t_shift).cpu().numpy() - nt//2 + ops['nt0min']
-            st[k:k+nsp,1] = stt[:,1].cpu().numpy()
-            st[k:k+nsp,2] = th_amps.cpu().numpy().squeeze()
-            
+            # Build all three columns on-device and move them in one transfer.
+            col0 = (stt[:,0].double() - nt) + t_shift - nt//2 + ops['nt0min']
+            col1 = stt[:,1].double()
+            col2 = th_amps.squeeze(-1).double()
+            st[k:k+nsp] = torch.stack((col0, col1, col2), dim=1).cpu().numpy()
+
             tF[k:k+nsp]  = xfeat.transpose(0,1).cpu()
 
             k+= nsp
@@ -155,33 +156,44 @@ def postprocess_templates(Wall, ops, clu, st, tF, device=torch.device('cuda')):
 def prepare_matching(ops, U):
     nt = ops['nt']
     W = ops['wPCA'].contiguous()
-    WtW = conv1d(W.reshape(-1, 1,nt), W.reshape(-1, 1 ,nt), padding = nt) 
+    WtW = conv1d(W.reshape(-1, 1,nt), W.reshape(-1, 1 ,nt), padding = nt)
     WtW = torch.flip(WtW, [2,])
-
-    #mu = (U**2).sum(-1).sum(-1)**.5
-    #U2 = U / mu.unsqueeze(-1).unsqueeze(-1)
 
     UtU = torch.einsum('ikl, jml -> ijkm',  U, U)
     ctc = torch.einsum('ijkm, kml -> ijl', UtU, WtW)
+
+    # Pre-scale by s_i = nm_i**-0.5 along the row axis so run_matching can work
+    # on a scaled projection B and skip the per-peel division by nm (ctc is
+    # indexed [:, iY, :] and subtracted from the scaled B).
+    nm = (U**2).sum(-1).sum(-1)
+    s = nm.clamp_min(1e-30).rsqrt()
+    ctc = ctc * s.view(-1, 1, 1)
 
     return ctc
 
 
 def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
+    # `ctc` must come from prepare_matching, which pre-scales it by
+    # s_i = nm_i**-0.5. The 1/sqrt(nm) normalisation is folded into the
+    # templates (U -> U*s) so the projection B comes out already scaled:
+    # relu(B_i)**2/nm_i == relu(B_i*s_i)**2, and because relu and squaring are
+    # monotonic on the reduced axis the max over units commutes with both.
+    # The peel loop therefore reduces B directly and applies relu/square on
+    # the (NT,) result instead of materialising a (n_units, NT) tensor.
     Th = ops['Th_learned']
     nt = ops['nt']
     max_peels = ops['max_peels']
     W = ops['wPCA'].contiguous()
 
     nm = (U**2).sum(-1).sum(-1)
-    #mu = nm**.5 
-    #U2 = U / mu.unsqueeze(-1).unsqueeze(-1)
+    s = nm.clamp_min(1e-30).rsqrt()
 
+    Us = U * s.view(-1, 1, 1)
     B = conv1d(X.unsqueeze(1), W.unsqueeze(1), padding=nt//2)
-    B = torch.einsum('ijk, kjl -> il', U, B)
+    B = torch.einsum('ijk, kjl -> il', Us, B)
 
-    trange = torch.arange(-nt, nt+1, device=device) 
-    tiwave = torch.arange(-(nt//2), nt//2+1, device=device) 
+    trange = torch.arange(-nt, nt+1, device=device)
+    tiwave = torch.arange(-(nt//2), nt//2+1, device=device)
 
     st = torch.zeros((100000,2), dtype = torch.int64, device = device)
     amps = torch.zeros((100000,1), dtype = torch.float, device = device)
@@ -189,48 +201,37 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
     k = 0
 
     Xres = X.clone()
-    lam = 20
 
     for t in range(max_peels):
-        # Cf = 2 * B - nm.unsqueeze(-1) 
-        # Cf is shape (n_units, n_times)
-        Cf = torch.relu(B)**2 /nm.unsqueeze(-1)
-        #a = 1 + lam
-        #b = torch.relu(B) + lam * mu.unsqueeze(-1)
-        #Cf = b**2 / a - lam * mu.unsqueeze(-1)**2
+        # Reduce first, then apply relu/square on the (NT,) result.
+        Cfmax, imax = torch.max(B, 0)
+        Cfmax = torch.relu(Cfmax)
+        Cfmax = Cfmax * Cfmax
+        Cfmax[:nt] = 0
+        Cfmax[-nt:] = 0
 
-        Cf[:, :nt] = 0
-        Cf[:, -nt:] = 0
+        Cmax = max_pool1d(Cfmax.view(1, 1, -1), (2*nt+1), stride=1, padding=(nt))
+        cmax = Cmax[0, 0]
 
-        Cfmax, imax = torch.max(Cf, 0)
-        Cmax  = max_pool1d(Cfmax.unsqueeze(0).unsqueeze(0), (2*nt+1), stride=1, padding=(nt))
+        cnd1 = cmax > Th**2
+        cnd2 = torch.abs(cmax - Cfmax) < 1e-9
+        xs = torch.nonzero(cnd1 & cnd2)
 
-        #print(Cfmax.shape)
-        #import pdb; pdb.set_trace()
-        cnd1 = Cmax[0,0] > Th**2
-        cnd2 = torch.abs(Cmax[0,0] - Cfmax) < 1e-9
-        xs = torch.nonzero(cnd1 * cnd2)
-
-        
         if len(xs)==0:
-            #print('iter %d'%t)
             break
 
         iX = xs[:,:1]
         iY = imax[iX]
 
-        #isort = torch.sort(iX)
-
         nsp = len(iX)
         st[k:k+nsp, 0] = iX[:,0]
         st[k:k+nsp, 1] = iY[:,0]
-        amps[k:k+nsp] = B[iY,iX] / nm[iY]
+        # B is scaled by s, so B_stock[iY,iX]/nm[iY] == B[iY,iX]*s[iY].
+        amps[k:k+nsp] = B[iY,iX] * s[iY]
         amp = amps[k:k+nsp]
-        th_amps[k:k+nsp] = Cmax[0, 0, iX[:,0], None]**.5
+        th_amps[k:k+nsp] = cmax[iX[:,0], None]**.5
 
         k+= nsp
-
-        #amp = B[iY,iX] 
 
         n = 2
         for j in range(n):
