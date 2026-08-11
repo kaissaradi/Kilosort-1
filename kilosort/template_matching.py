@@ -113,6 +113,12 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None,
             stt, amps, th_amps, Xres = run_matching(
                 ops, X, U, ctc, device=device, unit_cache=match_cache
             )
+            nsp = len(stt)
+            if nsp == 0:
+                if progress_bar is not None:
+                    progress_bar.emit(int((ibatch+1) / bfile.n_batches * 100))
+                continue
+
             xfeat = Xres[iCC[:, iU[stt[:,1:2]]],stt[:,:1] + tiwave] @ ops['wPCA'].T
             xfeat += amps * Ucc[:,stt[:,1]]
 
@@ -124,8 +130,12 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None,
                 xfeat = xfeat[:,~neg_spikes,:]
                 amps = amps[~neg_spikes,:]
                 th_amps = th_amps[~neg_spikes,:]
+                nsp = len(stt)
+                if nsp == 0:
+                    if progress_bar is not None:
+                        progress_bar.emit(int((ibatch+1) / bfile.n_batches * 100))
+                    continue
 
-            nsp = len(stt) 
             if k+nsp>st.shape[0]:
                 # Double capacity: copy only the live prefix, not a full zeros_like.
                 new_cap = max(k + nsp, st.shape[0] * 2)
@@ -177,9 +187,12 @@ def align_U(U, ops, device=torch.device('cuda')):
     Xmax = X.abs().max(0)[0].max(0)[0].reshape(-1, ops['nt'])
     imax = torch.argmax(Xmax, 1)
 
-    Unew = Uex.clone() 
-    for j in range(ops['nt']):
-        ix = imax==j
+    Unew = Uex.clone()
+    # Only roll unique lag bins that actually appear (nt loop was wasteful when
+    # few templates share lags; results identical).
+    for j in torch.unique(imax).tolist():
+        j = int(j)
+        ix = imax == j
         Unew[ix] = torch.roll(Unew[ix], ops['nt']//2 - j, -2)
     Unew = torch.einsum('xty, zt -> xzy', Unew, ops['wPCA'])#.transpose(1,2).cpu()
     return Unew, imax

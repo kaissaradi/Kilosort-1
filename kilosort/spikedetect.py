@@ -457,8 +457,17 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
             xy, imax, amp, adist = template_match(
                 X, ops, iC, iC2, weigh, device=device, scratch=tm_scratch
             )
-            yct = yweighted(yc, iC, adist, xy, device=device, yc_t=yc_t)
             nsp = len(xy)
+            if nsp == 0:
+                if clear_cache:
+                    gc.collect()
+                    if device.type == 'cuda' and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                if progress_bar is not None:
+                    progress_bar.emit(int((ibatch+1) / bfile.n_batches * 100))
+                continue
+
+            yct = yweighted(yc, iC, adist, xy, device=device, yc_t=yc_t)
 
             if k+nsp>st.shape[0]:
                 new_cap = max(k + nsp, st.shape[0] * 2)

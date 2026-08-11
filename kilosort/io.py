@@ -889,6 +889,8 @@ class BinaryRWFile:
         from concurrent.futures import ThreadPoolExecutor
 
         n_batches = int(self.n_batches)
+        if n_batches <= 0:
+            return
         with ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(self._read_padded_raw, 0)
             for ibatch in range(n_batches):
