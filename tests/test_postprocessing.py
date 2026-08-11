@@ -291,6 +291,39 @@ def test_make_pc_features_permutes_dims_for_phy():
     assert ind.shape == (4, nearest_chans)
 
 
+def test_make_pc_features_narrow_neighborhood_no_index_error(monkeypatch):
+    """When get_data_cpu returns fewer channels than nearest_chans, do not crash."""
+    n_templates, nearest_chans, n_pcs = 4, 8, 3
+    n_spikes, n_clusters = 40, 3
+    ops = _synthetic_ops_pc_features(
+        n_channels=20, n_templates=n_templates, nearest_chans=nearest_chans, seed=41,
+    )
+    spike_templates, spike_clusters, tF = _synthetic_spikes_pc_features(
+        n_templates, nearest_chans, n_pcs, n_spikes, n_clusters, seed=42,
+        multi_template_clusters=False,
+    )
+
+    def fake_get_data_cpu(*args, **kwargs):
+        # Only 3 local channels ( < nearest_chans=8 )
+        n_local = 3
+        n_sp = tF.shape[0]
+        Xd = torch.randn(n_sp, n_local, n_pcs)
+        igood = torch.arange(n_sp)
+        ichan = torch.arange(n_local)
+        return Xd, igood, ichan
+
+    monkeypatch.setattr(
+        'kilosort.postprocessing.get_data_cpu', fake_get_data_cpu
+    )
+    out, ind = make_pc_features(
+        ops, spike_templates, spike_clusters, tF.clone()
+    )
+    assert out.shape == (n_spikes, n_pcs, nearest_chans)
+    assert ind.shape[1] == nearest_chans
+    # Unused slots padded with 0
+    assert (ind[:, 3:] == 0).all()
+
+
 def test_compute_spike_positions_finite_when_weights_zero():
     """All-zero feature norms / masks must not emit NaN positions."""
     n_spikes, n_near, n_pcs = 5, 4, 3

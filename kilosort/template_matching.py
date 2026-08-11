@@ -297,11 +297,23 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=None):
 def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=True,
                      device=torch.device('cuda')):
     clu2 = clu.copy()
-    clu_unq, ns = np.unique(clu2, return_counts = True)
 
     Ww = Wall.to(device)
     NN = len(Ww)
 
+    # Dense spike counts indexed by cluster label 0..NN-1. Historical code used
+    # `unique(..., return_counts)` and then `ns[kk]` with kk=label, which only
+    # works when labels are exactly 0..K-1 dense with no empty Wall rows. Empty
+    # templates (gaps) made `while t<NN: clu_unq[isort[t]]` IndexError once t
+    # passed len(unique). bincount is identical for dense full label sets and
+    # safe with gaps / empty Wall rows.
+    clu2_i = clu2.astype(np.int64, copy=False)
+    if clu2_i.size and (clu2_i.min() < 0 or clu2_i.max() >= NN):
+        raise ValueError(
+            f'merging_function: cluster labels must be in [0, {NN}), '
+            f'got min={int(clu2_i.min())} max={int(clu2_i.max())}'
+        )
+    ns = np.bincount(clu2_i, minlength=NN).astype(np.float64, copy=False)
     isort = np.argsort(ns)[::-1]
 
     is_merged = np.zeros(NN, 'bool')
@@ -313,6 +325,12 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
         is_ref, est_contam_rate = CCG.refract(clu, st[:,0]/ops['fs'],
                                               acg_threshold=acg_threshold,
                                               ccg_threshold=ccg_threshold)
+        # refract returns length max(label)+1; pad/truncate to NN for empty tails
+        if len(is_ref) < NN:
+            pad = np.zeros(NN - len(is_ref), dtype=is_ref.dtype)
+            is_ref = np.concatenate([is_ref, pad])
+        else:
+            is_ref = is_ref[:NN]
 
     nt = ops['nt']
     W = ops['wPCA'].contiguous()
@@ -336,7 +354,10 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
         #if t%100==0:
             #print(t, nmerge)
 
-        kk = clu_unq[isort[t]]
+        kk = int(isort[t])
+        # Empty Wall rows / unused labels sit at the end of isort (count 0).
+        if ns[kk] == 0:
+            break
 
         if (mode == 'ccg') and is_ref[kk]==0:
             t += 1
@@ -369,6 +390,9 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
                 break
             # compare with CCG
             if mode == 'ccg':
+                # Merged-away / empty labels may be missing from spike_idx
+                if jj not in spike_idx:
+                    continue
                 st1 = st[spike_idx[jj], 0] / ops['fs']
                 _, is_ccg, _ = CCG.check_CCG(st0, st1, acg_threshold=acg_threshold,
                                              ccg_threshold=ccg_threshold)        
@@ -379,21 +403,25 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
             if is_ccg:
                 is_merged[jj] = 1
                 dt = (imax[kk] -imax[jj]).item()
-                idx = spike_idx[jj]
-                if dt != 0 and check_dt:
+                idx = spike_idx.get(jj, np.zeros(0, dtype=np.int64))
+                if dt != 0 and check_dt and idx.size:
                     # Update tF and Wall with shifted features
                     tF, Wall = roll_features(W, tF, Ww, idx, jj, dt)
                     # Shift spike times
                     st[idx,0] -= dt
                 
-                Ww[kk] = ns[kk]/(ns[kk]+ns[jj]) * Ww[kk] + ns[jj]/(ns[kk]+ns[jj]) * Ww[jj]            
+                denom = ns[kk] + ns[jj]
+                if denom > 0:
+                    Ww[kk] = ns[kk]/denom * Ww[kk] + ns[jj]/denom * Ww[jj]
                 Ww[jj] = 0
                 ns[kk] += ns[jj]
                 ns[jj] = 0
-                clu2[idx] = kk
-                # Preserve ascending-index gather order of `clu2 == kk`.
-                spike_idx[kk] = np.sort(np.concatenate((spike_idx[kk], idx)))
-                del spike_idx[jj]
+                if idx.size:
+                    clu2[idx] = kk
+                    # Preserve ascending-index gather order of `clu2 == kk`.
+                    prev = spike_idx.get(kk, np.zeros(0, dtype=np.int64))
+                    spike_idx[kk] = np.sort(np.concatenate((prev, idx)))
+                    spike_idx.pop(jj, None)
                 renorm = True
 
                 break

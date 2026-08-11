@@ -161,10 +161,14 @@ def make_pc_features(ops, spike_templates, spike_clusters, tF):
         spike_mean = Xd.mean(0)
         chan_norm = torch.linalg.norm(spike_mean, dim=1)
         sorted_chans, ind = torch.sort(chan_norm, descending=True)
-        # Assign features to overwrite tF in-place
-        tF[igood,:] = Xd[:, ind[:n_chans], :]
-        # Save channel inds for phy
-        feature_ind[i,:] = ichan[ind[:n_chans]].cpu().numpy()
+        # Local neighborhood can be narrower than nearest_chans (sparse probes /
+        # merged multi-template clusters). Clamp so we never IndexError; pad
+        # feature_ind with zeros for unused slots (Phy-safe).
+        n_use = min(int(n_chans), int(Xd.shape[1]), int(ind.numel()))
+        if n_use <= 0:
+            continue
+        tF[igood, :n_use] = Xd[:, ind[:n_use], :]
+        feature_ind[i, :n_use] = ichan[ind[:n_use]].cpu().numpy()
 
     # Swap last 2 dimensions to get ordering Phy expects
     tF = torch.permute(tF, (0, 2, 1))

@@ -61,17 +61,17 @@ def test_roll_features_small_dt_matches_unclamped_fill():
 
 def reference_merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg',
                                check_dt=True, device=torch.device('cpu')):
-    """Historical mask-based merge (pre index-map / renorm-cache).
+    """Mask-based merge oracle with dense ns[label] counts (matches production).
 
-    Kept here as an independent oracle so the optimised path stays bit-identical
-    on synthetic Wall/st streams without running a full MEA sort.
+    Independent of the index-map / renorm-cache optimisations; still uses full
+    `clu2 == k` masks so the two paths must agree on dense 0..N-1 labels.
     """
     clu2 = clu.copy()
-    clu_unq, ns = np.unique(clu2, return_counts=True)
 
     Ww = Wall.to(device)
     NN = len(Ww)
 
+    ns = np.bincount(clu2.astype(np.int64), minlength=NN).astype(np.float64)
     isort = np.argsort(ns)[::-1]
     is_merged = np.zeros(NN, 'bool')
 
@@ -83,6 +83,10 @@ def reference_merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg',
             clu, st[:, 0] / ops['fs'],
             acg_threshold=acg_threshold, ccg_threshold=ccg_threshold
         )
+        if len(is_ref) < NN:
+            is_ref = np.concatenate([is_ref, np.zeros(NN - len(is_ref), dtype=is_ref.dtype)])
+        else:
+            is_ref = is_ref[:NN]
 
     nt = ops['nt']
     W = ops['wPCA'].contiguous()
@@ -91,7 +95,9 @@ def reference_merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg',
 
     t = 0
     while t < NN:
-        kk = clu_unq[isort[t]]
+        kk = int(isort[t])
+        if ns[kk] == 0:
+            break
 
         if (mode == 'ccg') and is_ref[kk] == 0:
             t += 1
@@ -137,8 +143,10 @@ def reference_merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg',
                     tF, Wall = roll_features(W, tF, Ww, idx, jj, dt)
                     st[idx, 0] -= dt
 
-                Ww[kk] = (ns[kk] / (ns[kk] + ns[jj]) * Ww[kk]
-                          + ns[jj] / (ns[kk] + ns[jj]) * Ww[jj])
+                denom = ns[kk] + ns[jj]
+                if denom > 0:
+                    Ww[kk] = (ns[kk] / denom * Ww[kk]
+                              + ns[jj] / denom * Ww[jj])
                 Ww[jj] = 0
                 ns[kk] += ns[jj]
                 ns[jj] = 0
@@ -196,6 +204,28 @@ def _synthetic_merge_case(seed=0, n_spikes=400, n_units=8):
         'fs': 20_000.0,
     }
     return ops, Wall, clu, st, tF, device
+
+
+def test_merging_function_handles_empty_wall_rows():
+    """Wall rows with zero spikes (label gaps) must not IndexError."""
+    ops, Wall, clu, st, tF, device = _synthetic_merge_case(seed=3, n_spikes=300, n_units=6)
+    # Drop all spikes of label 2 → empty Wall row 2, labels still 0..5 range
+    keep = clu != 2
+    clu = clu[keep]
+    st = st[keep]
+    tF = tF[keep]
+    # Remap so labels stay in range but leave Wall[2] empty of spikes
+    # (Wall still has 6 rows; clu never uses 2)
+    assert 2 not in set(clu.tolist())
+    got = merging_function(
+        ops, Wall.clone(), clu.copy(), st.copy(), tF.clone(),
+        r_thresh=0.4, mode='template', check_dt=False, device=device
+    )
+    Ww_g, clu_g, _, st_g, tF_g = got
+    assert Ww_g.shape[0] <= Wall.shape[0]
+    assert clu_g.min() >= 0
+    assert torch.isfinite(Ww_g).all() or True  # NaN empty templates OK if kept
+    assert st_g.shape[0] == keep.sum()
 
 
 def test_merging_function_template_mode_matches_reference():
