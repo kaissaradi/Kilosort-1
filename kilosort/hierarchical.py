@@ -60,10 +60,14 @@ def find_merges(crat, cc, cneg):
     tstat = np.zeros((nc-1,3), 'float32')
     xnow = np.arange(nc)
     ntot = np.ones(nc,)
+    # Flat argmax is identical to unravel_index(argmax, shape) for C-order
+    # matrices (numpy default) and avoids building an index tuple each merge.
+    ncols = int(cc.shape[1])
 
     for nmerges in range(nc-1):
-        y, x = np.unravel_index(np.argmax(crat), cc.shape)
-        lam = crat[y,x]
+        flat = int(np.argmax(crat))
+        y, x = divmod(flat, ncols)
+        lam = crat[y, x]
 
         # Stock mass formula (MouseLand); keep exact expression for identity.
         m      = cc[y,x] + cc[x,x] + cc[x,y] + cc[y,x]
@@ -110,9 +114,9 @@ def get_my_clus(xtree, tstat):
     nc = xtree.shape[0]+1
     my_clus = [[j] for j in range(nc)]
     for t in range(nc-1):
-        new_clus = my_clus[xtree[t,1]].copy()
-        new_clus.extend(my_clus[xtree[t,0]])
-        my_clus.append(new_clus)
+        # New list = right-child members + left-child members (same order as
+        # historical copy(right).extend(left)).
+        my_clus.append(my_clus[xtree[t, 1]] + my_clus[xtree[t, 0]])
     return my_clus
 
 def maketree(M, iclust, iclust0):

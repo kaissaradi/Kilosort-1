@@ -78,9 +78,10 @@ def compute_spike_positions(st, tF, ops):
     # masked channels or zero features). Bit-identical when sum >= 1e-12.
     tmass = tmass / tmass.sum(1, keepdim=True).clamp_min(1e-12)
 
-    # Get x,y coordinates of nearest channels.
-    xc = torch.from_numpy(ops['xc'])
-    yc = torch.from_numpy(ops['yc'])
+    # Get x,y coordinates of nearest channels (as_tensor shares storage when
+    # xc/yc are already numpy float arrays — avoids an extra host copy).
+    xc = torch.as_tensor(ops['xc'])
+    yc = torch.as_tensor(ops['yc'])
     chs = iCC[:, iU[st[:,1]]]
     xc0 = xc[chs.T]
     yc0 = yc[chs.T]

@@ -206,3 +206,79 @@ def test_check_split_single_class_returns_zero_score():
     xproj, score = check_split(Xd, 0, xtree, iclust, my_clus)
     assert score == 0.0
     assert xproj.shape == (30,)
+
+
+def test_check_split_member_tables_match_labels_in_path():
+    """Precomputed membership tables must match the labels_in path bit-wise."""
+    from kilosort.swarmsplitter import _member_bool_tables
+
+    rng = np.random.default_rng(7)
+    n = 80
+    Xd = rng.standard_normal((n, 8)).astype(np.float64)
+    iclust = rng.integers(0, 4, size=n)
+    xtree = np.array([[0, 1, 4], [2, 3, 5], [4, 5, 6]], dtype=np.int32)
+    my_clus = [
+        [0], [1], [2], [3],
+        [0, 1], [2, 3],
+        [0, 1, 2, 3],
+    ]
+    tables = _member_bool_tables(my_clus, n_labels=4)
+    for kk in range(xtree.shape[0]):
+        x0, s0 = check_split(Xd, kk, xtree, iclust, my_clus)
+        x1, s1 = check_split(
+            Xd, kk, xtree, iclust, my_clus, member_tables=tables
+        )
+        assert s0 == s1
+        np.testing.assert_array_equal(x0, x1)
+
+
+def test_split_with_sorted_meta_runs():
+    """split() with time-sorted meta uses membership tables + assume_sorted."""
+    from kilosort.swarmsplitter import split
+    from kilosort.hierarchical import maketree
+    from scipy.sparse import csr_matrix
+
+    rng = np.random.default_rng(3)
+    n = 200
+    # Toy adjacency + labels so maketree produces a real hierarchy.
+    iclust = rng.integers(0, 6, size=n).astype(np.int64)
+    iclust0 = iclust[::5]
+    nsub = iclust0.shape[0]
+    rows = np.arange(n)
+    cols = rng.integers(0, nsub, size=n)
+    M = csr_matrix(
+        (np.ones(n, np.float32), (rows, cols)), shape=(n, nsub)
+    )
+    # Ensure some self-free edges exist for modularity
+    Xd = rng.standard_normal((n, 10)).astype(np.float64)
+    meta = np.sort(rng.uniform(0, 10, size=n))
+    xtree, tstat, my_clus = maketree(M, iclust, iclust0)
+    if len(xtree) == 0:
+        return  # degenerate toy; nothing to assert
+    xt2, ts2 = split(
+        Xd, xtree, tstat, iclust, my_clus, verbose=False,
+        meta=meta, meta_sorted=True,
+    )
+    assert xt2.shape[1] == 3
+    assert ts2.shape[1] == 3
+    assert len(xt2) <= len(xtree)
+
+
+def test_clean_tree_parent_edges_matches_scan():
+    """Indexed clean_tree must zero the same valid_merge edges as full scan."""
+    from kilosort.swarmsplitter import clean_tree, _parent_edge_lists
+
+    # Synthetic binary hierarchy: leaves 0..3, internal 4,5,6
+    xtree = np.array([
+        [0, 1, 4],
+        [2, 3, 5],
+        [4, 5, 6],
+    ], dtype=np.int32)
+    parent_edges = _parent_edge_lists(xtree)
+
+    for inode in (4, 5, 6, 0, 99):
+        vm0 = np.ones(xtree.shape[0], dtype=bool)
+        vm1 = np.ones(xtree.shape[0], dtype=bool)
+        clean_tree(vm0, xtree, inode, parent_edges=None)
+        clean_tree(vm1, xtree, inode, parent_edges=parent_edges)
+        np.testing.assert_array_equal(vm0, vm1)

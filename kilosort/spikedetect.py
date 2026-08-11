@@ -39,7 +39,8 @@ def my_sum2d(X, dt):
     return Xsum[0]
 
 def extract_snippets(X, nt, twav_min, Th_single_ch, loc_range=[4,5],
-                     long_range=[6,30], device=torch.device('cuda')):
+                     long_range=[6,30], device=torch.device('cuda'),
+                     tarange=None):
     Xabs   = X.abs()
     Xmax   = my_max2d(Xabs, loc_range)
     ispeak = torch.logical_and(Xmax==Xabs, Xabs > Th_single_ch).float()
@@ -52,7 +53,9 @@ def extract_snippets(X, nt, twav_min, Th_single_ch, loc_range=[4,5],
 
     xy = is_peak_iso.nonzero()
 
-    clips = X[xy[:,:1], xy[:,1:2] - twav_min + torch.arange(nt, device=device)]
+    if tarange is None:
+        tarange = torch.arange(nt, device=device)
+    clips = X[xy[:,:1], xy[:,1:2] - twav_min + tarange]
 
     return clips
 
@@ -66,12 +69,16 @@ def extract_wPCA_wTEMP(ops, bfile, nt=61, twav_min=20, Th_single_ch=6, nskip=25,
     max_clips = CLIP_BUFFER_HARD_CAP
     n_clips = get_clip_buffer_capacity(bfile.n_batches, nskip=nskip)
     clips = np.zeros((n_clips, nt), 'float32')
+    # Fixed window for every batch of clip collection.
+    tarange = torch.arange(nt, device=device)
     i = 0
     for j in range(0, bfile.n_batches, nskip):
         X = bfile.padded_batch_to_torch(j, ops)
         
-        clips_new = extract_snippets(X, nt=nt, twav_min=twav_min,
-                                     Th_single_ch=Th_single_ch, device=device)
+        clips_new = extract_snippets(
+            X, nt=nt, twav_min=twav_min, Th_single_ch=Th_single_ch,
+            device=device, tarange=tarange,
+        )
 
         nnew = len(clips_new)
         if nnew == 0:
@@ -437,6 +444,8 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
     tarange = torch.arange(-(nt//2),nt//2+1, device = device)
     # Contact y-coords once for yweighted (was torch.from_numpy every batch).
     yc_t = torch.as_tensor(yc, device=device)
+    # wPCA.T once (fixed for the detect pass) — avoid re-transpose per batch.
+    wPCA_T = ops['wPCA'].T.contiguous()
     # Scratch peak buffers reused by template_match across batches
     tm_scratch = {}
     logger.info('Detecting spikes...')
@@ -479,7 +488,7 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
                 tF = tF2
 
             xsub = X[iC[:,xy[:,:1]], xy[:,1:2] + tarange]
-            xfeat = xsub @ ops['wPCA'].T
+            xfeat = xsub @ wPCA_T
             tF[k:k+nsp] = xfeat.transpose(0,1).cpu().numpy()
 
             t_shift = ibatch * bfile.batch_downsampling * (ops['batch_size']/ops['fs'])

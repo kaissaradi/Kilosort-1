@@ -82,7 +82,9 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None,
     ops['iU'] = iU
     nt = ops['nt']
     
-    tiwave = torch.arange(-(nt//2), nt//2+1, device=device) 
+    tiwave = torch.arange(-(nt//2), nt//2+1, device=device)
+    # wPCA fixed for extract: cache transpose once (detect does the same).
+    wPCA_T = ops['wPCA'].T.contiguous()
     # U is fixed for the whole extract pass: scale, time-domain waveforms, and
     # ctc are batch-invariant. Build both in one pass over U.
     ctc, match_cache = prepare_matching(ops, U, return_cache=True)
@@ -119,7 +121,7 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None,
                     progress_bar.emit(int((ibatch+1) / bfile.n_batches * 100))
                 continue
 
-            xfeat = Xres[iCC[:, iU[stt[:,1:2]]],stt[:,:1] + tiwave] @ ops['wPCA'].T
+            xfeat = Xres[iCC[:, iU[stt[:,1:2]]],stt[:,:1] + tiwave] @ wPCA_T
             xfeat += amps * Ucc[:,stt[:,1]]
 
             if ibatch == 0:
@@ -242,7 +244,14 @@ def prepare_matching(ops, U, return_cache=False):
     Us = U * s.view(-1, 1, 1)
     # (n_units, n_chan, nt); peel permutes selected rows to (C, n_sel, nt)
     U_time = torch.einsum('ijk, jl -> ikl', U, W)
-    return ctc, {'s': s, 'Us': Us, 'U_time': U_time, 'W': W}
+    # Peel index windows depend only on nt (+ device of U); cache once per pass.
+    device = U.device
+    trange = torch.arange(-nt, nt + 1, device=device)
+    tiwave = torch.arange(-(nt // 2), nt // 2 + 1, device=device)
+    return ctc, {
+        's': s, 'Us': Us, 'U_time': U_time, 'W': W,
+        'trange': trange, 'tiwave': tiwave,
+    }
 
 
 def _matching_unit_cache(ops, U):
@@ -257,13 +266,20 @@ def _matching_unit_cache(ops, U):
     # stay finite when tests / callers skip prepare_matching's nan scrub.
     if not torch.isfinite(U).all():
         U = torch.nan_to_num(U, nan=0.0, posinf=0.0, neginf=0.0)
+    nt = ops['nt']
     W = ops['wPCA'].contiguous()
     nm = (U ** 2).sum(-1).sum(-1)
     s = nm.clamp_min(1e-30).rsqrt()
     Us = U * s.view(-1, 1, 1)
     # (n_units, n_chan, nt); peel permutes selected rows to (C, n_sel, nt)
     U_time = torch.einsum('ijk, jl -> ikl', U, W)
-    return {'s': s, 'Us': Us, 'U_time': U_time, 'W': W}
+    device = U.device
+    trange = torch.arange(-nt, nt + 1, device=device)
+    tiwave = torch.arange(-(nt // 2), nt // 2 + 1, device=device)
+    return {
+        's': s, 'Us': Us, 'U_time': U_time, 'W': W,
+        'trange': trange, 'tiwave': tiwave,
+    }
 
 
 def run_matching(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=None):
@@ -283,12 +299,17 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=None):
     Us = unit_cache['Us']
     U_time = unit_cache['U_time']
     W = unit_cache['W']
+    # Windows are nt/device-fixed; older callers may pass a partial cache.
+    trange = unit_cache.get('trange')
+    tiwave = unit_cache.get('tiwave')
+    if trange is None or tiwave is None:
+        trange = torch.arange(-nt, nt + 1, device=device)
+        tiwave = torch.arange(-(nt // 2), nt // 2 + 1, device=device)
+        unit_cache['trange'] = trange
+        unit_cache['tiwave'] = tiwave
 
     B = conv1d(X.unsqueeze(1), W.unsqueeze(1), padding=nt//2)
     B = torch.einsum('ijk, kjl -> il', Us, B)
-
-    trange = torch.arange(-nt, nt+1, device=device)
-    tiwave = torch.arange(-(nt//2), nt//2+1, device=device)
 
     # Growable peel buffer. Cap at historical 1e5; start smaller so quiet
     # batches do not reserve a full 100k×(2+1+1) int64/float slab up front.
@@ -417,6 +438,14 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
     mu = None
     Wnorm = None
 
+    # Spike times in seconds once. Extract sorts st by time; spike_idx lists
+    # are ascending indices, so st_sec[idx] is sorted until a dt≠0 roll.
+    # After any time-shifting merge, fall back to sorting inside compute_CCG.
+    st_sec = None
+    times_sorted = True
+    if mode == 'ccg':
+        st_sec = st[:, 0] / ops['fs']
+
     t = 0
     nmerge = 0
     while t<NN:
@@ -450,7 +479,7 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
         jsort = np.argsort(cmax.cpu().numpy())[::-1]
 
         if mode == 'ccg':
-            st0 = st[spike_idx[kk], 0] / ops['fs']
+            st0 = st_sec[spike_idx[kk]]
         
         is_ccg  = 0
         for j in range(NN):
@@ -462,9 +491,13 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
                 # Merged-away / empty labels may be missing from spike_idx
                 if jj not in spike_idx:
                     continue
-                st1 = st[spike_idx[jj], 0] / ops['fs']
-                _, is_ccg, _ = CCG.check_CCG(st0, st1, acg_threshold=acg_threshold,
-                                             ccg_threshold=ccg_threshold)        
+                st1 = st_sec[spike_idx[jj]]
+                _, is_ccg, _ = CCG.check_CCG(
+                    st0, st1,
+                    acg_threshold=acg_threshold,
+                    ccg_threshold=ccg_threshold,
+                    assume_sorted=times_sorted,
+                )
             else:
                 # Zero-energy templates (empty Wall rows) → 0/0; treat as not
                 # mergeable on amplitude criterion (same as non-match).
@@ -482,8 +515,12 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
                 if dt != 0 and check_dt and idx.size:
                     # Update tF and Wall with shifted features
                     tF, Wall = roll_features(W, tF, Ww, idx, jj, dt)
-                    # Shift spike times
+                    # Shift spike times (and seconds cache); order no longer
+                    # guaranteed sorted by time under ascending index lists.
                     st[idx,0] -= dt
+                    if st_sec is not None:
+                        st_sec[idx] = st[idx, 0] / ops['fs']
+                    times_sorted = False
                 
                 denom = ns[kk] + ns[jj]
                 if denom > 0:
@@ -528,10 +565,20 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
 
 
 def roll_features(wPCA, tF, Wall, spike_idx, clust_idx, dt):
-    W = wPCA.cpu()
+    # tF is host-side on the merge path; Wall (Ww) may sit on CUDA. Keep each
+    # matmul on its operand's device. On CPU MEA, both share wPCA — no copy.
+    if wPCA.device.type == 'cpu':
+        W_host = wPCA
+    else:
+        W_host = wPCA.cpu()
+    if Wall.device == wPCA.device:
+        W_wall = wPCA
+    else:
+        W_wall = wPCA.to(Wall.device)
+
     # Project from PC space back to sample time, shift by dt
-    feats = torch.roll(tF[spike_idx] @ W, shifts=dt, dims=2)
-    temps = torch.roll(Wall[clust_idx:clust_idx+1] @ wPCA, shifts=dt, dims=2)
+    feats = torch.roll(tF[spike_idx] @ W_host, shifts=dt, dims=2)
+    temps = torch.roll(Wall[clust_idx:clust_idx+1] @ W_wall, shifts=dt, dims=2)
 
     # For values that "rolled over the edge," set equal to next closest bin.
     # Lag from WtW can be |dt| >= T (feature length nt); clamp so edge fill
@@ -548,8 +595,8 @@ def roll_features(wPCA, tF, Wall, spike_idx, clust_idx, dt):
             feats[:, :, d:] = feats[:, :, d - 1].unsqueeze(-1)
             temps[:, :, d:] = temps[:, :, d - 1].unsqueeze(-1)
 
-    # Project back to PC space and update tF
-    tF[spike_idx] = feats @ W.T
-    Wall[clust_idx] = temps @ wPCA.T
+    # Project back to PC space and update tF / Wall
+    tF[spike_idx] = feats @ W_host.T
+    Wall[clust_idx] = temps @ W_wall.T
 
     return tF, Wall

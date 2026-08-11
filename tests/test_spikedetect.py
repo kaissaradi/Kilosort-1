@@ -213,7 +213,7 @@ def test_extract_wpca_grows_when_first_batch_exceeds_capacity(monkeypatch):
     )
 
     def fake_snippets(X, nt=61, twav_min=20, Th_single_ch=6, loc_range=None,
-                      long_range=None, device=None):
+                      long_range=None, device=None, tarange=None):
         # Deterministic non-zero waveforms so normalization/SVD are well-posed.
         base = torch.linspace(0.1, 1.0, steps=nt, dtype=torch.float32)
         return base.unsqueeze(0).repeat(n_peaks, 1) + 0.01 * torch.arange(
@@ -253,7 +253,7 @@ def test_extract_wpca_partial_fills_at_hard_cap(monkeypatch):
     )
 
     def fake_snippets(X, nt=61, twav_min=20, Th_single_ch=6, loc_range=None,
-                      long_range=None, device=None):
+                      long_range=None, device=None, tarange=None):
         n = hard_cap + 10
         base = torch.ones(n, nt, dtype=torch.float32)
         base[:, 0] = torch.linspace(0.5, 1.5, steps=n)

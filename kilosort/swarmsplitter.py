@@ -1,7 +1,12 @@
 import numpy as np
 from numba import njit
 import math
+from scipy.ndimage import gaussian_filter1d
 from kilosort.CCG import compute_CCG, CCG_metrics
+
+
+# Fixed histogram edges for bimod_score (stock linspace(-2, 2, 400)).
+_BIMOD_EDGES = np.linspace(-2.0, 2.0, 400)
 
 
 def labels_in(labels, members):
@@ -32,19 +37,49 @@ def labels_in(labels, members):
     return table[labels - lo]
 
 
+def _member_bool_tables(my_clus, n_labels):
+    """Dense bool tables: table[node][label] for original labels in ``0..n_labels-1``.
+
+    Production clustering uses non-negative dense original ids. Building once at
+    the start of ``split`` turns every ``labels_in`` into a gather. Nodes whose
+    members fall outside that range (or are empty) still get a valid table
+    (empty → all-False; out-of-range → fall back via labels_in at use sites
+    is not needed if we expand n_labels).
+    """
+    tables = []
+    for members in my_clus:
+        t = np.zeros(int(n_labels), dtype=bool)
+        if members:
+            m = np.asarray(members, dtype=np.int64).ravel()
+            if m.size:
+                # Clip to table; production members are always in range.
+                good = (m >= 0) & (m < n_labels)
+                if np.any(good):
+                    t[m[good]] = True
+        tables.append(t)
+    return tables
+
+
 def count_elements(kk, iclust, my_clus, xtree):
     n1 = labels_in(iclust, my_clus[xtree[kk, 0]]).sum()
     n2 = labels_in(iclust, my_clus[xtree[kk, 1]]).sum()
     return n1, n2
 
-def check_split(Xd, kk, xtree, iclust, my_clus):
-    ixy = labels_in(iclust, my_clus[xtree[kk, 2]])
+def check_split(Xd, kk, xtree, iclust, my_clus, member_tables=None):
+    if member_tables is not None:
+        ixy = member_tables[int(xtree[kk, 2])][iclust]
+    else:
+        ixy = labels_in(iclust, my_clus[xtree[kk, 2]])
     # Empty membership (remapped labels / fully pruned branch): not bimodal.
     if not np.any(ixy):
         return np.zeros(0, dtype=np.float64), 0.0
 
     iclu = iclust[ixy]
-    labels = 2*labels_in(iclu, my_clus[xtree[kk, 0]]) - 1
+    if member_tables is not None:
+        # 2*bool - 1 → ±1 int (same dtype promotion as 2*labels_in(...) - 1)
+        labels = 2 * member_tables[int(xtree[kk, 0])][iclu] - 1
+    else:
+        labels = 2*labels_in(iclu, my_clus[xtree[kk, 0]]) - 1
 
     Xs = Xd[ixy]
     # One class empty → weighted LS / bimod_score are meaningless; treat as
@@ -57,9 +92,13 @@ def check_split(Xd, kk, xtree, iclust, my_clus):
     Xs = Xs.copy()
     Xs[:,-1] = 1
 
-    w = np.ones((Xs.shape[0],1))
-    w[pos] = np.mean(neg)
-    w[neg] = np.mean(pos)
+    # np.mean(bool) == fraction True; compute via counts (bit-identical float).
+    n = float(labels.shape[0])
+    n_pos = float(np.count_nonzero(pos))
+    n_neg = float(np.count_nonzero(neg))
+    w = np.empty((Xs.shape[0], 1), dtype=np.float64)
+    w[pos, 0] = n_neg / n
+    w[neg, 0] = n_pos / n
 
     CC = Xs.T @ (Xs * w)
     CC = CC + .01 * np.eye(CC.shape[0])
@@ -69,18 +108,49 @@ def check_split(Xd, kk, xtree, iclust, my_clus):
     score = bimod_score(xproj)
     return xproj, score
 
-def clean_tree(valid_merge, xtree, inode):
-    ix = (xtree[:,2]==inode).nonzero()[0]
-    if len(ix)==0:
-        return
-    valid_merge[ix] = 0
-    clean_tree(valid_merge, xtree, xtree[ix, 0])
-    clean_tree(valid_merge, xtree, xtree[ix, 1])
+def _parent_edge_lists(xtree):
+    """Map parent node id (xtree[:, 2]) → edge indices into xtree / valid_merge.
+
+    Built once per ``split`` so ``clean_tree`` is O(edges visited) instead of
+    rescanning the full tree on every prune.
+    """
+    n_edges = int(xtree.shape[0])
+    if n_edges == 0:
+        return []
+    max_node = int(xtree[:, 2].max())
+    buckets = [[] for _ in range(max_node + 1)]
+    for i in range(n_edges):
+        buckets[int(xtree[i, 2])].append(i)
+    return buckets
+
+
+def clean_tree(valid_merge, xtree, inode, parent_edges=None):
+    # Iterative (was recursive): deep trees on large centers could overflow.
+    stack = [int(inode)]
+    while stack:
+        node = stack.pop()
+        if parent_edges is not None:
+            if node < 0 or node >= len(parent_edges):
+                continue
+            ix_list = parent_edges[node]
+            if not ix_list:
+                continue
+            for i in ix_list:
+                valid_merge[i] = 0
+                stack.append(int(xtree[i, 0]))
+                stack.append(int(xtree[i, 1]))
+        else:
+            ix = (xtree[:, 2] == node).nonzero()[0]
+            if ix.size == 0:
+                continue
+            valid_merge[ix] = 0
+            for i in ix:
+                stack.append(int(xtree[i, 0]))
+                stack.append(int(xtree[i, 1]))
     return
 
 def bimod_score(xproj):
-    from scipy.ndimage import gaussian_filter1d
-    xbin, _ = np.histogram(xproj, np.linspace(-2,2,400))
+    xbin, _ = np.histogram(xproj, _BIMOD_EDGES)
     xbin = gaussian_filter1d(xbin.astype('float32'), 4)
 
     imin = np.argmin(xbin[175:225])
@@ -117,10 +187,13 @@ def check_CCG(st1, st2=None, nbins = 500, tbin  = 1/1000, assume_sorted=False):
     cross_refractory = R12<.25 and (Q12<.05 or Q00<.25)
     return is_refractory, cross_refractory
 
-def refractoriness(st1, st2):
+def refractoriness(st1, st2, assume_sorted=False):
     # compute goodness of st1, st2, and both
+    # Production clustering passes time-ordered spike times (global detect order
+    # + increasing igood), and boolean masks preserve that order — so callers
+    # can set assume_sorted=True to skip two O(n log n) sorts per CCG check.
 
-    is_refractory = check_CCG(st1, st2)[1]
+    is_refractory = check_CCG(st1, st2, assume_sorted=assume_sorted)[1]
     if is_refractory:
         criterion = 1 # never split
         #print('this is refractory')
@@ -135,54 +208,70 @@ def refractoriness(st1, st2):
         #    print('good cluster becomes bad')
     return criterion
 
-def split(Xd, xtree, tstat, iclust, my_clus, verbose = True, meta = None):
+def split(Xd, xtree, tstat, iclust, my_clus, verbose = False, meta = None,
+          meta_sorted=True):
     xtree = np.array(xtree)
+    iclust = np.asarray(iclust)
 
     kk = xtree.shape[0]-1
     nc = xtree.shape[0] + 1
     valid_merge = np.ones((nc-1,), 'bool')
 
+    # Precompute dense membership tables once. Original labels from hierarchical
+    # clustering are non-negative and dense in 0..nc0-1; my_clus nodes only
+    # contain those originals. Gather-based membership matches labels_in.
+    n_labels = 0
+    for members in my_clus:
+        if members:
+            n_labels = max(n_labels, int(max(members)) + 1)
+    if iclust.size:
+        n_labels = max(n_labels, int(iclust.max()) + 1)
+    member_tables = _member_bool_tables(my_clus, max(n_labels, 1))
+    # Parent→edge lists for O(visited) clean_tree (was O(n_edges) scan/prune).
+    parent_edges = _parent_edge_lists(xtree)
 
     for kk in range(nc-2,-1,-1):
         if not valid_merge[kk]:
-            continue;
+            continue
 
-        ix1 = labels_in(iclust, my_clus[xtree[kk, 0]])
-        ix2 = labels_in(iclust, my_clus[xtree[kk, 1]])
-
-        criterion = 0
         score = np.nan
-        if criterion==0:
-            # first mutation is global modularity
-            if tstat[kk,0] < 0.2:
-                criterion = -1
+        # first mutation is global modularity — reject before membership gathers
+        if tstat[kk, 0] < 0.2:
+            criterion = -1
+        else:
+            criterion = 0
+            left = int(xtree[kk, 0])
+            right = int(xtree[kk, 1])
+            ix1 = member_tables[left][iclust]
+            ix2 = member_tables[right][iclust]
 
+            if meta is not None and criterion == 0:
+                # second mutation is based on meta_data
+                criterion = refractoriness(
+                    meta[ix1], meta[ix2], assume_sorted=meta_sorted
+                )
 
-        if meta is not None and criterion==0:
-            # second mutation is based on meta_data
-            criterion = refractoriness(meta[ix1],meta[ix2])
-            #criterion = 0
-        
-        if criterion==0:
-            xproj, score = check_split(Xd, kk, xtree, iclust, my_clus)
-            # third mutation is bimodality
-            #xproj, score = check_split(Xd, kk, xtree, iclust, my_clus)
-            criterion = 2 * (score <  .6) - 1
+            if criterion == 0:
+                xproj, score = check_split(
+                    Xd, kk, xtree, iclust, my_clus, member_tables=member_tables
+                )
+                # third mutation is bimodality
+                criterion = 2 * (score < .6) - 1
 
-        if criterion==0:
-            # fourth mutation is local modularity (not reachable)
-            score = tstat[kk,-1]
-            criterion = score > .15
+            if criterion == 0:
+                # fourth mutation is local modularity (not reachable)
+                score = tstat[kk, -1]
+                criterion = score > .15
 
-        if verbose:
-            n1,n2 = ix1.sum(), ix2.sum()
-            #print('%3.0d, %6.0d, %6.0d, %6.0d, %2.2f,%4.2f, %2.2f'%(kk, n1, n2,n1+n2,
-            #tstat[kk,0], tstat[kk,-1], score))
+            if verbose:
+                n1, n2 = int(ix1.sum()), int(ix2.sum())
+                # print('%3.0d, %6.0d, %6.0d, %6.0d, %2.2f,%4.2f, %2.2f'%(kk, n1, n2,n1+n2,
+                # tstat[kk,0], tstat[kk,-1], score))
 
-        if criterion==1:
+        if criterion == 1:
             valid_merge[kk] = 0
-            clean_tree(valid_merge, xtree, xtree[kk,0])
-            clean_tree(valid_merge, xtree, xtree[kk,1])
+            clean_tree(valid_merge, xtree, xtree[kk, 0], parent_edges)
+            clean_tree(valid_merge, xtree, xtree[kk, 1], parent_edges)
 
     tstat = tstat[valid_merge]
     xtree = xtree[valid_merge]
@@ -224,11 +313,18 @@ def new_clusters(iclust, my_clus, xtree, tstat):
         return iclust_arr.copy()
 
     remap = np.full(max_label + 1, -1, dtype=np.int64)
+    # Node id → new leaf id for xtree child remapping (vectorized after loop).
+    max_node = int(max(ind.max(), xtree.max()))
+    node_remap = np.arange(max_node + 1, dtype=np.int64)
     for j, leaf in enumerate(ind):
+        leaf = int(leaf)
         for orig in my_clus[leaf]:
             remap[orig] = j
-        xtree[xtree[:, 0] == leaf, 0] = j
-        xtree[xtree[:, 1] == leaf, 1] = j
+        node_remap[leaf] = j
+
+    # Vectorized leaf→new-id rewrite of both tree child columns.
+    xtree[:, 0] = node_remap[xtree[:, 0]]
+    xtree[:, 1] = node_remap[xtree[:, 1]]
 
     # Preserve original labels for any spike id not present in a leaf (same as
     # the historical isin loop, which only wrote matched membership).

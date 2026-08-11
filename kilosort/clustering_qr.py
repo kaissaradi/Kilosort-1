@@ -744,7 +744,11 @@ def mean_cluster_templates(Xd, iclust, ichan, n_chan, n_pcs):
 def get_data_cpu(ops, xy, iC, PID, tF, ycenter, xcenter, dmin=20, dminx=32,
                  ix=None, merge_dim=True):
     # Accept numpy or tensor spike/template ids (export path often tensors).
-    PID = torch.as_tensor(PID).long()
+    # clustering_qr.run hoists a long tensor once; skip redundant conversion.
+    if not isinstance(PID, torch.Tensor):
+        PID = torch.as_tensor(PID).long()
+    elif PID.dtype != torch.long:
+        PID = PID.long()
 
     #iU = ops['iU'].cpu().numpy()
     #iC = ops['iCC'][:, ops['iU']]    
@@ -768,6 +772,7 @@ def get_data_cpu(ops, xy, iC, PID, tF, ycenter, xcenter, dmin=20, dminx=32,
     pid = PID[igood]
     data = tF[igood]
     nspikes, nchanraw, nfeatures = data.shape
+    # iC[:, ix] with bool ix; torch.unique on the selected columns.
     ichan, imap = torch.unique(iC[:, ix], return_inverse=True)
     nchan = ichan.nelement()
 
@@ -783,12 +788,11 @@ def get_data_cpu(ops, xy, iC, PID, tF, ycenter, xcenter, dmin=20, dminx=32,
     lookup = torch.full((ix.numel(),), -1, dtype=torch.long)
     lookup[sel] = torch.arange(sel.numel(), dtype=torch.long)
     k_per = lookup[pid]
-    rows = torch.arange(nspikes, dtype=torch.long).unsqueeze(1).expand(
-        nspikes, nchanraw
-    )
+    # cols[s, c] = unique-channel slot for spike s, raw-channel c.
+    # Index with arange broadcast (no materialize of nspikes×nchanraw rows).
     cols = imap[:, k_per].T
     dd = torch.zeros((nspikes, nchan, nfeatures), dtype=data.dtype)
-    dd[rows, cols] = data
+    dd[torch.arange(nspikes, dtype=torch.long).unsqueeze(1), cols] = data
 
     if merge_dim:
         Xd = torch.reshape(dd, (nspikes, -1))

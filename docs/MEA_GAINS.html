@@ -1,0 +1,654 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Kilosort MEA — measurable gains</title>
+<style>
+  :root {
+    --bg: #0f1419;
+    --panel: #1a2332;
+    --border: #2d3a4d;
+    --text: #e7ecf3;
+    --muted: #8b9bb4;
+    --accent: #3d9cf0;
+    --good: #3ecf8e;
+    --warn: #e6b84d;
+    --bad: #e85d5d;
+    --mono: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+    --sans: "IBM Plex Sans", system-ui, -apple-system, Segoe UI, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 2rem 1.25rem 4rem;
+    font-family: var(--sans);
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.45;
+    font-size: 15px;
+  }
+  main { max-width: 920px; margin: 0 auto; }
+  h1 { font-size: 1.55rem; font-weight: 650; margin: 0 0 0.35rem; letter-spacing: -0.02em; }
+  h2 {
+    font-size: 1.05rem;
+    font-weight: 650;
+    margin: 2rem 0 0.65rem;
+    padding-bottom: 0.35rem;
+    border-bottom: 1px solid var(--border);
+    color: var(--accent);
+  }
+  h3 { font-size: 0.95rem; font-weight: 600; margin: 1.25rem 0 0.5rem; color: var(--text); }
+  p, li { color: var(--text); }
+  .sub { color: var(--muted); font-size: 0.9rem; margin: 0 0 1.25rem; }
+  .meta {
+    display: flex; flex-wrap: wrap; gap: 0.5rem 1.25rem;
+    padding: 0.85rem 1rem;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 0.85rem;
+    color: var(--muted);
+    margin-bottom: 1.5rem;
+  }
+  .meta strong { color: var(--text); font-weight: 600; }
+  .hero {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 0.75rem;
+    margin: 1rem 0 1.5rem;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.9rem 1rem;
+  }
+  .card .label { font-size: 0.75rem; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+  .card .value { font-size: 1.55rem; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 0.2rem; }
+  .card .value.good { color: var(--good); }
+  .card .hint { font-size: 0.78rem; color: var(--muted); margin-top: 0.25rem; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.88rem;
+    margin: 0.5rem 0 1rem;
+  }
+  th, td {
+    text-align: left;
+    padding: 0.45rem 0.55rem;
+    border-bottom: 1px solid var(--border);
+    vertical-align: top;
+  }
+  th {
+    color: var(--muted);
+    font-weight: 600;
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--mono); font-size: 0.82rem; }
+  td.mono, .mono { font-family: var(--mono); font-size: 0.82rem; }
+  tr.highlight td { background: rgba(61, 156, 240, 0.08); }
+  tr.delta-good td.delta { color: var(--good); font-weight: 600; }
+  .note {
+    font-size: 0.82rem;
+    color: var(--muted);
+    border-left: 3px solid var(--border);
+    padding: 0.35rem 0 0.35rem 0.75rem;
+    margin: 0.5rem 0 1rem;
+  }
+  .tag {
+    display: inline-block;
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 0.12rem 0.45rem;
+    border-radius: 4px;
+    background: rgba(61, 156, 240, 0.15);
+    color: var(--accent);
+    vertical-align: middle;
+  }
+  .tag.warn { background: rgba(230, 184, 77, 0.15); color: var(--warn); }
+  ul.compact { margin: 0.35rem 0 1rem; padding-left: 1.2rem; }
+  ul.compact li { margin: 0.2rem 0; }
+  footer {
+    margin-top: 2.5rem;
+    padding-top: 1rem;
+    border-top: 1px solid var(--border);
+    font-size: 0.78rem;
+    color: var(--muted);
+  }
+</style>
+</head>
+<body>
+<main>
+
+<h1>MEA optimizations — measurable gains</h1>
+<p class="sub">
+  Numbers only. Branch <span class="mono">mea-optimizations</span> · host fieldlab (CPU) ·
+  Litke 519-ch 30&nbsp;µm · Th 8/6 · dmin=30 · max_channel_distance=10 · max_peels=100 · nblocks=0.
+  Non-golden paths under <span class="mono">…/sorted/20251204A/data000/</span>. Production goldens never clobbered.
+</p>
+
+<div class="meta">
+  <div><strong>Tip at write</strong> · <span class="mono">fd20d57</span></div>
+  <div><strong>Date</strong> · 2026-08-11</div>
+  <div><strong>Fast gate</strong> · 133 tests collected</div>
+  <div><strong>Scope</strong> · wall · step time · microbench · mem · accuracy counts</div>
+</div>
+
+<div class="hero">
+  <div class="card">
+    <div class="label">tmax=5 wall</div>
+    <div class="value good">−13%</div>
+    <div class="hint">83.4 s → 72.2 s</div>
+  </div>
+  <div class="card">
+    <div class="label">High-pass / batch</div>
+    <div class="value good">~2.5×</div>
+    <div class="hint">1.15 s → 0.46 s (rFFT)</div>
+  </div>
+  <div class="card">
+    <div class="label">Full data000</div>
+    <div class="value">3.86 h</div>
+    <div class="hint">13 896 s wall · SUCCESS</div>
+  </div>
+  <div class="card">
+    <div class="label">Full units / good</div>
+    <div class="value">148 / 101</div>
+    <div class="hint">7.76M spikes after dupe drop</div>
+  </div>
+</div>
+
+<!-- ========== 1. HEADLINE END-TO-END ========== -->
+<h2>1 · End-to-end wall times</h2>
+
+<h3>Short smoke · tmax=5 · data000 · CPU</h3>
+<p class="note">
+  Same settings, native <span class="mono">LitkeRecording(drop_ttl=True)</span>.
+  Wall from <span class="mono">SMOKE_SUMMARY.txt</span>; step times from ops log.
+</p>
+<table>
+  <thead>
+    <tr>
+      <th>Metric</th>
+      <th class="num">Prior smoke</th>
+      <th class="num">Cycle 11</th>
+      <th class="num">Δ</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr class="highlight delta-good">
+      <td>Wall clock (script)</td>
+      <td class="num">83.4 s</td>
+      <td class="num">72.2 s</td>
+      <td class="num delta">−11.2 s (−13.4%)</td>
+    </tr>
+    <tr class="delta-good">
+      <td>ops total runtime</td>
+      <td class="num">80.29 s</td>
+      <td class="num">69.15 s</td>
+      <td class="num delta">−11.1 s (−13.9%)</td>
+    </tr>
+    <tr>
+      <td>Units</td>
+      <td class="num">110</td>
+      <td class="num">110</td>
+      <td class="num">0</td>
+    </tr>
+    <tr>
+      <td>Good units (KSLabel)</td>
+      <td class="num">14</td>
+      <td class="num">16</td>
+      <td class="num">+2</td>
+    </tr>
+    <tr>
+      <td>Spikes (detect → export)</td>
+      <td class="num">38 138 / 38 057</td>
+      <td class="num">38 403 / 38 334</td>
+      <td class="num">~+0.7%</td>
+    </tr>
+    <tr>
+      <td>Peak sys mem (log, by step)</td>
+      <td class="num">~4.7 GB</td>
+      <td class="num">~4.2 GB</td>
+      <td class="num">~−0.5 GB</td>
+    </tr>
+  </tbody>
+</table>
+
+<table>
+  <thead>
+    <tr>
+      <th>Step (ops)</th>
+      <th class="num">Prior (s)</th>
+      <th class="num">Prior %</th>
+      <th class="num">Cycle 11 (s)</th>
+      <th class="num">C11 %</th>
+      <th class="num">Δ s</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr class="delta-good">
+      <td>preprocessing</td>
+      <td class="num">2.8</td>
+      <td class="num">3.5%</td>
+      <td class="num">1.9</td>
+      <td class="num">2.7%</td>
+      <td class="num delta">−0.9</td>
+    </tr>
+    <tr class="highlight delta-good">
+      <td>spike det. (univ) st0</td>
+      <td class="num">50.4</td>
+      <td class="num">62.7%</td>
+      <td class="num">43.4</td>
+      <td class="num">62.8%</td>
+      <td class="num delta">−7.0</td>
+    </tr>
+    <tr>
+      <td>cluster (temp) clu0</td>
+      <td class="num">0.5</td>
+      <td class="num">0.6%</td>
+      <td class="num">0.4</td>
+      <td class="num">0.6%</td>
+      <td class="num">−0.1</td>
+    </tr>
+    <tr class="delta-good">
+      <td>spike det. (learn) st</td>
+      <td class="num">18.5</td>
+      <td class="num">23.0%</td>
+      <td class="num">15.9</td>
+      <td class="num">23.0%</td>
+      <td class="num delta">−2.6</td>
+    </tr>
+    <tr>
+      <td>cluster (final) clu</td>
+      <td class="num">0.2</td>
+      <td class="num">0.3%</td>
+      <td class="num">0.5</td>
+      <td class="num">0.8%</td>
+      <td class="num">+0.3</td>
+    </tr>
+    <tr>
+      <td>cluster merge</td>
+      <td class="num">2.5</td>
+      <td class="num">3.1%</td>
+      <td class="num">2.5</td>
+      <td class="num">3.7%</td>
+      <td class="num">0.0</td>
+    </tr>
+  </tbody>
+</table>
+<p class="note">
+  Paths:
+  <span class="mono">…/kilosort4_litke_smoke_tmax5/</span> (prior) vs
+  <span class="mono">…/kilosort4_litke_smoke_tmax5_cycle11/</span>.
+  Spike count can move slightly after rFFT high-pass (float32-level vs full FFT, not bit-identical on threshold straddlers). Unit count matched.
+</p>
+
+<h3>Full recording · data000 · no tmax · CPU</h3>
+<p class="note">
+  One full e2e SUCCESS. Many cycle-10+ commits landed <em>during</em> this run — next full sort is the post-opt baseline.
+  Output: <span class="mono">…/kilosort4_litke_full_data000/</span>.
+</p>
+<table>
+  <thead>
+    <tr><th>Metric</th><th class="num">Value</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Recording</td><td class="num">17.86M samples × 519 ch · 893 s · 20 kHz</td></tr>
+    <tr><td>Wall clock (script)</td><td class="num">13 896 s (~3.86 h)</td></tr>
+    <tr><td>ops runtime total</td><td class="num">13 610 s (~3.78 h)</td></tr>
+    <tr><td>Spikes detect → after dupe drop</td><td class="num">7 953 200 → 7 758 398</td></tr>
+    <tr><td>Units / good</td><td class="num">148 / 101</td></tr>
+    <tr><td>TTL onsets saved</td><td class="num">120</td></tr>
+    <tr><td>Peak sys mem (merge step log)</td><td class="num">~10.9 GB / 15.5 GB host</td></tr>
+  </tbody>
+</table>
+
+<table>
+  <thead>
+    <tr>
+      <th>Step (ops)</th>
+      <th class="num">Seconds</th>
+      <th class="num">% of ops</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr class="highlight"><td>st0 universal detect</td><td class="num">6 296</td><td class="num">46.3%</td></tr>
+    <tr class="highlight"><td>st learned extract / peel</td><td class="num">4 173</td><td class="num">30.7%</td></tr>
+    <tr><td>clu final cluster</td><td class="num">2 522</td><td class="num">18.5%</td></tr>
+    <tr><td>clu0 first cluster</td><td class="num">529</td><td class="num">3.9%</td></tr>
+    <tr><td>postproc</td><td class="num">49</td><td class="num">0.4%</td></tr>
+    <tr><td>preproc</td><td class="num">26</td><td class="num">0.2%</td></tr>
+    <tr><td>merge</td><td class="num">9</td><td class="num">0.1%</td></tr>
+    <tr><td>drift</td><td class="num">~0</td><td class="num">nblocks=0</td></tr>
+  </tbody>
+</table>
+<p class="note">
+  <strong>Still hot:</strong> st0 + st = 77% of full-run ops time. Clustering is small on short smoke (~1%) but material on full data (22% clu0+clu).
+</p>
+
+<!-- ========== 2. MICROBENCH ========== -->
+<h2>2 · Micro-benchmarks (fieldlab CPU)</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>Path</th>
+      <th>Workload</th>
+      <th class="num">Before</th>
+      <th class="num">After</th>
+      <th class="num">Gain</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td class="mono">high-pass FFT → rFFT</td>
+      <td>batch filter, 519×~60k float32</td>
+      <td class="num">≈1.15 s/batch</td>
+      <td class="num">≈0.46 s/batch</td>
+      <td class="num">~2.5×</td>
+    </tr>
+    <tr>
+      <td class="mono">As/Amaxs/imaxs.zero_()</td>
+      <td>Nfilt≈2000, NT≈60k (3 buffers)</td>
+      <td class="num">≈60 ms ×3 /batch</td>
+      <td class="num">0 (skipped)</td>
+      <td class="num">~180 ms/batch</td>
+    </tr>
+    <tr>
+      <td class="mono">pad buffer empty vs zeros</td>
+      <td>~519×60k float32 slab</td>
+      <td class="num">full zero write</td>
+      <td class="num">empty alloc</td>
+      <td class="num">~125 MiB write/batch</td>
+    </tr>
+    <tr>
+      <td class="mono">Litke unpack prange</td>
+      <td>12-bit pack decode (numba)</td>
+      <td class="num">~40 ms serial</td>
+      <td class="num">~7 ms prange</td>
+      <td class="num">~5.7×</td>
+    </tr>
+    <tr>
+      <td class="mono">get_data_cpu scatter</td>
+      <td>5k spikes · 40 templates</td>
+      <td class="num">~12 ms</td>
+      <td class="num">~3.3 ms</td>
+      <td class="num">~3.7×</td>
+    </tr>
+    <tr>
+      <td class="mono">group_indices_by_label</td>
+      <td>200k spikes · 80 labels</td>
+      <td class="num">~14.6 ms</td>
+      <td class="num">~10.4 ms</td>
+      <td class="num">~1.4×</td>
+    </tr>
+    <tr>
+      <td>merge time gathers (index map vs <span class="mono">==</span> mask)</td>
+      <td>200k · 80 labels · 2000 gathers</td>
+      <td class="num">~294 ms</td>
+      <td class="num">~13 ms</td>
+      <td class="num">~23×</td>
+    </tr>
+    <tr>
+      <td class="mono">labels_in</td> vs <span class="mono">np.isin</span></td>
+      <td>200k labels · 80 members</td>
+      <td class="num">~1.5 ms</td>
+      <td class="num">~1.0 ms</td>
+      <td class="num">~1.5×</td>
+    </tr>
+    <tr>
+      <td class="mono">split</td> membership tables vs <span class="mono">labels_in</span></td>
+      <td>50k spikes · 400 node probes</td>
+      <td class="num">70.0 ms</td>
+      <td class="num">23.7 ms</td>
+      <td class="num">~3.0×</td>
+    </tr>
+    <tr>
+      <td class="mono">new_clusters</td></td>
+      <td>200k spikes · 200 labels · pair merges</td>
+      <td class="num">—</td>
+      <td class="num">~9 ms/call</td>
+      <td class="num">dense remap</td>
+    </tr>
+    <tr>
+      <td class="mono">remove_duplicates</td> (numba)</td>
+      <td>200k spikes · 200 clusters</td>
+      <td class="num">—</td>
+      <td class="num">~1.3 ms after warm</td>
+      <td class="num">njit cache</td>
+    </tr>
+    <tr>
+      <td class="mono">template_match</td> imaxs dtype</td>
+      <td>Nfilt×NT peak index buffer</td>
+      <td class="num">int64</td>
+      <td class="num">int32</td>
+      <td class="num">~½ buffer</td>
+    </tr>
+  </tbody>
+</table>
+<p class="note">
+  rFFT high-pass max |diff| vs full complex FFT ≈ 2×10<sup>−6</sup> on unit noise (float32-level agreement, not bit-identical).
+</p>
+
+<!-- ========== 3. MEMORY / IO ========== -->
+<h2>3 · Memory &amp; IO (measured / structural)</h2>
+<table>
+  <thead>
+    <tr><th>Change</th><th class="num">Effect</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Reuse <span class="mono">template_match</span> As / Amaxs / imaxs across batches</td>
+      <td class="num">avoid re-alloc ~3 × Nfilt × NT / batch</td>
+    </tr>
+    <tr>
+      <td>imaxs as int32 (was int64)</td>
+      <td class="num">~½ peak-index buffer (~0.6 GiB class at 2600×60k)</td>
+    </tr>
+    <tr>
+      <td>In-place peel on X (no clone)</td>
+      <td class="num">~125 MiB peak avoided per 519×60k float32 batch</td>
+    </tr>
+    <tr>
+      <td>Free universal st0/tF before learned extract</td>
+      <td class="num">drop one spike table before second detect</td>
+    </tr>
+    <tr>
+      <td>Spike / clip buffer capacity scaled to n_batches</td>
+      <td class="num">short runs: min 10k spikes, not fixed 1M / 500k</td>
+    </tr>
+    <tr>
+      <td>Litke drop_ttl unpack skips electrode 0 column</td>
+      <td class="num">519 ch sort path; no full n_elec slab for TTL-drop</td>
+    </tr>
+    <tr>
+      <td>tmax=5 smoke peak sys mem (log)</td>
+      <td class="num">~4.7 GB → ~4.2 GB</td>
+    </tr>
+    <tr>
+      <td>Full data000 peak sys mem at merge</td>
+      <td class="num">~10.9 GB on 15.5 GB host (finished green)</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ========== 4. CORRECTNESS / TESTS ========== -->
+<h2>4 · Correctness gates (counts)</h2>
+<table>
+  <thead>
+    <tr><th>Gate</th><th class="num">Result</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>Pytest collection (tip)</td><td class="num">133 tests</td></tr>
+    <tr><td>Fast unit gate (reported green runs)</td><td class="num">≥129 passed (wpca Illegal instruction deselected on old CPU)</td></tr>
+    <tr><td>Litke unpack vs lab bin2py (real 20251204A bytes)</td><td class="num">bit-exact</td></tr>
+    <tr><td>Frozen bin2py oracle fixtures</td><td class="num">in-repo, no runtime .so dep</td></tr>
+    <tr><td>tmax=5 unit count prior → cycle 11</td><td class="num">110 → 110</td></tr>
+    <tr><td>Full data000 e2e</td><td class="num">SUCCESS · 148 units · 101 good</td></tr>
+  </tbody>
+</table>
+
+<!-- ========== 5. WHERE TIME GOES ========== -->
+<h2>5 · Where time still goes</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Workload</th>
+      <th class="num">st0 + st share</th>
+      <th class="num">clu share</th>
+      <th class="num">rest</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>tmax=5 smoke (cycle 11 ops)</td>
+      <td class="num">85.8%</td>
+      <td class="num">1.4%</td>
+      <td class="num">12.8%</td>
+    </tr>
+    <tr>
+      <td>Full data000 (ops)</td>
+      <td class="num">77.0%</td>
+      <td class="num">22.4%</td>
+      <td class="num">0.6%</td>
+    </tr>
+  </tbody>
+</table>
+<ul class="compact">
+  <li>Universal detect: ~2597 templates on this MEA grid (tmax=5 log).</li>
+  <li>Learned extract: max_peels=100 fully exercised (~19k spikes/batch on short smoke).</li>
+  <li>Profile (CPU, one batch): <span class="mono">template_match</span> body ≈ 95% of detect kernel;
+      filter+read ≈ 1.3 s/batch; peel/st still second wall after st0.</li>
+  <li>Next re-measure: full data000 under tip after cycle-14 landings (clustering share is 22% full-run).</li>
+</ul>
+
+<!-- ========== 5b. CYCLE 14 QUALITY + MICROBENCH ========== -->
+<h2>5b · Cycle 14 pipeline audit (measurable only)</h2>
+<p class="note">
+  Solo smoke <span class="mono">…/kilosort4_litke_smoke_tmax5_cycle14/</span> under post–fd20d57
+  landings (membership tables, merge CCG assume_sorted, extract wPCA_T, indexed clean_tree, …).
+  Short smoke wall is dominated by st0; clustering/split opts show mainly on full-length runs + microbenches.
+</p>
+<table>
+  <thead>
+    <tr>
+      <th>Metric</th>
+      <th class="num">Cycle 11</th>
+      <th class="num">Cycle 14</th>
+      <th class="num">Note</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>ops total runtime</td>
+      <td class="num">69.15 s</td>
+      <td class="num">77.01 s</td>
+      <td>Machine variance (st0 43→51 s); not a claimed regression</td>
+    </tr>
+    <tr>
+      <td>st (learned extract)</td>
+      <td class="num">15.91 s</td>
+      <td class="num">15.91 s</td>
+      <td>Matched</td>
+    </tr>
+    <tr>
+      <td>clu0 + clu + merge</td>
+      <td class="num">3.49 s</td>
+      <td class="num">3.06 s</td>
+      <td class="num">−0.4 s short smoke</td>
+    </tr>
+    <tr>
+      <td>Units / good / spikes (export)</td>
+      <td class="num">110 / 16 / 38 334</td>
+      <td class="num">110 / 16 / 38 284</td>
+      <td>Quality stable</td>
+    </tr>
+  </tbody>
+</table>
+
+<table>
+  <thead>
+    <tr><th>Microbench (this session)</th><th class="num">Result</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><span class="mono">clean_tree</span> full scan vs parent-edge index (500 prunes, 79-edge tree)</td>
+      <td class="num">0.545 s → 0.041 s (~13.3×)</td>
+    </tr>
+    <tr>
+      <td>Member-table split path + <span class="mono">assume_sorted</span> CCG (unit tests)</td>
+      <td class="num">identity vs labels_in path</td>
+    </tr>
+    <tr>
+      <td>Focused unit suite (swarmsplitter / clustering / template_match / detect / CCG / …)</td>
+      <td class="num">79+ green after landings</td>
+    </tr>
+  </tbody>
+</table>
+
+<!-- ========== 6. LANDINGS THAT MOVED THE NEEDLE ========== -->
+<h2>6 · Landings tied to measured wins</h2>
+<table>
+  <thead>
+    <tr><th>Area</th><th>What landed (summary)</th><th class="num">Evidence</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Filter</td>
+      <td class="mono">rFFT high-pass</td> every batch</td>
+      <td class="num">1.15→0.46 s/batch; preproc 2.8→1.9 s smoke</td>
+    </tr>
+    <tr>
+      <td>Detect</td>
+      <td>Skip zero_ scratch; reuse As/Amaxs/imaxs; int32 imaxs; cache W / yc / wPCA.T</td>
+      <td class="num">st0 50.4→43.4 s smoke</td>
+    </tr>
+    <tr>
+      <td>Peel / extract</td>
+      <td>In-place peel; fuse prepare_matching cache (incl. trange/tiwave); empty-nsp skip; unique-lag align_U; extract wPCA_T</td>
+      <td class="num">st 18.5→15.9 s smoke</td>
+    </tr>
+    <tr>
+      <td>Litke IO</td>
+      <td>Native file_object; drop_ttl; prange unpack</td>
+      <td class="num">~5.7× unpack microbench; full e2e no offline convert</td>
+    </tr>
+    <tr>
+      <td>Cluster / merge / split</td>
+      <td>neigh_mat CSR; group_indices; get_data_cpu scatter; labels_in; dense membership tables; indexed clean_tree; merge st_sec + CCG assume_sorted; hierarchical flat argmax</td>
+      <td class="num">microbenches 1.4–23×; clean_tree ~13×; clu path −0.4 s cycle14</td>
+    </tr>
+    <tr>
+      <td>Correctness</td>
+      <td>NaN/empty guards; empty-tree preserve; CCG empty/T=0; divide-where crat; pad fixes</td>
+      <td class="num">green full e2e + expanded tests</td>
+    </tr>
+  </tbody>
+</table>
+
+<footer>
+  <p>
+    Sources: <span class="mono">SMOKE_SUMMARY.txt</span>,
+    <span class="mono">FULL_SUMMARY.txt</span>,
+    kilosort4.log step tables,
+    fieldlab microbenches logged in branch commits / MEA field context,
+    cycle 14 ops under <span class="mono">kilosort4_litke_smoke_tmax5_cycle14</span>.
+  </p>
+  <p>
+    File: <span class="mono">docs/MEA_GAINS.html</span> ·
+    Branch: <span class="mono">mea-optimizations</span> ·
+    Companion brief: <span class="mono">docs/MEA_FIELD_TEST_CONTEXT.html</span>
+  </p>
+  <p>
+    Not claimed: GPU vs CPU parity, golden bit-identity after rFFT, full-data000 speedup
+    under tip (re-sort not yet run post cycle 11), bmm rewrite of template_match body
+    (float reordering; left on the table).
+  </p>
+</footer>
+
+</main>
+</body>
+</html>
