@@ -108,19 +108,23 @@ def neigh_mat(Xd, nskip=1, n_neigh=10, max_sub=25000, device=None):
     # M is n_samples by n_nodes, adjacency matrix.
     # Avoid materializing a full ones(kn.shape) slab + 2D tile: one repeat +
     # ravel matches the old CSR contents exactly.
-    nnz = kn.size
-    M = csr_matrix(
-        (np.ones(nnz, np.float32),
-         (np.repeat(np.arange(n_samples, dtype=np.int64), n_neigh),
-          kn.ravel())),
-        shape=(n_samples, n_nodes),
-    )
-
-    # self connections are set to 0
+    # Self-edges (subset spike → its own node) are dropped before CSR build.
+    # Historical path built CSR then M[skip_idx, j] = 0; scipy CSR __setitem__
+    # is O(nnz) per write and dominated clustering setup on large centers.
+    # Omitting structural zeros is identical for sum / SpMV (Mstats, maketree).
     skip_idx = np.arange(0, n_samples, nskip)
     if rev_idx is not None:
         skip_idx = skip_idx[rev_idx]
-    M[skip_idx, np.arange(n_nodes)] = 0
+    rows = np.repeat(np.arange(n_samples, dtype=np.int64), n_neigh)
+    cols = kn.ravel().astype(np.int64, copy=False)
+    node_of_row = np.full(n_samples, -1, dtype=np.int64)
+    node_of_row[skip_idx] = np.arange(n_nodes, dtype=np.int64)
+    keep = node_of_row[rows] != cols
+    M = csr_matrix(
+        (np.ones(int(keep.sum()), np.float32),
+         (rows[keep], cols[keep])),
+        shape=(n_samples, n_nodes),
+    )
 
     return kn, M
 

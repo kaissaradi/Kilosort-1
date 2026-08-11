@@ -70,6 +70,10 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
     
     tiwave = torch.arange(-(nt//2), nt//2+1, device=device) 
     ctc = prepare_matching(ops, U)
+    # U is fixed for the whole extract pass: scale, time-domain waveforms, and
+    # ctc are batch-invariant. Precompute once (run_matching used to redo this
+    # every batch — pure overhead across hundreds of MEA batches).
+    match_cache = _matching_unit_cache(ops, U)
     spike_capacity = get_spike_buffer_capacity(bfile.n_batches)
     st = np.zeros((spike_capacity, 3), 'float64')
     tF = torch.zeros((spike_capacity, nC, ops['settings']['n_pcs']))
@@ -89,7 +93,9 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
                 log_performance(logger, 'debug', f'Batch {ibatch}')
 
             X = next(batches)
-            stt, amps, th_amps, Xres = run_matching(ops, X, U, ctc, device=device)
+            stt, amps, th_amps, Xres = run_matching(
+                ops, X, U, ctc, device=device, unit_cache=match_cache
+            )
             xfeat = Xres[iCC[:, iU[stt[:,1:2]]],stt[:,:1] + tiwave] @ ops['wPCA'].T
             xfeat += amps * Ucc[:,stt[:,1]]
 
@@ -180,7 +186,23 @@ def prepare_matching(ops, U):
     return ctc
 
 
-def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
+def _matching_unit_cache(ops, U):
+    """Batch-invariant tensors for run_matching (scale + time-domain units).
+
+    U is fixed for the whole extract pass, so s / Us / U_time only need to be
+    built once. Returning a small dict keeps run_matching's call surface stable
+    for tests that invoke it directly.
+    """
+    W = ops['wPCA'].contiguous()
+    nm = (U ** 2).sum(-1).sum(-1)
+    s = nm.clamp_min(1e-30).rsqrt()
+    Us = U * s.view(-1, 1, 1)
+    # (n_units, n_chan, nt); peel permutes selected rows to (C, n_sel, nt)
+    U_time = torch.einsum('ijk, jl -> ikl', U, W)
+    return {'s': s, 'Us': Us, 'U_time': U_time, 'W': W}
+
+
+def run_matching(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=None):
     # `ctc` must come from prepare_matching, which pre-scales it by
     # s_i = nm_i**-0.5. The 1/sqrt(nm) normalisation is folded into the
     # templates (U -> U*s) so the projection B comes out already scaled:
@@ -191,25 +213,18 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
     Th = ops['Th_learned']
     nt = ops['nt']
     max_peels = ops['max_peels']
-    W = ops['wPCA'].contiguous()
+    if unit_cache is None:
+        unit_cache = _matching_unit_cache(ops, U)
+    s = unit_cache['s']
+    Us = unit_cache['Us']
+    U_time = unit_cache['U_time']
+    W = unit_cache['W']
 
-    nm = (U**2).sum(-1).sum(-1)
-    s = nm.clamp_min(1e-30).rsqrt()
-
-    Us = U * s.view(-1, 1, 1)
     B = conv1d(X.unsqueeze(1), W.unsqueeze(1), padding=nt//2)
     B = torch.einsum('ijk, kjl -> il', Us, B)
 
     trange = torch.arange(-nt, nt+1, device=device)
     tiwave = torch.arange(-(nt//2), nt//2+1, device=device)
-
-    # Unit waveforms in sample time, once per call. The peel used to re-einsum
-    # U[selected] @ W on every hit (up to max_peels times). Per-unit matmul is
-    # independent, so indexing a precomputed (n_units, C, nt) is bit-identical
-    # and avoids the dominant CPU cost of learned matching on dense MEA.
-    # Layout matches historical einsum('ijk, jl -> kil', U[sel], W) after
-    # permute: (C, n_sel, nt).
-    U_time = torch.einsum('ijk, jl -> ikl', U, W)
 
     # Growable peel buffer: dense MEA batches can exceed the historical 1e5
     # cap and crash mid-assign. Double capacity on overflow (same growth rule

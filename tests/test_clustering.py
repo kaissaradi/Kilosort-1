@@ -7,6 +7,7 @@ from kilosort.clustering_qr import (
     Mstats,
     kmeans_plusplus,
     mean_cluster_templates,
+    neigh_mat,
     x_centers,
 )
 from kilosort.hierarchical import Mstats as hierarchical_Mstats
@@ -57,6 +58,22 @@ def test_mean_cluster_templates_accepts_torch_iclust():
     W = mean_cluster_templates(Xd, iclust, ichan, n_chan=8, n_pcs=6)
     assert W.shape == (2, 8, 6)
     assert torch.isfinite(W[:, [2, 3], :]).all()
+
+
+def test_neigh_mat_drops_self_edges_like_historical_zeroing():
+    """CSR without self edges must match post-zeroing dense adjacency values."""
+    rng = np.random.default_rng(0)
+    n_samples, dim, n_neigh = 200, 12, 8
+    Xd = rng.standard_normal((n_samples, dim)).astype(np.float32)
+    kn, M = neigh_mat(Xd, nskip=1, n_neigh=n_neigh, max_sub=None, device=torch.device('cpu'))
+    # Historical: ones at kn then zero diagonal of subset (every row when nskip=1)
+    ref = np.zeros((n_samples, n_samples), dtype=np.float32)
+    for i in range(n_samples):
+        ref[i, kn[i]] = 1.0
+    np.fill_diagonal(ref, 0.0)
+    got = M.toarray()
+    np.testing.assert_array_equal(got, ref)
+    assert kn.shape == (n_samples, n_neigh)
 
 
 def test_mstats_zero_adjacency_finite():

@@ -62,12 +62,18 @@ def find_merges(crat, cc, cneg):
         y, x = np.unravel_index(np.argmax(crat), cc.shape)
         lam = crat[y,x]
 
+        # Stock mass formula (MouseLand); keep exact expression for identity.
         m      = cc[y,x] + cc[x,x] + cc[x,y] + cc[y,x]
         ki = cc[x,x] + cc[x,y]
         kj = cc[y,y] + cc[y,x]
-        cneg_l = .5 * (ki * kj + (m-ki) * (m-kj)) / m
         cpos_l = cc[y,x] + cc[x,y]
-        M      = cpos_l / cneg_l
+        # Empty 2x2 block (no edges) → 0/0 NaNs used to poison tstat and
+        # downstream split decisions. Treat as zero modularity ratio.
+        if m == 0:
+            M = 0.0
+        else:
+            cneg_l = .5 * (ki * kj + (m-ki) * (m-kj)) / m
+            M = cpos_l / cneg_l if cneg_l != 0 else 0.0
 
         cc[y]   = cc[y] + cc[x]
         cc[:,y] = cc[:,y] + cc[:,x]

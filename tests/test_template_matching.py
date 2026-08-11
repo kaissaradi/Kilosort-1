@@ -4,6 +4,7 @@ import torch
 from torch.nn.functional import conv1d
 
 from kilosort.template_matching import (
+    _matching_unit_cache,
     merging_function,
     prepare_matching,
     roll_features,
@@ -297,6 +298,16 @@ def test_run_matching_precomputed_U_time_matches_inline_einsum():
     # Peel should have found something on random noise at low Th, or at least
     # both paths agree on empty.
     assert st1.shape[0] == st.shape[0]
+
+    # Explicit unit_cache path (extract precompute) must match auto-cache.
+    cache = _matching_unit_cache(ops, U)
+    st2, a2, th2, X2 = run_matching(
+        ops, X.clone(), U, ctc, device=device, unit_cache=cache
+    )
+    assert torch.equal(st1, st2)
+    assert torch.equal(a1, a2)
+    assert torch.equal(th1, th2)
+    assert torch.equal(X1, X2)
 
 
 def test_merging_function_ccg_mode_matches_reference():
