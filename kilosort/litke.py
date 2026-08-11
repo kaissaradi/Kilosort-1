@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import BinaryIO, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
-from numba import njit
+from numba import njit, prange
 
 
 # --- Vision / Litke header tags (big-endian uint32) -------------------------
@@ -209,11 +209,13 @@ def pack_samples(data: np.ndarray) -> np.ndarray:
     return pack_samples_odd(data)
 
 
-@njit(cache=True)
+@njit(cache=True, parallel=True)
 def _unpack_even_numba(buf: np.ndarray, n_samples: int, n_elec: int,
                        out: np.ndarray) -> None:
-    k = 0
-    for i in range(n_samples):
+    # Independent per-sample byte base → prange-safe, bit-identical to serial.
+    bps = 3 * (n_elec // 2)
+    for i in prange(n_samples):
+        k = i * bps
         for j in range(0, n_elec, 2):
             b1 = np.int32(buf[k])
             b2 = np.int32(buf[k + 1])
@@ -223,11 +225,13 @@ def _unpack_even_numba(buf: np.ndarray, n_samples: int, n_elec: int,
             out[i, j + 1] = np.int16((((b2 & 0xF) << 8) | b3) - 2048)
 
 
-@njit(cache=True)
+@njit(cache=True, parallel=True)
 def _unpack_odd_numba(buf: np.ndarray, n_samples: int, n_elec: int,
                       out: np.ndarray) -> None:
-    k = 0
-    for i in range(n_samples):
+    # Odd: 2-byte TTL prefix + 3 bytes per remaining pair.
+    bps = 2 + 3 * ((n_elec - 1) // 2)
+    for i in prange(n_samples):
+        k = i * bps
         b1 = np.int32(buf[k])
         b2 = np.int32(buf[k + 1])
         k += 2
@@ -288,13 +292,13 @@ def unpack_samples(buf: np.ndarray, n_samples: int, n_elec: int,
     return out
 
 
-@njit(cache=True)
+@njit(cache=True, parallel=True)
 def _unpack_even_drop_ttl_numba(buf: np.ndarray, n_samples: int, n_elec: int,
                                 out: np.ndarray) -> None:
     """Even board: skip electrode 0, write electrodes 1..n_elec-1 → out (n, n_elec-1)."""
-    k = 0
-    n_out = n_elec - 1
-    for i in range(n_samples):
+    bps = 3 * (n_elec // 2)
+    for i in prange(n_samples):
+        k = i * bps
         # First pair: electrode 0 (TTL) + electrode 1
         b1 = np.int32(buf[k])
         b2 = np.int32(buf[k + 1])
@@ -314,13 +318,13 @@ def _unpack_even_drop_ttl_numba(buf: np.ndarray, n_samples: int, n_elec: int,
             col += 2
 
 
-@njit(cache=True)
+@njit(cache=True, parallel=True)
 def _unpack_odd_drop_ttl_numba(buf: np.ndarray, n_samples: int, n_elec: int,
                                out: np.ndarray) -> None:
     """Odd board: skip 16-bit TTL prefix, write neural electrodes to out."""
-    k = 0
-    for i in range(n_samples):
-        k += 2  # skip electrode 0 (raw 16-bit TTL)
+    bps = 2 + 3 * ((n_elec - 1) // 2)
+    for i in prange(n_samples):
+        k = i * bps + 2  # skip electrode 0 (raw 16-bit TTL)
         col = 0
         for j in range(1, n_elec, 2):
             b1 = np.int32(buf[k])
@@ -362,24 +366,24 @@ def unpack_samples_drop_ttl(buf: np.ndarray, n_samples: int, n_elec: int,
     return out
 
 
-@njit(cache=True)
+@njit(cache=True, parallel=True)
 def _unpack_ttl_even_numba(buf: np.ndarray, n_samples: int, n_elec: int,
                            out: np.ndarray) -> None:
     """Electrode 0 only for even boards (first 12-bit of each sample)."""
     bps = 3 * n_elec // 2
-    for i in range(n_samples):
+    for i in prange(n_samples):
         base = i * bps
         b1 = np.int32(buf[base])
         b2 = np.int32(buf[base + 1])
         out[i] = np.int16(((b1 << 4) | (b2 >> 4)) - 2048)
 
 
-@njit(cache=True)
+@njit(cache=True, parallel=True)
 def _unpack_ttl_odd_numba(buf: np.ndarray, n_samples: int, n_elec: int,
                           out: np.ndarray) -> None:
     """Electrode 0 only for odd boards (raw 16-bit TTL prefix)."""
     bps = 2 + (n_elec - 1) * 3 // 2
-    for i in range(n_samples):
+    for i in prange(n_samples):
         base = i * bps
         b1 = np.int32(buf[base])
         b2 = np.int32(buf[base + 1])
