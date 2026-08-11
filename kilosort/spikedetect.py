@@ -250,7 +250,8 @@ def _template_match_body_dispatch(*args):
         return _TM_BODY(*args)
 
 
-def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda')):
+def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda'),
+                   scratch=None):
     nt = ops['nt']
     nt0 = ops['settings']['nt0min']
     nk = ops['settings']['n_templates']
@@ -261,9 +262,22 @@ def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda')):
 
     W = ops['wTEMP'].unsqueeze(1)
     B = conv1d(X.unsqueeze(1), W, padding=nt//2)
-    As    = torch.zeros((Nfilt, NT), device=device)
-    Amaxs = torch.zeros((Nfilt, NT), device=device)
-    imaxs = torch.zeros((Nfilt, NT), dtype = torch.int64, device=device)
+    # Reuse (Nfilt, NT) peak buffers across batches when sizes match — saves
+    # ~3×Nfilt×NT alloc/zero on every batch of universal detect (dominant stage).
+    if (scratch is not None
+            and scratch['As'].shape == (Nfilt, NT)
+            and scratch['As'].device == device):
+        As = scratch['As'].zero_()
+        Amaxs = scratch['Amaxs'].zero_()
+        imaxs = scratch['imaxs'].zero_()
+    else:
+        As    = torch.zeros((Nfilt, NT), device=device)
+        Amaxs = torch.zeros((Nfilt, NT), device=device)
+        imaxs = torch.zeros((Nfilt, NT), dtype = torch.int64, device=device)
+        if scratch is not None:
+            scratch['As'] = As
+            scratch['Amaxs'] = Amaxs
+            scratch['imaxs'] = imaxs
     # iC2 is (nC2, Nfilt); flattening it lets the neighbour max below use
     # index_select, which reaches the same elements on a faster path than
     # advanced indexing.
@@ -393,6 +407,8 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
     k = 0
     nt = ops['nt']
     tarange = torch.arange(-(nt//2),nt//2+1, device = device)
+    # Scratch peak buffers reused by template_match across batches
+    tm_scratch = {}
     logger.info('Detecting spikes...')
     prog = tqdm(np.arange(bfile.n_batches), miniters=200 if progress_bar else None, 
                 mininterval=60 if progress_bar else None)
@@ -407,7 +423,9 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
                 log_performance(logger, 'debug', f'Batch {ibatch} of {nb-1} ({100*(ibatch/nb):.1f}%)')
 
             X = next(batches)
-            xy, imax, amp, adist = template_match(X, ops, iC, iC2, weigh, device=device)
+            xy, imax, amp, adist = template_match(
+                X, ops, iC, iC2, weigh, device=device, scratch=tm_scratch
+            )
             yct = yweighted(yc, iC, adist, xy, device=device)
             nsp = len(xy)
 
