@@ -264,16 +264,20 @@ def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda'),
     B = conv1d(X.unsqueeze(1), W, padding=nt//2)
     # Reuse (Nfilt, NT) peak buffers across batches when sizes match — saves
     # ~3×Nfilt×NT alloc/zero on every batch of universal detect (dominant stage).
+    # imaxs is signed template index encoding; int32 covers n_templates and
+    # peak-pool indices on MEA scales and halves the int64 slab (~0.6 GiB at
+    # 2600×60k vs float32 As/Amaxs peers).
     if (scratch is not None
             and scratch['As'].shape == (Nfilt, NT)
-            and scratch['As'].device == device):
+            and scratch['As'].device == device
+            and scratch['imaxs'].dtype == torch.int32):
         As = scratch['As'].zero_()
         Amaxs = scratch['Amaxs'].zero_()
         imaxs = scratch['imaxs'].zero_()
     else:
         As    = torch.zeros((Nfilt, NT), device=device)
         Amaxs = torch.zeros((Nfilt, NT), device=device)
-        imaxs = torch.zeros((Nfilt, NT), dtype = torch.int64, device=device)
+        imaxs = torch.zeros((Nfilt, NT), dtype=torch.int32, device=device)
         if scratch is not None:
             scratch['As'] = As
             scratch['Amaxs'] = Amaxs
@@ -302,7 +306,7 @@ def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda'),
         Aa, imax, Amax = _template_match_body_dispatch(
             B[:, :, lo:hi], weigh, iC, iC2_flat, nC2, Nfilt)
         As[:, lo:hi] = Aa
-        imaxs[:, lo:hi] = imax
+        imaxs[:, lo:hi] = imax.to(torch.int32)
         Amaxs[:, lo:hi] = Amax
 
     Amaxs[:,:nt] = 0
