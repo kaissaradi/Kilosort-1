@@ -65,6 +65,10 @@ Some things to be aware of when running Kilosort4:
 
 * We do not provide support for SpikeInterface, and are not involved in their development (or vise-versa). If you encounter problems running Kilosort4 through SpikeInterface, please try running Kilosort4 directly instead. In particular, the KS4 GUI is a useful tool for checking that your probe and data are formatted correctly.
 
+## Litke MEA data
+
+Litke packed ``.bin`` recordings (folder of ``dataXXXXXX.bin`` parts or a single file) can be sorted **without** offline conversion to int16. Use ``kilosort.litke.LitkeRecording`` as a ``file_object`` with ``run_kilosort`` / ``BinaryRWFile``, set ``n_chan_bin`` to ``rec.n_chan`` and ``fs`` to ``int(rec.fs)``, and pair with your Litke 512- or 519-channel probe. See [docs/litke.rst](docs/litke.rst) for a full guide.
+
 
 ## Integration with Phy GUI
 

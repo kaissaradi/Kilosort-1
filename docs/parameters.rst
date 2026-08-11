@@ -7,7 +7,7 @@ This page will give suggestions for when to change specific settings and why. No
 
 ``n_chan_bin`` (number of channels)
 -----------------------------------
-This should reflect the total number of channels in the binary file, `including non-ephys channels not used for sorting`. If you load your data in the GUI and see repeating diagonal patterns in the data, you probably need to change this value.
+This should reflect the total number of channels in the binary file, `including non-ephys channels not used for sorting`. If you load your data in the GUI and see repeating diagonal patterns in the data, you probably need to change this value. For native Litke packed bins via ``LitkeRecording`` (see :ref:`litke`), set ``n_chan_bin`` to ``rec.n_chan`` so it matches the probe after the default TTL drop.
 
 
 ``batch_size``
