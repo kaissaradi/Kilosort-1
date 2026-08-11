@@ -288,6 +288,56 @@ def unpack_samples(buf: np.ndarray, n_samples: int, n_elec: int,
     return out
 
 
+@njit(cache=True)
+def _unpack_ttl_even_numba(buf: np.ndarray, n_samples: int, n_elec: int,
+                           out: np.ndarray) -> None:
+    """Electrode 0 only for even boards (first 12-bit of each sample)."""
+    bps = 3 * n_elec // 2
+    for i in range(n_samples):
+        base = i * bps
+        b1 = np.int32(buf[base])
+        b2 = np.int32(buf[base + 1])
+        out[i] = np.int16(((b1 << 4) | (b2 >> 4)) - 2048)
+
+
+@njit(cache=True)
+def _unpack_ttl_odd_numba(buf: np.ndarray, n_samples: int, n_elec: int,
+                          out: np.ndarray) -> None:
+    """Electrode 0 only for odd boards (raw 16-bit TTL prefix)."""
+    bps = 2 + (n_elec - 1) * 3 // 2
+    for i in range(n_samples):
+        base = i * bps
+        b1 = np.int32(buf[base])
+        b2 = np.int32(buf[base + 1])
+        out[i] = np.int16((b1 << 8) | (b2 & 0xFF))
+
+
+def unpack_ttl(buf: np.ndarray, n_samples: int, n_elec: int,
+               out: Optional[np.ndarray] = None) -> np.ndarray:
+    """Unpack only electrode 0 (TTL / stim) from packed Litke bytes.
+
+    Bit-identical to ``unpack_samples(...)[:, 0]`` but does not materialize the
+    full (n_samples, n_elec) matrix — important for full-recording TTL export
+    on memory-constrained hosts (~18 GiB avoided on 519-ch data000).
+    """
+    buf = np.ascontiguousarray(buf, dtype=np.uint8).ravel()
+    need = n_samples * bytes_per_sample(n_elec)
+    if buf.size < need:
+        raise ValueError(
+            f'buffer has {buf.size} bytes, need {need} for '
+            f'{n_samples} samples × {n_elec} electrodes'
+        )
+    if out is None:
+        out = np.empty(n_samples, dtype=np.int16)
+    elif out.shape != (n_samples,) or out.dtype != np.int16:
+        raise ValueError('out must be int16 with shape (n_samples,)')
+    if n_elec % 2 == 0:
+        _unpack_ttl_even_numba(buf, n_samples, n_elec, out)
+    else:
+        _unpack_ttl_odd_numba(buf, n_samples, n_elec, out)
+    return out
+
+
 # --- Array-like multi-file recording ----------------------------------------
 
 def _list_bin_paths(path: Union[str, Path], ext: str = '.bin') -> List[Path]:
@@ -424,21 +474,20 @@ class LitkeRecording:
                 hi = mid - 1
         return lo
 
-    def _read_raw_samples(self, start: int, n: int) -> np.ndarray:
-        """Read and unpack ``n`` samples starting at global sample ``start``.
+    def _iter_packed_chunks(self, start: int, n: int):
+        """Yield ``(packed_uint8, take)`` for contiguous global samples.
 
-        Returns int16 array shape (n, num_electrodes) including TTL.
+        Shared by full unpack and TTL-only paths so multi-file edge math stays
+        in one place.
         """
         if n <= 0:
-            return np.zeros((0, self.num_electrodes), dtype=np.int16)
+            return
         end = start + n
         if start < 0 or end > self.n_samples:
             raise IndexError(
                 f'requested samples [{start}, {end}) outside '
                 f'[0, {self.n_samples})'
             )
-
-        out = np.empty((n, self.num_electrodes), dtype=np.int16)
         written = 0
         sample = start
         while written < n:
@@ -447,7 +496,6 @@ class LitkeRecording:
             file_end = self.sample_edges[fi + 1]
             take = min(n - written, file_end - sample)
             local = sample - file_start
-            # byte offset inside this file
             data_off = (self.header_length if fi == 0 else 0)
             byte_off = data_off + local * self.bytes_per_sample
             nbytes = take * self.bytes_per_sample
@@ -459,12 +507,39 @@ class LitkeRecording:
                     f'short read on {self.paths[fi]}: got {raw.size}, '
                     f'want {nbytes}'
                 )
+            yield raw, take
+            written += take
+            sample += take
+
+    def _read_raw_samples(self, start: int, n: int) -> np.ndarray:
+        """Read and unpack ``n`` samples starting at global sample ``start``.
+
+        Returns int16 array shape (n, num_electrodes) including TTL.
+        """
+        if n <= 0:
+            return np.zeros((0, self.num_electrodes), dtype=np.int16)
+        out = np.empty((n, self.num_electrodes), dtype=np.int16)
+        written = 0
+        for raw, take in self._iter_packed_chunks(start, n):
             unpack_samples(
                 raw, take, self.num_electrodes,
                 out=out[written:written + take],
             )
             written += take
-            sample += take
+        return out
+
+    def _read_ttl_samples(self, start: int, n: int) -> np.ndarray:
+        """Read electrode 0 only — bit-identical to ``_read_raw_samples()[:, 0]``."""
+        if n <= 0:
+            return np.zeros(0, dtype=np.int16)
+        out = np.empty(n, dtype=np.int16)
+        written = 0
+        for raw, take in self._iter_packed_chunks(start, n):
+            unpack_ttl(
+                raw, take, self.num_electrodes,
+                out=out[written:written + take],
+            )
+            written += take
         return out
 
     def __getitem__(self, idx):
@@ -540,8 +615,8 @@ class LitkeRecording:
         if n_samples is None:
             n_samples = self.n_samples - start
         n_samples = int(n_samples)
-        raw = self._read_raw_samples(start, n_samples)
-        return np.ascontiguousarray(raw[:, 0])
+        # TTL-only path: do not allocate (n, n_elec) just to drop all but ch0.
+        return self._read_ttl_samples(start, n_samples)
 
     def save_ttl(self, path: Union[str, Path], start: int = 0,
                  n_samples: Optional[int] = None,

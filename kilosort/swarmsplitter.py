@@ -199,9 +199,11 @@ def new_clusters(iclust, my_clus, xtree, tstat):
     # reassigned with a single integer gather instead of O(n_leaves) isin scans.
     max_label = -1
     for leaf in ind:
-        for orig in my_clus[leaf]:
-            if orig > max_label:
-                max_label = orig
+        members = my_clus[leaf]
+        if members:
+            m = max(members)
+            if m > max_label:
+                max_label = m
     if max_label < 0:
         return iclust_arr.copy()
 

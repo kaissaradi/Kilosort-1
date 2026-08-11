@@ -1588,17 +1588,26 @@ pytest tests/ -q --deselect tests/test_full_pipeline.py \
     <li>Commit often; <strong>push to origin/mea-optimizations</strong> when green (user wants remote backup). MEA primary.</li>
   </ol>
 
+  <h3>Cycle 9 — TTL-only unpack + continuous goal</h3>
+  <ul>
+    <li><code>litke.unpack_ttl</code> / <code>_read_ttl_samples</code>: electrode-0 decode without
+      materializing full (n, n_elec) slabs. Identity vs full unpack and real bin2py oracle col0.</li>
+    <li><code>mean_cluster_templates</code>: fill occupied labels first; empty NaN slab once.</li>
+    <li>Full data000 e2e (893 s, no tmax) running to
+      <code>…/sorted/20251204A/data000/kilosort4_litke_full_data000/</code> (non-golden).</li>
+  </ul>
+
   <h3>Plausible next (ordered)</h3>
   <ol>
-    <li><strong>Run --runslow once</strong> — NP mini full pipeline overnight; close integration audit gap (fast gate still deselects it).</li>
-    <li><strong>cProfile longer e2e</strong> if needed — KS runtime table already shows peel spike-det ~86% of tmax=5; further speed needs peel/GPU or non-identity.</li>
-    <li><strong>Hunt cycle-5-class latent bugs</strong> rather than another micro-opt pass.</li>
+    <li><strong>Finish full data000 e2e</strong> — record units/spikes/runtime table; profile if needed.</li>
+    <li><strong>Run --runslow once</strong> — NP mini full pipeline overnight; close integration audit gap.</li>
+    <li><strong>Hunt cycle-5-class latent bugs</strong> + small identity-locked CPU wins.</li>
     <li><strong>Swarm speed</strong> only if profile shows it — assume_sorted / check_split reuse.</li>
   </ol>
   <p class="note">
-    Already done: cycle-5 correctness fixes, cycle-6 native Litke, <strong>cycle-7 bin2py oracle + short e2e
-    (110 units / 14 good / ~80s)</strong>, <strong>cycle-8 single-batch right pad + yweighted/position NaN guards</strong>
-    (bit-identical on normal paths). Peel dominates wall time. Push to origin when green.
+    Already done: cycle-5–8 correctness + Litke + oracle + short e2e + pad/NaN;
+    <strong>cycle-9 TTL-only unpack</strong> (memory/speed for stim export). Continuous goal:
+    never stop iterating verified fixes. Peel dominates wall time. Push when green.
   </p>
 </section>
 
@@ -1612,7 +1621,7 @@ pytest tests/ -q --deselect tests/test_full_pipeline.py \
   </p>
   <p class="mono" style="font-size:0.8rem;color:var(--muted)">
     File: docs/MEA_FIELD_TEST_CONTEXT.html · Branch: mea-optimizations · Host: fieldlab ·
-    Cycles 1–8 · e2e + pad/NaN · 2026-08-10
+    Cycles 1–9 · TTL unpack + full e2e · 2026-08-11
   </p>
 </section>
 

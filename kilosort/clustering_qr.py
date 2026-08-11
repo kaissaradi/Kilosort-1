@@ -688,18 +688,17 @@ def mean_cluster_templates(Xd, iclust, ichan, n_chan, n_pcs):
     if Nfilt == 0:
         return W
 
+    # Fill occupied labels only; empty clusters get a single empty-mean NaN
+    # slab (matches Xd[:0].mean(0)) without scanning missing ids per call.
     groups = group_indices_by_label(iclust_np)
-    empty_mean = None
-    for j in range(Nfilt):
-        idxs = groups.get(j)
-        if idxs is None:
-            # Match torch mean over an empty selection → NaN features.
-            if empty_mean is None:
-                empty_mean = Xd[:0].mean(0)
-            w = empty_mean
-        else:
-            w = Xd[idxs].mean(0)
+    for j, idxs in groups.items():
+        w = Xd[idxs].mean(0)
         W[j, ichan, :] = torch.reshape(w, (-1, n_pcs))
+    if len(groups) < Nfilt:
+        empty_mean = torch.reshape(Xd[:0].mean(0), (-1, n_pcs))
+        for j in range(Nfilt):
+            if j not in groups:
+                W[j, ichan, :] = empty_mean
     return W
 
 

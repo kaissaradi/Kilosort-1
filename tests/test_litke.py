@@ -78,6 +78,45 @@ def test_pack_unpack_odd_identity():
     np.testing.assert_array_equal(out, ref)
 
 
+def test_unpack_ttl_matches_full_unpack_even():
+    """TTL-only path must be bit-identical to full unpack[:, 0] (even)."""
+    rng = np.random.default_rng(42)
+    data = rng.integers(-500, 500, size=(64, 8), dtype=np.int16)
+    packed = litke.pack_samples_even(data)
+    full = litke.unpack_samples(packed, 64, 8)
+    ttl = litke.unpack_ttl(packed, 64, 8)
+    np.testing.assert_array_equal(ttl, full[:, 0])
+    # preallocated out
+    out = np.empty(64, dtype=np.int16)
+    litke.unpack_ttl(packed, 64, 8, out=out)
+    np.testing.assert_array_equal(out, full[:, 0])
+
+
+def test_unpack_ttl_matches_full_unpack_odd():
+    """TTL-only path must be bit-identical to full unpack[:, 0] (odd)."""
+    rng = np.random.default_rng(43)
+    ttl0 = rng.integers(-3000, 3000, size=(40, 1), dtype=np.int16)
+    rec = rng.integers(-800, 800, size=(40, 6), dtype=np.int16)
+    data = np.concatenate([ttl0, rec], axis=1)
+    packed = litke.pack_samples_odd(data)
+    full = litke.unpack_samples(packed, 40, 7)
+    ttl = litke.unpack_ttl(packed, 40, 7)
+    np.testing.assert_array_equal(ttl, full[:, 0])
+
+
+def test_get_ttl_identity_vs_full_decode(tmp_path):
+    """Recording.get_ttl must match drop_ttl=False stream[:, 0]."""
+    rng = np.random.default_rng(44)
+    n_samples, n_elec = 120, 8
+    data = rng.integers(-400, 400, size=(n_samples, n_elec), dtype=np.int16)
+    path = _write_litke_file(tmp_path / 'ttl_id.bin', data)
+    with litke.LitkeRecording(path, drop_ttl=True) as rec:
+        got = rec.get_ttl()
+        full = rec._read_raw_samples(0, n_samples)
+        np.testing.assert_array_equal(got, full[:, 0])
+        np.testing.assert_array_equal(rec.get_ttl(10, 25), full[10:35, 0])
+
+
 def test_litke_recording_roundtrip(tmp_path):
     rng = np.random.default_rng(2)
     n_samples, n_elec = 200, 8  # even: no special TTL packing path vs 519
@@ -242,6 +281,10 @@ def test_real_519_unpack_matches_bin2py_oracle():
     # pure-Python path must agree too (catches numba-only skew)
     py = litke.unpack_samples_python(packed, n_samples, n_elec)
     np.testing.assert_array_equal(py, expected)
+
+    # TTL-only path vs full oracle column 0 (real packed bytes)
+    ttl = litke.unpack_ttl(packed, n_samples, n_elec)
+    np.testing.assert_array_equal(ttl, expected[:, 0])
 
 
 def test_odd_unpack_matches_bin2py_oracle():
