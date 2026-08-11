@@ -1,33 +1,27 @@
 """Native Litke packed-bin reader for Kilosort (no convert step).
 
-Litke MEA recordings store samples as packed 12-bit values (plus a 16-bit TTL
-channel on odd electrode counts). Lab tooling converts to int16 via bin2py
-before sorting; that rewrite is multi-GB and blocked when the Cython extension
-is not built.
+Litke MEA bins pack 12-bit electrode samples. **Electrode 0 is the TTL /
+visual-stimulus trigger channel — not spikes.** Lab converters strip it before
+sorting; this module does the same by default and can export TTL separately.
 
-This module provides an array-like ``file_object`` that BinaryRWFile /
-``run_kilosort(..., file_object=...)`` can stream from directly:
+Array-like ``file_object`` for BinaryRWFile / ``run_kilosort(..., file_object=)``:
 
-* Header parse is pure Python (big-endian Vision tags).
-* Sample unpack is Numba JIT (already a kilosort dependency) — no Cython,
-  no CUDA. Matches bin2py's ``unpack_bin_{even,odd}_num_electrodes``.
-* Multi-file folders (``data000000.bin``, ``data000001.bin``, …) are joined
-  by sample index the same way ``PyBinFileReader`` does.
-* By default the TTL channel is dropped so ``shape[1]`` equals the recording
-  channel count used by the lab converter / probe maps (512 or 519).
+* Pure-Python Vision header; Numba unpack matching bin2py bit layout
+  (bit-exact vs lab ``bin2py_cythonext`` on real 519 data).
+* Multi-file folders joined like ``PyBinFileReader``.
+* ``drop_ttl=True`` (default): electrode 0 omitted → 512/519 neural channels.
+* ``get_ttl`` / ``save_ttl`` / ``detect_ttl_onsets``: keep stim sync separately.
 
 Usage
 -----
 >>> from kilosort.litke import LitkeRecording
->>> rec = LitkeRecording('/path/to/data000')   # folder or single .bin
->>> # rec.shape == (n_samples, n_channels), dtype int16
+>>> rec = LitkeRecording('/path/to/data000')   # TTL dropped for sorting
+>>> rec.save_ttl('ttl_chan0.npy')              # stim triggers only
+>>> onsets = rec.detect_ttl_onsets()           # rising edges (lab thr=1000)
 >>> from kilosort.io import BinaryRWFile
 >>> bfile = BinaryRWFile(
-...     filename=str(rec.paths[0]), n_chan_bin=rec.shape[1],
+...     filename=str(rec.paths[0]), n_chan_bin=rec.n_chan,
 ...     fs=rec.fs, file_object=rec, device='cpu')
-
-Accuracy: unpack is bit-exact vs the reference pack/unpack in tests and vs
-bin2py's published bit layout. Do not rewrite the nibble packing.
 """
 
 from __future__ import annotations
@@ -311,16 +305,28 @@ def _list_bin_paths(path: Union[str, Path], ext: str = '.bin') -> List[Path]:
     return [path]
 
 
+# Default edge threshold used by MEA-fieldlab / convert_litke_to_kilosort
+# when detecting stimulus triggers on electrode 0.
+DEFAULT_TTL_THRESHOLD = 1000
+
+
 class LitkeRecording:
     """Array-like view of a Litke recording for Kilosort ``file_object``.
+
+    Electrode **0 is the TTL / visual-stim trigger channel**, not a spike
+    channel. With ``drop_ttl=True`` (default) it is excluded from ``shape`` and
+    ``__getitem__`` so Kilosort only sees neural electrodes (512 or 519).
+    Use :meth:`get_ttl`, :meth:`save_ttl`, and :meth:`detect_ttl_onsets` to keep
+    the stim sync stream.
 
     Parameters
     ----------
     path : str or Path
         Folder of multi-part ``.bin`` files, or a single ``.bin`` path.
     drop_ttl : bool
-        If True (default), channel 0 (TTL) is omitted so ``shape[1]`` matches
-        the lab converter output and Litke probe maps (512 or 519 channels).
+        If True (default), electrode 0 (TTL / stim triggers) is omitted so
+        ``shape[1]`` matches the lab converter output and Litke probe maps
+        (512 or 519 channels). **Leave True for spike sorting.**
     ext : str
         File extension to collect in folder mode (default ``.bin``).
     """
@@ -510,7 +516,120 @@ class LitkeRecording:
             data = data[:, 1:]
         return data[:, c_idx]
 
+    # -- TTL / stim trigger channel (electrode 0) ----------------------------
+
+    def get_ttl(self, start: int = 0, n_samples: Optional[int] = None) -> np.ndarray:
+        """Return electrode 0 (TTL / visual-stim triggers) as int16.
+
+        This channel is **not** neural data. It is always electrode index 0 in
+        the packed Litke layout, independent of ``drop_ttl``.
+
+        Parameters
+        ----------
+        start : int
+            First sample index (inclusive).
+        n_samples : int or None
+            Number of samples. ``None`` reads through the end of the recording.
+
+        Returns
+        -------
+        np.ndarray
+            Shape ``(n_samples,)``, dtype int16.
+        """
+        start = int(start)
+        if n_samples is None:
+            n_samples = self.n_samples - start
+        n_samples = int(n_samples)
+        raw = self._read_raw_samples(start, n_samples)
+        return np.ascontiguousarray(raw[:, 0])
+
+    def save_ttl(self, path: Union[str, Path], start: int = 0,
+                 n_samples: Optional[int] = None,
+                 chunk_samples: int = 100_000) -> Path:
+        """Write electrode 0 (TTL) to ``.npy`` (int16 vector) for later use.
+
+        Does not include TTL in the Kilosort ``file_object`` stream. Prefer this
+        over sorting with ``drop_ttl=False``.
+
+        Parameters
+        ----------
+        path : path-like
+            Output path. Should end in ``.npy`` (``np.save``).
+        start, n_samples
+            Sample window; same meaning as :meth:`get_ttl`.
+        chunk_samples : int
+            Disk-friendly read size when exporting long recordings.
+
+        Returns
+        -------
+        Path
+            Resolved output path.
+        """
+        path = Path(path)
+        start = int(start)
+        total = self.n_samples - start if n_samples is None else int(n_samples)
+        if total < 0 or start + total > self.n_samples:
+            raise IndexError('TTL export window out of bounds')
+
+        out = np.empty(total, dtype=np.int16)
+        done = 0
+        while done < total:
+            take = min(chunk_samples, total - done)
+            out[done:done + take] = self.get_ttl(start + done, take)
+            done += take
+        np.save(path, out)
+        return path.resolve()
+
+    def detect_ttl_onsets(self, threshold: int = DEFAULT_TTL_THRESHOLD,
+                          start: int = 0,
+                          n_samples: Optional[int] = None,
+                          chunk_samples: int = 100_000) -> np.ndarray:
+        """Sample indices of rising TTL edges (lab converter convention).
+
+        Matches MEA-fieldlab / ``convert_litke_to_kilosort``: a rising edge is
+        where the signal goes from ``< -threshold`` to ``>= -threshold``
+        (default ``threshold=1000``). Indices are absolute within the full
+        recording (offset by ``start``).
+
+        Returns
+        -------
+        np.ndarray
+            1-D int64 sample indices of detected onsets.
+        """
+        start = int(start)
+        total = self.n_samples - start if n_samples is None else int(n_samples)
+        if total <= 1:
+            return np.zeros(0, dtype=np.int64)
+
+        thr = int(threshold)
+        onsets: List[int] = []
+        # Carry one sample so edges on chunk boundaries are not missed.
+        prev = None
+        done = 0
+        while done < total:
+            take = min(chunk_samples, total - done)
+            seg = self.get_ttl(start + done, take)
+            if prev is not None:
+                work = np.empty(take + 1, dtype=np.int16)
+                work[0] = prev
+                work[1:] = seg
+                offset = start + done - 1
+            else:
+                work = seg
+                offset = start + done
+            below = work < -thr
+            above = ~below
+            edges = np.flatnonzero(below[:-1] & above[1:])
+            if edges.size:
+                onsets.append(edges.astype(np.int64) + offset)
+            prev = seg[-1]
+            done += take
+
+        if not onsets:
+            return np.zeros(0, dtype=np.int64)
+        return np.concatenate(onsets)
+
 
 def open_litke(path: Union[str, Path], drop_ttl: bool = True) -> LitkeRecording:
-    """Convenience constructor matching lab default (TTL dropped)."""
+    """Convenience constructor matching lab default (TTL dropped for sorting)."""
     return LitkeRecording(path, drop_ttl=drop_ttl)

@@ -60,6 +60,27 @@ Note you will always have to run `conda activate kilosort` before you run kiloso
 4. Hit `LOAD`. The data should now be visible.
 5. Hit `Run`. This will run the pipeline and output the results in a format compatible with Phy, the most popular spike sorting curating software.
 
+### Litke MEA `.bin` files (native, no convert)
+
+Litke/Vision recordings are packed binaries (not plain int16). This fork can stream them with `kilosort.litke.LitkeRecording` as a `file_object` for `run_kilosort` / `BinaryRWFile`.
+
+**Electrode 0 is TTL (visual-stim sync), not spikes.** It is dropped by default so Kilosort sees 512/519 neural channels. Save triggers separately with `rec.save_ttl(...)` / `rec.detect_ttl_onsets()`.
+
+```python
+from kilosort.litke import LitkeRecording
+from kilosort import run_kilosort
+
+rec = LitkeRecording('/path/to/EXP/data000')  # folder or single .bin
+rec.save_ttl('ttl_chan0.npy')                 # stim TTL only
+run_kilosort(
+    {'n_chan_bin': rec.n_chan, 'fs': int(rec.fs), 'results_dir': 'ks_out'},
+    filename=str(rec.paths[0]),
+    file_object=rec,
+)
+```
+
+Full guide: [docs/litke.rst](docs/litke.rst).
+
 Some things to be aware of when running Kilosort4:
 * Re-using parameters from previous versions of Kilosort will probably not work well. Kilosort4 is a new algorithm, and the main parameters (like the detection thresholds) can affect the results in different ways. **Please start with the default parameters** and adjust from there based on what you see in Phy. For descriptions of Kilosort4's parameters, you can mouse-over their names in the GUI or look at `kilosort.parameters.py`. You can find [additional explanation for some parameters here](https://kilosort.readthedocs.io/en/latest/parameters.html).
 

@@ -1,167 +1,144 @@
-.. _litke:
+Litke MEA binary data
+=====================
 
-Litke MEA data
-==============
+This fork can stream **Litke / Vision packed ``.bin``** recordings into Kilosort
+without an offline multi‑GB conversion step.
 
-Kilosort can sort Litke multi-electrode array (MEA) recordings directly from
-their native packed ``.bin`` files. You do not need an offline conversion to
-int16 before sorting.
-
-
-What Litke data looks like
---------------------------
-
-A Litke recording is typically either:
-
-* a **folder** of multi-part files named like ``data000000.bin``,
-  ``data000001.bin``, … (for example ``/path/to/EXP/data000/``), or
-* a **single** ``.bin`` file with the same format.
-
-Each file begins with a **Vision / Litke binary header** (big-endian tags).
-Sample data after the header is **packed 12-bit** values. When the electrode
-count is odd, channel 0 is a 16-bit **TTL** channel packed separately from the
-12-bit recording channels.
-
-After unpacking with the default TTL handling, the array shape used for sorting
-is ``(n_samples, n_channels)`` with ``dtype=int16``, where ``n_channels`` is
-usually **512** or **519** to match lab probe maps.
-
-
-Why use the native reader
--------------------------
-
-Lab pipelines often convert Litke bins to a plain int16 binary with tools such
-as ``bin2py`` before spike sorting. That rewrite:
-
-* can produce multi-gigabyte intermediate files, and
-* may require a Cython extension that is not always built.
-
-``kilosort.litke.LitkeRecording`` streams samples on the fly: the header is
-parsed in pure Python, and samples are unpacked with Numba (already a Kilosort
-dependency). No separate convert step and no Cython build are required for
-sorting.
-
-
-Minimal working example
------------------------
-
-Pass a ``LitkeRecording`` as ``file_object`` to ``run_kilosort``. You still
-provide a ``filename`` (Kilosort uses it for bookkeeping); data are read from
-the recording object, not as raw int16 from that path.
-
-.. code-block:: python
-
-   from pathlib import Path
-   from kilosort import run_kilosort
-   from kilosort.litke import LitkeRecording
-
-   # Folder of dataXXXXXX.bin parts, or a single .bin path
-   data_path = Path('/path/to/EXP/data000')
-   rec = LitkeRecording(data_path)  # drop_ttl=True by default
-
-   settings = {
-       'n_chan_bin': rec.n_chan,       # must match probe channel count
-       'fs': int(rec.fs),              # often 20000 for Litke
-       # Optional: limit duration for a smoke test (seconds)
-       # 'tmax': 30,
-   }
-
-   ops, st, clu, tF, Wall, similar_templates, \
-       is_ref, est_contam_rate, kept_spikes = run_kilosort(
-           settings=settings,
-           filename=str(rec.paths[0]),
-           file_object=rec,
-           probe=your_litke_probe,     # 512- or 519-channel Litke probe map
-           # probe_name=...            # if you load probes by name in your setup
-           results_dir=data_path / 'kilosort4',
-       )
-   rec.close()
-
-
-Using ``BinaryRWFile`` with ``file_object``
+Electrode 0 is TTL (stim sync), not spikes
 ------------------------------------------
 
-The same object works with the lower-level IO wrapper:
+In every Litke bin, **electrode index 0 is the digital TTL / visual‑stimulus
+trigger channel**. It is used to align stimulus frames and other lab events.
+It is **not** a recording electrode for spike sorting.
+
+| Role | Index in packed bin | Used for spike sorting? |
+| ---- | ------------------- | ----------------------- |
+| TTL / visual stim triggers | ``0`` | **No** (dropped by default) |
+| Neural electrodes | ``1 … N-1`` | Yes → 512 or 519 channels |
+
+Lab converters (``convert_litke_to_kilosort``, MEA‑fieldlab join scripts) write
+only ``samples[:, 1:]`` to the int16 file Kilosort sorts. Native IO matches that
+contract with ``drop_ttl=True`` (the default).
+
+**Do not** pass electrode 0 into Kilosort as a neural channel. If you need the
+stim stream, save it separately (see below).
+
+Quick start
+-----------
 
 .. code-block:: python
 
-   from kilosort.io import BinaryRWFile
-   from kilosort.litke import LitkeRecording
+    from pathlib import Path
+    from kilosort.litke import LitkeRecording
+    from kilosort import run_kilosort
 
-   rec = LitkeRecording('/path/to/EXP/data000')
-   bfile = BinaryRWFile(
-       filename=str(rec.paths[0]),
-       n_chan_bin=rec.n_chan,
-       fs=int(rec.fs),
-       file_object=rec,
-       device='cpu',   # or a CUDA device string / torch.device
-   )
-   # bfile.padded_batch_to_torch(batch_index) → torch tensor for one batch
-   rec.close()
+    litke_path = Path('/path/to/EXP/data000')  # folder of data000000.bin, …
+    # or a single: Path('/path/to/data000000.bin')
 
+    rec = LitkeRecording(litke_path)  # drop_ttl=True → neural channels only
+    print(rec.shape, rec.fs, rec.array_id, rec.n_chan)
+    # e.g. (17860000, 519), 20000.0, 1551, 519
 
-Required settings and probe
+    # Optional: keep stim TTL for alignment (not used by sorting)
+    rec.save_ttl(Path('results') / 'ttl_chan0.npy')
+    onset_samples = rec.detect_ttl_onsets()  # lab threshold 1000
+    np.save(Path('results') / 'ttl_onsets.npy', onset_samples)
+
+    settings = {
+        'n_chan_bin': rec.n_chan,   # 512 or 519 — must match probe
+        'fs': int(rec.fs),          # usually 20000
+        'results_dir': 'results/kilosort4_litke',
+        # 'tmin': 0, 'tmax': 10,    # short smoke on CPU
+        # … plus your production thresholds / dmin / probe …
+    }
+    run_kilosort(
+        settings,
+        filename=str(rec.paths[0]),  # still required for bookkeeping
+        file_object=rec,
+        # probe=your_litke_probe,
+    )
+    rec.close()
+
+Using ``BinaryRWFile`` only
 ---------------------------
 
-Match these to the recording and your probe layout:
+.. code-block:: python
 
-+------------------+----------------------------------------------------------+
-| Setting          | Value                                                    |
-+==================+==========================================================+
-| ``n_chan_bin``   | ``rec.n_chan`` (channels after TTL handling; typically   |
-|                  | 512 or 519)                                              |
-+------------------+----------------------------------------------------------+
-| ``fs``           | ``int(rec.fs)``, commonly ``20000`` for Litke            |
-+------------------+----------------------------------------------------------+
-| Probe            | Your Litke **512** or **519** probe map; ``n_chan_bin``  |
-|                  | must match the number of channels in that probe          |
-+------------------+----------------------------------------------------------+
-| ``drop_ttl``     | ``True`` (default on ``LitkeRecording``): drop channel 0 |
-|                  | so the layout matches lab converter output and probe maps|
-+------------------+----------------------------------------------------------+
+    import torch
+    from kilosort.litke import LitkeRecording
+    from kilosort.io import BinaryRWFile
 
-Do not invent probe paths. Use the Litke 512/519 probe file you already use for
-converted data so channel order and geometry stay consistent.
+    rec = LitkeRecording('/path/to/data000')
+    bfile = BinaryRWFile(
+        filename=str(rec.paths[0]),
+        n_chan_bin=rec.n_chan,
+        fs=int(rec.fs),
+        file_object=rec,
+        device=torch.device('cpu'),  # or 'cuda'
+        tmin=0,
+        tmax=5,  # seconds — optional short window
+    )
+    X = bfile.padded_batch_to_torch(0)  # shape (n_chan, NT + 2*nt)
 
+Saving TTL separately
+---------------------
 
-Smoke tests with ``tmax``
--------------------------
+.. code-block:: python
 
-For a short end-to-end check without sorting a full multi-hour experiment, set
-``tmax`` in seconds (for example ``30`` or ``60``) in ``settings``. That limits
-how much of the recording Kilosort processes while still exercising the native
-reader and the rest of the pipeline.
+    from kilosort.litke import LitkeRecording
 
+    with LitkeRecording('/path/to/data000') as rec:
+        # Full int16 waveform of electrode 0
+        rec.save_ttl('ttl_chan0.npy')
 
-TTL channel
------------
+        # Or a window
+        ttl = rec.get_ttl(start=0, n_samples=rec.fs * 60)  # first minute
 
-On odd electrode counts, **TTL is channel 0** in the packed layout. By default
-(``drop_ttl=True``), ``LitkeRecording`` omits that channel so ``shape[1]``
-matches the lab converter and standard Litke probe maps (512 or 519 recording
-channels). Only set ``drop_ttl=False`` if you intentionally want the TTL
-channel included and have adjusted ``n_chan_bin`` and the probe accordingly.
+        # Rising edges (same rule as convert_litke_to_kilosort):
+        # transition from < -threshold to >= -threshold, default threshold=1000
+        onsets = rec.detect_ttl_onsets(threshold=1000)
+        # onsets are sample indices; times in seconds: onsets / rec.fs
 
+``get_ttl`` always returns electrode 0, even when ``drop_ttl=True``. You do
+**not** need ``drop_ttl=False`` (which would put TTL into the sorting matrix).
+
+What the files look like
+------------------------
+
+* **Folder mode:** ``data000/data000000.bin``, ``data000001.bin``, …  
+  Header lives in the first file; later files are packed sample bodies only.
+* **Single file:** one ``.bin`` with header + body.
+* **Sample rate:** usually 20 kHz (from the Vision header).
+* **Channel counts after dropping TTL:**
+  * 519‑electrode (30 µm) boards → **519** neural channels (520 incl. TTL).
+  * 512‑electrode (60 µm) boards → **512** neural channels (513 incl. TTL).
+
+``n_chan_bin`` and your probe geometry must match those neural counts.
 
 What not to do
 --------------
 
-* **Do not** pass a raw Litke ``.bin`` path to ``BinaryRWFile`` or
-  ``run_kilosort`` as a plain int16 binary **without** ``file_object``. The
-  packed 12-bit layout is not row-major int16; results will be wrong or the
-  load will fail.
-* **Do not** drop the TTL twice (for example convert offline with TTL removed
-  and also use another custom drop). With the native reader, leave
-  ``drop_ttl=True`` and use the same probe as for converter output.
-* **Do not** set ``n_chan_bin`` to the wrong count (header electrode count
-  including TTL, or a Neuropixels default). Always use ``rec.n_chan`` with the
-  matching 512- or 519-channel Litke probe.
+* Do **not** open a Litke ``.bin`` as a plain int16 ``BinaryRWFile`` filename.
+  The file is packed 12‑bit Vision data, not interleaved int16 samples.
+* Do **not** set ``drop_ttl=False`` for sorting unless you intentionally change
+  channel count and probe maps (almost never).
+* Do **not** treat electrode 0 as a spike channel in Phy or analysis.
 
+Correctness
+-----------
 
-Correctness tests
------------------
+* Unpack layout matches bin2py
+  (``unpack_bin_even_num_electrodes`` / ``unpack_bin_odd_num_electrodes``).
+* Unit tests: ``tests/test_litke.py`` (pack/unpack identity, multi‑file,
+  TTL drop, TTL save/onsets, ``BinaryRWFile`` smoke).
+* Field check on real ``20251204A/data000``: unpack bit‑exact vs lab
+  ``bin2py_cythonext``; electrode 0 shows large stim‑like swings while neural
+  channels stay in the normal MEA range.
 
-The unpack layout and ``file_object`` integration are covered by
-``tests/test_litke.py`` (header parse, even/odd pack–unpack identity, TTL drop,
-multi-file folders, and ``BinaryRWFile`` smoke). Treat that suite as the
-correctness contract when changing Litke IO.
+API summary
+-----------
+
+* ``LitkeRecording(path, drop_ttl=True)`` — array‑like ``(n_samples, n_chan)`` int16
+* ``rec.n_chan``, ``rec.fs``, ``rec.array_id``, ``rec.paths``
+* ``rec.get_ttl(...)`` / ``rec.save_ttl(path)`` / ``rec.detect_ttl_onsets(...)``
+* ``open_litke(path)`` — same as the constructor

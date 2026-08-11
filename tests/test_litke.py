@@ -159,3 +159,49 @@ def test_parse_header_rejects_garbage(tmp_path):
     p.write_bytes(b'not a litke file' + b'\x00' * 64)
     with pytest.raises(ValueError, match='Litke|header'):
         litke.LitkeRecording(p)
+
+
+def test_electrode0_is_ttl_dropped_from_sorting_stream(tmp_path):
+    """Electrode 0 is stim TTL, not spikes — must not enter KS file_object.
+
+    Lab contract: converter writes samples[:, 1:] only. drop_ttl=True must
+    match that; get_ttl always returns electrode 0 even when drop_ttl=True.
+    """
+    rng = np.random.default_rng(7)
+    n_samples, n_elec = 80, 7  # odd → TTL packed as 16-bit ch0
+    # Distinct TTL waveform vs neural-looking noise
+    ttl = np.zeros(n_samples, dtype=np.int16)
+    ttl[10:20] = -2000
+    ttl[20:30] = 0
+    ttl[40:50] = -2000
+    rec_ch = rng.integers(-100, 100, size=(n_samples, n_elec - 1), dtype=np.int16)
+    data = np.concatenate([ttl[:, None], rec_ch], axis=1)
+    path = _write_litke_file(tmp_path / 'ttl.bin', data, array_id=504)
+
+    with litke.LitkeRecording(path, drop_ttl=True) as rec:
+        assert rec.shape == (n_samples, n_elec - 1)
+        # Sorting stream is neural only
+        np.testing.assert_array_equal(rec[:], rec_ch)
+        # TTL still available separately
+        np.testing.assert_array_equal(rec.get_ttl(), ttl)
+        np.testing.assert_array_equal(rec.get_ttl(5, 10), ttl[5:15])
+        out = rec.save_ttl(tmp_path / 'ttl_chan0.npy')
+        np.testing.assert_array_equal(np.load(out), ttl)
+        # Lab-style rising edges: below[:-1] & above[1:] → index of last
+        # sample still < -thr (convert_litke_to_kilosort convention).
+        onsets = rec.detect_ttl_onsets(threshold=1000)
+        # pulses end at 20 and 50 → reported indices 19 and 49
+        np.testing.assert_array_equal(onsets, np.array([19, 49], dtype=np.int64))
+
+
+def test_detect_ttl_onsets_chunk_boundary(tmp_path):
+    """Onsets spanning read chunks must not be lost."""
+    n_samples, n_elec = 50, 7
+    ttl = np.full(n_samples, -2000, dtype=np.int16)
+    ttl[25:] = 0  # sample 24 still low, 25 high → lab index 24
+    rec_ch = np.zeros((n_samples, n_elec - 1), dtype=np.int16)
+    data = np.concatenate([ttl[:, None], rec_ch], axis=1)
+    path = _write_litke_file(tmp_path / 'edge.bin', data, array_id=504)
+    with litke.LitkeRecording(path, drop_ttl=True) as rec:
+        onsets = rec.detect_ttl_onsets(threshold=1000, chunk_samples=10)
+        np.testing.assert_array_equal(onsets, np.array([24], dtype=np.int64))
