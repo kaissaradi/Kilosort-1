@@ -279,9 +279,9 @@
       <div><strong>Branch</strong> · mea-optimizations</div>
       <div><strong>Fork</strong> · kaissaradi/Kilosort-1</div>
       <div><strong>Survey date</strong> · 2026-08-10</div>
-      <div><strong>Updated</strong> · 2026-08-10 · cycles 1–4 + get_data_cpu + pipeline status</div>
-      <div><strong>HEAD</strong> · 64eace1 code · docs tip (ahead origin by 13)</div>
-      <div><strong>Status</strong> · Living brief · cycles 1–4 + get_data_cpu · e2e/Litke IO pending</div>
+      <div><strong>Updated</strong> · 2026-08-10 · cycle 5 bugfix + handoff</div>
+      <div><strong>HEAD</strong> · b53de47 code · ahead origin (see §15)</div>
+      <div><strong>Status</strong> · Living brief · cycles 1–5 · e2e/Litke IO still pending</div>
     </div>
   </div>
   <div class="accent-bar"></div>
@@ -1007,27 +1007,29 @@ nproc; free -h; nvidia-smi || true</code></pre>
 
 <!-- 15 CPU OPTIMIZATION LOG -->
 <section id="cpu-log">
-  <h2>15 · CPU optimization log (living · cycles 1–4)</h2>
+  <h2>15 · CPU optimization log (living · cycles 1–5)</h2>
   <p class="lede">
-    Fieldlab is the gate for pure-CPU correctness. Cycles keep numerical identity
-    (unit-level vs independent references) and extend the in-repo pytest surface.
-    Full MEA multi-GB e2e remains a non-goal on this host. This section is the
-    handoff snapshot for agents after context compaction — read it first.
+    Fieldlab is the gate for pure-CPU correctness. Prefer accuracy-preserving
+    fixes with identity tests. Full multi-GB MEA e2e is a non-goal as a CI gate
+    on this host. <strong>This section is the sole agent handoff</strong> after
+    compaction — read it first; do not invent parallel status docs.
   </p>
 
   <div class="callout ok">
-    <div class="tag">Snapshot · 2026-08-10 · cycles 1–4 + get_data_cpu</div>
-    Branch <code>mea-optimizations</code> · latest code <code>64eace1</code>
-    (<code>get_data_cpu</code> scatter) · cycle-4 group-by <code>ff902e1</code> ·
-    <strong>local ahead of origin by 13</strong> (includes this docs refresh) ·
-    not pushed unless user asks. Tip: <code>git rev-parse --short HEAD</code>.
+    <div class="tag">Snapshot · 2026-08-10 · cycle 5 handoff</div>
+    Branch <code>mea-optimizations</code> · HEAD <code>b53de47</code>
+    (bugfix + micro-opts) · prior test-only <code>089db86</code>
+    (<code>make_pc_features</code>) · <code>get_data_cpu</code> <code>64eace1</code> ·
+    <strong>local ahead of origin</strong> · <strong>do not push</strong> unless
+    user asks. Tip: <code>git rev-parse --short HEAD</code>.
   </div>
 
   <div class="callout ok">
     <div class="tag">Fast suite gate (latest verified)</div>
-    <code>pytest tests/ -q</code> with full_pipeline + <code>test_wpca_wtemp</code> deselected
-    → <strong>66 passed, 2 deselected</strong> after <code>get_data_cpu</code>
-    (was 60 post–cycle&nbsp;4; was 53 pre–cycle&nbsp;4).
+    <code>pytest tests/ -q --deselect tests/test_full_pipeline.py
+    --deselect tests/test_spikedetect.py::test_wpca_wtemp</code>
+    → <strong>75 passed, 2 deselected</strong>
+    (was 66 after get_data_cpu; was 60 post–cycle&nbsp;4).
   </div>
 
   <h3>Results at a glance</h3>
@@ -1037,54 +1039,29 @@ nproc; free -h; nvidia-smi || true</code></pre>
     </thead>
     <tbody>
       <tr>
-        <td>CPU cycles 1–4 + skeptic</td>
+        <td>CPU cycles 1–4 + get_data_cpu</td>
         <td><strong>Landed</strong></td>
-        <td>Buffers, CCG, duplicates, clips, whitening, labels_in, merge/PC group-by</td>
+        <td>Buffers, CCG refract, duplicates, clips, whitening nearest, labels_in, merge/PC group-by, scatter</td>
+      </tr>
+      <tr>
+        <td>Cycle 5 · correctness + micro</td>
+        <td><strong>Landed</strong> · <code>b53de47</code></td>
+        <td>IO short-tail crash, whitening 1-batch, empty-tree collapse, CCG T==0, peel grow, device kNN, mean templates</td>
+      </tr>
+      <tr>
+        <td><code>make_pc_features</code> identity</td>
+        <td><strong>Landed</strong> · <code>089db86</code></td>
+        <td>vs historical per-cluster mask loop (export path)</td>
       </tr>
       <tr>
         <td><code>get_data_cpu</code> scatter</td>
         <td><strong>Landed</strong> · ~12→~3.3&nbsp;ms (~3.7×)</td>
-        <td>5k spikes / 40 templates; identity vs loop reference (<code>64eace1</code>)</td>
+        <td>5k spikes / 40 templates; identity vs loop (<code>64eace1</code>)</td>
       </tr>
       <tr>
         <td>Fast pytest gate</td>
-        <td><strong>66 passed · 2 deselected</strong></td>
+        <td><strong>75 passed · 2 deselected</strong></td>
         <td>Deselect full_pipeline + <code>test_wpca_wtemp</code> (SIGILL risk on fieldlab)</td>
-      </tr>
-      <tr>
-        <td>Pure unit surface</td>
-        <td>8 modules</td>
-        <td>Cycle 4: <code>test_utils</code>, <code>test_template_matching</code>; then <code>test_get_data_cpu</code></td>
-      </tr>
-      <tr>
-        <td><code>remove_duplicates</code></td>
-        <td>~1.3&nbsp;ms/call</td>
-        <td>200k spikes · 200 clusters (numba warm)</td>
-      </tr>
-      <tr>
-        <td><code>whitening_local</code></td>
-        <td>~54&nbsp;ms</td>
-        <td>128 ch · nrange=32; SVD still dominates</td>
-      </tr>
-      <tr>
-        <td><code>new_clusters</code></td>
-        <td>~9&nbsp;ms</td>
-        <td>200k spikes · 200 labels</td>
-      </tr>
-      <tr>
-        <td><code>labels_in</code> vs <code>np.isin</code></td>
-        <td>~1.0 vs ~1.5&nbsp;ms</td>
-        <td>200k labels · 80 members</td>
-      </tr>
-      <tr>
-        <td><code>group_indices_by_label</code></td>
-        <td>~10.4 vs ~14.6&nbsp;ms (~1.4×)</td>
-        <td>vs flatnonzero/label · 200k/80</td>
-      </tr>
-      <tr>
-        <td>Merge-style time gathers</td>
-        <td>~13 vs ~294&nbsp;ms (~23×)</td>
-        <td>Index map vs <code>==</code> mask · 2000 gathers</td>
       </tr>
       <tr>
         <td>Full pipeline on real 20251204A</td>
@@ -1093,11 +1070,75 @@ nproc; free -h; nvidia-smi || true</code></pre>
       </tr>
       <tr>
         <td>Litke raw BinaryFile (no remap)</td>
-        <td><strong>Not started</strong></td>
-        <td>Still convert → <code>(ntime, nchan)</code> int16 for KS</td>
+        <td><strong>Not started</strong> · blocked on host</td>
+        <td>Linux <code>bin2py</code> .so exists but import needs Cython in kilosort env — not installed. Still convert → <code>(ntime, nchan)</code> int16</td>
+      </tr>
+      <tr>
+        <td>Neuropixels mini gate</td>
+        <td>Still first regression gate</td>
+        <td>Cycle 5 fixes also help NP (empty-tree, peel buffer, device kNN, CCG guard)</td>
       </tr>
     </tbody>
   </table>
+
+  <h3>Cycle 5 detail (what landed)</h3>
+  <table>
+    <thead>
+      <tr><th>Change</th><th>Axis</th><th>Test</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>BinaryRWFile</code>: short last batch decrements <code>n_batches_raw</code> (was crash on unset <code>n_batches</code>)</td>
+        <td>bug · MEA short clips + NP</td>
+        <td><code>test_short_last_batch_does_not_crash</code></td>
+      </tr>
+      <tr>
+        <td><code>get_whitening_matrix</code>: <code>n_batches==1</code> no longer divides by zero</td>
+        <td>bug · fieldlab fixtures</td>
+        <td><code>test_get_whitening_matrix_single_batch</code></td>
+      </tr>
+      <tr>
+        <td><code>new_clusters</code>: empty tree preserves labels (stock zeros collapsed multi-cluster centers)</td>
+        <td>bug · MEA+NP accuracy</td>
+        <td><code>test_new_clusters_empty_tree_preserves_labels</code></td>
+      </tr>
+      <tr>
+        <td>Swarm <code>check_CCG</code>: empty / <code>T==0</code> → <code>(False, False)</code> (no nan path)</td>
+        <td>bug</td>
+        <td><code>test_check_CCG_zero_span_*</code></td>
+      </tr>
+      <tr>
+        <td><code>neigh_mat</code>: clamp <code>n_neigh≤n_nodes</code>; kNN only if <code>device.type=='cuda'</code></td>
+        <td>bug · CPU fieldlab</td>
+        <td>covered by clustering path / unit gate</td>
+      </tr>
+      <tr>
+        <td><code>mean_cluster_templates</code> + one-shot <code>Wall</code> cat; small-center <code>int32</code> labels</td>
+        <td>speed · memory</td>
+        <td><code>test_mean_cluster_templates_*</code></td>
+      </tr>
+      <tr>
+        <td><code>run_matching</code> peel buffers grow past 1e5</td>
+        <td>bug · dense MEA</td>
+        <td>growth path; low-rate bit-identical</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Dead ends / do not re-litigate</h3>
+  <ul>
+    <li><strong>bin2py on fieldlab:</strong> Linux cpython-39 .so under
+      <code>…/artificial-retina-software-pipeline/utilities/build/lib.linux-x86_64-cpython-39/bin2py</code>
+      fails import without <code>Cython</code> in the kilosort env. Do not assume
+      macOS egg works. Options: install Cython + PYTHONPATH, rebuild extension,
+      or pure-Python unpack later — not started.</li>
+    <li><strong>Do not rewrite</strong> <code>template_match</code> max/gather pair
+      (documented yield regression when “optimized”).</li>
+    <li><strong>Do not float32-downcast</strong> <code>cluster</code> float64 buffers
+      without a non-identity knob (stock parity).</li>
+    <li><strong>Goldens under</strong> <code>data/sorted/20251204A/chunk*</code>
+      are read-only references — write CPU runs elsewhere.</li>
+  </ul>
 
   <h3>Commit map (this goal stack, newest first)</h3>
   <table>
@@ -1107,7 +1148,22 @@ nproc; free -h; nvidia-smi || true</code></pre>
     <tbody>
       <tr>
         <td class="mono">—</td>
-        <td>This docs refresh (cycle 1–4 results, pipeline status, get_data_cpu)</td>
+        <td>This docs handoff (cycle 5 + next-agent playbook)</td>
+        <td>docs</td>
+      </tr>
+      <tr>
+        <td class="mono">b53de47</td>
+        <td>Short-batch IO, whitening k=0, empty-tree, CCG T==0, peel grow, device kNN, mean templates</td>
+        <td>fix · speed</td>
+      </tr>
+      <tr>
+        <td class="mono">089db86</td>
+        <td>Identity tests for <code>make_pc_features</code> export path</td>
+        <td>test</td>
+      </tr>
+      <tr>
+        <td class="mono">b392011</td>
+        <td>Prior docs refresh (cycles 1–4 + pipeline status)</td>
         <td>docs</td>
       </tr>
       <tr>
@@ -1489,38 +1545,41 @@ pytest tests/ -q --deselect tests/test_full_pipeline.py \
 
   <h3>Post-compaction playbook (next agent)</h3>
   <ol>
-    <li>Open this file (§15) + <code>git log --oneline -12</code> before inventing new work.</li>
-    <li>Keep production lab params: Th 8/6, max_peels 100, dmin=pitch; do not rewrite goldens under <code>data/sorted/</code>.</li>
-    <li>Prefer pure NumPy/numba/CPU torch paths with identity tests that call shipped functions.</li>
-    <li>Update this §15 whenever a cycle or skeptic fix lands; commit docs with the code.</li>
-    <li>Do not push unless the user explicitly asks.</li>
-    <li>Non-goals still hold: full multi-GB MEA e2e on fieldlab as a gate, GPU-only as primary deliverable.</li>
+    <li>Open <strong>this file §15</strong> + <code>git log --oneline -15</code> + <code>git status</code>. No second handoff doc.</li>
+    <li>Env: <code>conda activate kilosort</code>; gate:
+      <code>pytest tests/ -q --deselect tests/test_full_pipeline.py
+      --deselect tests/test_spikedetect.py::test_wpca_wtemp</code>.</li>
+    <li>Production params: Th 8/6, max_peels 100, dmin=pitch, max_channel_distance 10 in goldens (CLI default 32). Never clobber <code>data/sorted/</code> goldens.</li>
+    <li>Accuracy first: identity tests that call shipped functions; no approximate kNN/merge rewrites.</li>
+    <li>Commit code when green; update §15 in the same push of work; do not push remote unless asked.</li>
+    <li>MEA is primary; note NP-relevant fixes in §15 when they land.</li>
   </ol>
 
-  <h3>Plausible next (not started)</h3>
-  <ul>
-    <li><strong>Raw Litke BinaryFile reader</strong> — stream non-transposed Litke bins into KS without full convert/remap each time; match lab <code>is_row_major=True</code> + channel-select contract.</li>
-    <li><strong>Short full-pipeline fixture on <code>data000</code></strong> — convert 1–few bins or truncate with <code>tmax</code>; smoke on fieldlab; not a merge gate.</li>
-    <li><code>CCG_metrics</code> / empty-guard hygiene (avoid behavioral drift vs pinned 4.1.2).</li>
-    <li>Swarmsplitter <code>split</code> already uses <code>labels_in</code>; further tree prune cost is secondary.</li>
-    <li><code>get_data_cpu</code> scatter — <strong>done</strong> in <code>64eace1</code>; further clustering CPU wins only if profiled hot.</li>
-  </ul>
+  <h3>Plausible next (ordered)</h3>
+  <ol>
+    <li><strong>Short fixture / synthetic GT</strong> — 1 batch × 512-ch planted spikes (~60&nbsp;MB) or convert first file of <code>data000</code> + <code>tmax</code>; smoke CPU <code>run_kilosort</code> to a non-golden results path. Prefer tiny synthetic for CI; real slice for field proof.</li>
+    <li><strong>Single-batch trailing pad</strong> — when <code>n_batches==1</code>, right edge of padded batch stays zeros (IO); accuracy for short clips.</li>
+    <li><strong>NaN guards</strong> — <code>yweighted</code> / <code>compute_spike_positions</code> when all weights mask to 0 (finite fallback; bit-identical on normal spikes).</li>
+    <li><strong>Swarm speed</strong> — pass <code>assume_sorted=True</code> for chronological meta; reuse <code>ix1</code>/<code>ix2</code> in <code>check_split</code>.</li>
+    <li><strong>Litke BinaryFile</strong> — unblock bin2py (Cython or pure unpack) only after a short converted fixture proves the pipeline; match lab converter layout.</li>
+    <li><strong>template_match identity test</strong> — eager path on synthetic batch (do not rewrite max/gather).</li>
+  </ol>
+  <p class="note">
+    Already done: <code>get_data_cpu</code> scatter, group-by merge/PC, labels_in, clip/spike caps,
+    cycle-5 IO/whitening/empty-tree/CCG/peel/device-kNN. Profile before more clustering micro-opts.
+  </p>
 </section>
 
 <section>
   <h2>Document control</h2>
   <p>
-    Living agent-facing engineering brief from a live host survey plus CPU optimization cycles.
-    Paths are absolute for this machine. If the workspace moves, re-verify roots in §05.
-    Do not treat verbal parameter memory as source of truth over logs and
-    <code>run_kilosort4.py</code>. <strong>Update §15 before every context compaction</strong>
-    and whenever a CPU cycle or skeptic fix lands. Keep user-request status honest
-    (landed vs not started).
+    Single living agent brief for this fork. Paths are absolute on fieldlab.
+    <strong>Update §15 before every context compaction</strong> and when a cycle lands.
+    Do not grow a docs tree — production code + this HTML.
   </p>
   <p class="mono" style="font-size:0.8rem;color:var(--muted)">
     File: docs/MEA_FIELD_TEST_CONTEXT.html · Branch: mea-optimizations · Host: fieldlab ·
-    Code HEAD: 64eace1 · docs tip ahead origin 13 · Cycles 1–4 + get_data_cpu + skeptic ·
-    e2e/Litke IO not started · 2026-08-10
+    Code HEAD: b53de47 · Cycles 1–5 · e2e/Litke IO not started · 2026-08-10
   </p>
 </section>
 
