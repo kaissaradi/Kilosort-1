@@ -209,10 +209,22 @@ def _template_match_body(Bsl, weigh, iC, iC2_flat, nC2, Nfilt):
 _TM_BODY = None
 
 def _template_match_body_dispatch(*args):
-    """Compiled loop body, falling back to eager if Inductor is unusable."""
+    """Compiled loop body, falling back to eager if Inductor is unusable.
+
+    CPU / no-CUDA fieldlab builds stay on the eager path: torch.compile's
+    Inductor compile cost and lack of win on CPU dominate short MEA runs and
+    can fail hard. Set KILOSORT_FORCE_COMPILE=1 to opt in on CPU; set
+    KILOSORT_NO_COMPILE=1 to force eager on GPU.
+    """
     global _TM_BODY
     if _TM_BODY is None:
-        if os.environ.get('KILOSORT_NO_COMPILE'):
+        force_compile = os.environ.get('KILOSORT_FORCE_COMPILE')
+        no_compile = os.environ.get('KILOSORT_NO_COMPILE')
+        use_compile = (
+            not no_compile
+            and (force_compile or torch.cuda.is_available())
+        )
+        if not use_compile:
             _TM_BODY = _template_match_body
         else:
             try:

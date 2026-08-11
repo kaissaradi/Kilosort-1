@@ -66,6 +66,48 @@ def test_clip_buffer_capacity_scales_with_recording_length():
     assert get_clip_buffer_capacity(10_000, nskip=25) == 500_000
 
 
+def test_template_match_body_dispatch_eager_on_cpu(monkeypatch):
+    """CPU path must not torch.compile by default (fieldlab / no CUDA)."""
+    import kilosort.spikedetect as sd
+    # Reset dispatch cache
+    sd._TM_BODY = None
+    monkeypatch.delenv('KILOSORT_FORCE_COMPILE', raising=False)
+    monkeypatch.delenv('KILOSORT_NO_COMPILE', raising=False)
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+    # Call dispatch once with dummy tensors matching body signature
+    weigh = torch.randn(2, 3, 4)
+    Bsl = torch.randn(5, 2, 6)
+    iC = torch.tensor([[0, 1, 2, 3], [1, 2, 3, 4]], dtype=torch.long)
+    # weigh is (nsizes, nC, Nfilt); simplify: call body directly via dispatch
+    # after ensuring init runs
+    try:
+        # Minimal call may fail on shape; we only care that _TM_BODY is set
+        # to the eager function after first init.
+        sd._template_match_body_dispatch(
+            Bsl, weigh, iC, torch.arange(4), 2, 4
+        )
+    except Exception:
+        # Shape mismatch is fine; init of _TM_BODY happens before the call body
+        if sd._TM_BODY is None:
+            # Force init path by calling the None-branch logic
+            pass
+    # Re-init explicitly like dispatch does
+    sd._TM_BODY = None
+    # Manually invoke the selection logic by calling with valid shapes from body
+    # _template_match_body(Bsl, weigh, iC, iC2_flat, nC2, Nfilt)
+    # weigh: (nsize, nC, Nfilt), Bsl: (n_chan, n_temp, T), iC: (nC, Nfilt)
+    nC, Nfilt, nsize, n_chan, n_temp, T = 3, 4, 2, 6, 2, 10
+    weigh = torch.randn(nsize, nC, Nfilt)
+    Bsl = torch.randn(n_chan, n_temp, T)
+    iC = torch.randint(0, n_chan, (nC, Nfilt))
+    iC2 = torch.randint(0, Nfilt, (5, Nfilt))
+    iC2_flat = iC2.reshape(-1)
+    nC2 = iC2.shape[0]
+    sd._template_match_body_dispatch(Bsl, weigh, iC, iC2_flat, nC2, Nfilt)
+    assert sd._TM_BODY is sd._template_match_body
+    sd._TM_BODY = None  # leave clean for other tests
+
+
 def test_clip_norm_drops_zero_energy_rows():
     """All-zero clips must not NaN-normalize; only positive-energy rows kept."""
     # Unit-test the norm filter logic in isolation (same as extract_wPCA path).

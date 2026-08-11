@@ -272,6 +272,33 @@ def test_merging_function_template_mode_matches_reference():
     assert Ww_g.shape[0] < Wall.shape[0]
 
 
+def test_prepare_matching_fused_equals_two_step():
+    """Single-einsum ctc must match historical UtU then WtW contraction."""
+    torch.manual_seed(1)
+    n_units, n_pcs, n_chan, nt = 7, 3, 9, 15
+    U = torch.randn(n_units, n_pcs, n_chan)
+    W = torch.randn(n_pcs, nt)
+    W = W / (W.norm(dim=1, keepdim=True) + 1e-6)
+    ops = {'nt': nt, 'wPCA': W}
+
+    # Two-step historical
+    WtW = conv1d(W.reshape(-1, 1, nt), W.reshape(-1, 1, nt), padding=nt)
+    WtW = torch.flip(WtW, [2])
+    UtU = torch.einsum('ikl, jml -> ijkm', U, U)
+    ctc_ref = torch.einsum('ijkm, kml -> ijl', UtU, WtW)
+    nm = (U ** 2).sum(-1).sum(-1)
+    s = nm.clamp_min(1e-30).rsqrt()
+    ctc_ref = ctc_ref * s.view(-1, 1, 1)
+
+    ctc_got = prepare_matching(ops, U)
+    assert torch.allclose(ctc_got, ctc_ref, rtol=1e-5, atol=1e-5)
+    # NaN template rows zeroed, not propagated
+    U2 = U.clone()
+    U2[2] = float('nan')
+    ctc_nan = prepare_matching(ops, U2)
+    assert torch.isfinite(ctc_nan).all()
+
+
 def test_run_matching_precomputed_U_time_matches_inline_einsum():
     """U_time index path must match historical per-hit einsum subtract.
 

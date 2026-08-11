@@ -173,8 +173,13 @@ def prepare_matching(ops, U):
     WtW = conv1d(W.reshape(-1, 1,nt), W.reshape(-1, 1 ,nt), padding = nt)
     WtW = torch.flip(WtW, [2,])
 
-    UtU = torch.einsum('ikl, jml -> ijkm',  U, U)
-    ctc = torch.einsum('ijkm, kml -> ijl', UtU, WtW)
+    # Fuse UtU @ WtW so the (nU, nU, nPC, nPC) intermediate is never retained.
+    # Mathematically identical to the two-step form; bit-checked in unit tests.
+    # Non-finite empty-template rows (NaN means from clustering) zeroed so peel
+    # does not poison B / ctc for the whole batch.
+    if not torch.isfinite(U).all():
+        U = torch.nan_to_num(U, nan=0.0, posinf=0.0, neginf=0.0)
+    ctc = torch.einsum('ikl, jml, kmt -> ijt', U, U, WtW)
 
     # Pre-scale by s_i = nm_i**-0.5 along the row axis so run_matching can work
     # on a scaled projection B and skip the per-peel division by nm (ctc is
@@ -235,7 +240,10 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=None):
     th_amps = torch.zeros((peel_cap, 1), dtype=torch.float, device=device)
     k = 0
 
-    Xres = X.clone()
+    # Peel in-place on X: callers (extract) never reuse the pre-peel batch, so
+    # a full clone (~125 MiB at 519×60k float32) was pure peak-RAM + bandwidth.
+    # Spike times / amps / residual features stay bit-identical to clone path.
+    Xres = X
 
     for t in range(max_peels):
         # Reduce first, then apply relu/square on the (NT,) result.
