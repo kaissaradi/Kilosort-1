@@ -61,6 +61,17 @@ def test_remove_duplicates_matches_reference_rule():
     assert got_keep.sum() == exp_keep.sum()
 
 
+def test_remove_duplicates_default_dt_matches_explicit():
+    """Default dt=15 must dispatch (fixed signature used to break 2-arg calls)."""
+    spike_times = np.array([0, 5, 20], dtype=np.int64)
+    spike_clusters = np.array([0, 0, 0], dtype=np.int32)
+    t1, c1, k1 = remove_duplicates(spike_times, spike_clusters)
+    t2, c2, k2 = remove_duplicates(spike_times, spike_clusters, dt=15)
+    np.testing.assert_array_equal(t1, t2)
+    np.testing.assert_array_equal(c1, c2)
+    np.testing.assert_array_equal(k1, k2)
+
+
 def test_remove_duplicates_empty_input():
     times = np.zeros(0, dtype=np.int64)
     clusters = np.zeros(0, dtype=np.int32)

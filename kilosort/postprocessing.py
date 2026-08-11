@@ -7,7 +7,7 @@ from kilosort.clustering_qr import xy_templates, get_data_cpu
 from kilosort.utils import group_indices_by_label
 
 
-@njit("(int64[:], int32[:], int32)")
+@njit(cache=True)
 def remove_duplicates(spike_times, spike_clusters, dt=15):
     '''Removes same-cluster spikes that occur within `dt` samples.
 
@@ -16,6 +16,10 @@ def remove_duplicates(spike_times, spike_clusters, dt=15):
     avoiding per-spike hash lookups on the common dense 0..N-1 cluster labels.
     Negative cluster ids are supported via a min-offset (historical dict path
     allowed any hashable id; stock export uses non-negative labels).
+
+    Note: fixed-type ``@njit("(int64[:], int32[:], int32)")`` broke the default
+    ``dt=15`` (Numba treated the omitted arg as a non-matching type). Inference
+    + cache keeps the same int64/int32 paths while allowing 2-arg calls.
     '''
     n = spike_times.size
     keep = np.zeros(n, dtype=bool_)
