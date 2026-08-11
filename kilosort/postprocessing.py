@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 from kilosort.clustering_qr import xy_templates, get_data_cpu
+from kilosort.utils import group_indices_by_label
 
 
 @njit("(int64[:], int32[:], int32)")
@@ -112,15 +113,18 @@ def make_pc_features(ops, spike_templates, spike_clusters, tF):
     # xy: template centers, iC: channels associated with each template
     xy, iC = xy_templates(ops)
     n_templates = iC.shape[1]
-    n_clusters = np.unique(spike_clusters).size
+    # One stable group-by over spikes: avoids per-cluster full scans of
+    # `spike_clusters == i` and a second `np.unique` over the whole vector.
+    groups = group_indices_by_label(spike_clusters)
+    n_clusters = len(groups)
     n_chans = ops['nearest_chans']
     feature_ind = np.zeros((n_clusters, n_chans), dtype=np.uint32)
 
-    for i in np.unique(spike_clusters):
+    for i, idxs in groups.items():
         # Get templates associated with cluster (often just 1)
-        iunq = np.unique(spike_templates[spike_clusters==i]).astype(int)
-        # Get boolean mask with size (n_templates,), True if they match cluster
-        ix = torch.from_numpy(np.zeros(n_templates, bool))
+        iunq = np.unique(spike_templates[idxs]).astype(int)
+        # Boolean mask over templates (not spikes) for get_data_cpu
+        ix = torch.zeros(n_templates, dtype=torch.bool)
         ix[iunq] = True
         # Get PC features for all spikes detected with those templates (Xd),
         # and the indices in tF where those spikes occur (igood).

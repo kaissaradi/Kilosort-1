@@ -49,6 +49,38 @@ def get_clip_buffer_capacity(n_batches, nskip=25):
     return min(500_000, max(10_000, n_used * 5_000))
 
 
+def group_indices_by_label(labels):
+    """Map each integer label to ascending spike indices (stable).
+
+    Equivalent to
+    ``{int(k): np.flatnonzero(labels == k) for k in np.unique(labels)}``
+    but uses one stable argsort + split instead of a full vector scan per
+    label. Insertion order of the returned dict follows sorted label order
+    (same as ``np.unique``).
+
+    Used by merge and PC-feature export hot paths where
+    ``mask = labels == k`` is applied repeatedly.
+    """
+    labels = np.asarray(labels)
+    n = labels.size
+    if n == 0:
+        return {}
+
+    order = np.argsort(labels, kind='mergesort')
+    sorted_lab = labels[order]
+    cuts = np.flatnonzero(sorted_lab[1:] != sorted_lab[:-1]) + 1
+    starts = np.empty(cuts.size + 1, dtype=np.intp)
+    starts[0] = 0
+    starts[1:] = cuts
+    ends = np.empty_like(starts)
+    ends[:-1] = cuts
+    ends[-1] = n
+    return {
+        int(sorted_lab[s]): order[s:e]
+        for s, e in zip(starts, ends)
+    }
+
+
 def template_path(basename='wTEMP.npz'):
     """ currently only one set of example templates to use"""
     return cache_template_path(basename)

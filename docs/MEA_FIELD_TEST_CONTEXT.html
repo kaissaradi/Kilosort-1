@@ -279,9 +279,9 @@
       <div><strong>Branch</strong> · mea-optimizations</div>
       <div><strong>Fork</strong> · kaissaradi/Kilosort-1</div>
       <div><strong>Survey date</strong> · 2026-08-10</div>
-      <div><strong>Updated</strong> · 2026-08-10 · pre-compaction</div>
-      <div><strong>HEAD</strong> · 32ee4cd (ahead origin by 8)</div>
-      <div><strong>Status</strong> · Living brief · cycles 1–3 + skeptic fixes</div>
+      <div><strong>Updated</strong> · 2026-08-10 · cycle 4</div>
+      <div><strong>HEAD</strong> · ef94ab2 (ahead origin by 10)</div>
+      <div><strong>Status</strong> · Living brief · cycles 1–4 + skeptic fixes</div>
     </div>
   </div>
   <div class="accent-bar"></div>
@@ -1007,7 +1007,7 @@ nproc; free -h; nvidia-smi || true</code></pre>
 
 <!-- 15 CPU OPTIMIZATION LOG -->
 <section id="cpu-log">
-  <h2>15 · CPU optimization log (living · pre-compaction)</h2>
+  <h2>15 · CPU optimization log (living · cycle 4)</h2>
   <p class="lede">
     Fieldlab is the gate for pure-CPU correctness. Cycles keep numerical identity
     (unit-level vs independent references) and extend the in-repo pytest surface.
@@ -1016,18 +1016,15 @@ nproc; free -h; nvidia-smi || true</code></pre>
   </p>
 
   <div class="callout ok">
-    <div class="tag">Snapshot · 2026-08-10</div>
-    Branch <code>mea-optimizations</code> · HEAD <code>32ee4cd</code> ·
-    <strong>local ahead of origin by 8</strong> · working tree clean after report commit ·
-    not pushed unless user asks.
+    <div class="tag">Snapshot · 2026-08-10 · cycle 4</div>
+    Branch <code>mea-optimizations</code> · HEAD <code>ef94ab2</code> ·
+    <strong>local ahead of origin by 10</strong> · not pushed unless user asks.
   </div>
 
   <div class="callout ok">
     <div class="tag">Fast suite gate (latest verified)</div>
-    <code>pytest tests/ -q -m "not slow" -k "not wpca_wtemp"</code>
-    → <strong>53 passed, 2 deselected</strong> · pure units
-    <strong>30 passed</strong> · skeptic-fix extract/labels tests
-    <strong>5 passed ×2</strong>.
+    <code>pytest tests/ -q</code> with full_pipeline + <code>test_wpca_wtemp</code> deselected
+    → <strong>60 passed, 2 deselected</strong> (was 53; +7 cycle-4 tests).
   </div>
 
   <h3>Commit map (this goal stack, newest first)</h3>
@@ -1036,6 +1033,16 @@ nproc; free -h; nvidia-smi || true</code></pre>
       <tr><th>SHA</th><th>Summary</th><th>Axis</th></tr>
     </thead>
     <tbody>
+      <tr>
+        <td class="mono">ef94ab2</td>
+        <td><code>group_indices_by_label</code>; merge index maps + Wall renorm cache; <code>make_pc_features</code> one-pass group-by</td>
+        <td>speed</td>
+      </tr>
+      <tr>
+        <td class="mono">fa9d52c</td>
+        <td>Pre-compaction handoff snapshot in this HTML brief</td>
+        <td>docs</td>
+      </tr>
       <tr>
         <td class="mono">32ee4cd</td>
         <td>Clip buffer grow-on-overflow + partial-fill; <code>labels_in</code> negative isin parity</td>
@@ -1220,6 +1227,39 @@ get_clip_buffer_capacity(n_batches, nskip=25) =
     </tbody>
   </table>
 
+  <h3>Cycle 4 — merge index maps, PC-feature group-by, renorm cache</h3>
+  <table>
+    <thead>
+      <tr><th>Change</th><th>Axis</th><th>Module</th><th>Lock-in test</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>group_indices_by_label</code> — one stable argsort + split (flatnonzero-per-label oracle)</td>
+        <td>speed</td>
+        <td><code>utils.py</code></td>
+        <td><code>tests/test_utils.py</code></td>
+      </tr>
+      <tr>
+        <td><code>merging_function</code> spike index maps; concat+sort on merge; no repeated <code>clu2==k</code></td>
+        <td>speed</td>
+        <td><code>template_matching.py</code></td>
+        <td><code>test_merging_function_*_matches_reference</code></td>
+      </tr>
+      <tr>
+        <td>Cache Wall <code>mu</code>/<code>Wnorm</code> until a merge rewrites <code>Ww</code></td>
+        <td>speed</td>
+        <td><code>template_matching.merging_function</code></td>
+        <td>same identity tests (template + ccg modes)</td>
+      </tr>
+      <tr>
+        <td><code>make_pc_features</code> one-pass group-by; templates unique only on cluster subset</td>
+        <td>speed</td>
+        <td><code>postprocessing.py</code></td>
+        <td>group helper identity + merge reassign test</td>
+      </tr>
+    </tbody>
+  </table>
+
   <h3>Micro-bench snapshots (fieldlab, indicative)</h3>
   <table>
     <thead>
@@ -1246,6 +1286,16 @@ get_clip_buffer_capacity(n_batches, nskip=25) =
         <td>200k labels · 80 members</td>
         <td>~1.0 vs ~1.5&nbsp;ms/call (cycle 3)</td>
       </tr>
+      <tr>
+        <td><code>group_indices_by_label</code> vs flatnonzero/label</td>
+        <td>200k spikes · 80 labels</td>
+        <td>~10.4 vs ~14.6&nbsp;ms/call (cycle 4 · ~1.4×)</td>
+      </tr>
+      <tr>
+        <td>merge-style time gathers (index map vs <code>==</code> mask)</td>
+        <td>200k · 80 · 2000 gathers</td>
+        <td>~13 vs ~294&nbsp;ms (cycle 4 · ~23× hot path)</td>
+      </tr>
     </tbody>
   </table>
 
@@ -1254,8 +1304,10 @@ get_clip_buffer_capacity(n_batches, nskip=25) =
     <li><code>tests/test_ccg.py</code> — refract / ACG / assume_sorted</li>
     <li><code>tests/test_spikedetect.py</code> — spike + clip capacity; nearest_chans; extract grow/partial-fill</li>
     <li><code>tests/test_postprocessing.py</code> — remove_duplicates identity</li>
-    <li><code>tests/test_swarmsplitter.py</code> — labels_in, new_clusters, check_CCG (new file)</li>
+    <li><code>tests/test_swarmsplitter.py</code> — labels_in, new_clusters, check_CCG</li>
     <li><code>tests/test_preprocessing.py</code> — whitening_local vs per-channel argsort</li>
+    <li><code>tests/test_utils.py</code> — buffer caps; <code>group_indices_by_label</code> oracle + merge reassign</li>
+    <li><code>tests/test_template_matching.py</code> — <code>merging_function</code> vs historical mask/renorm reference (template + ccg)</li>
   </ul>
 
   <h3>Commands agents should re-run after compact</h3>
@@ -1268,10 +1320,12 @@ python -c "import kilosort; print(kilosort.__file__)"
 # Pure CPU units (no wpca SIGILL path)
 pytest tests/test_ccg.py tests/test_spikedetect.py tests/test_postprocessing.py \
        tests/test_swarmsplitter.py tests/test_preprocessing.py \
+       tests/test_utils.py tests/test_template_matching.py \
        -k "not wpca_wtemp" -q
 
 # Default fast gate
-pytest tests/ -q -m "not slow" -k "not wpca_wtemp"</code></pre>
+pytest tests/ -q --deselect tests/test_full_pipeline.py \
+                 --deselect tests/test_spikedetect.py::test_wpca_wtemp</code></pre>
 
   <div class="callout warn">
     <div class="tag">Host limit</div>
@@ -1292,8 +1346,8 @@ pytest tests/ -q -m "not slow" -k "not wpca_wtemp"</code></pre>
 
   <h3>Plausible next CPU wins (not started)</h3>
   <ul>
-    <li><code>merging_function</code>: reduce repeated <code>clu2==kk</code> full-vector masks; optional per-cluster time index.</li>
-    <li><code>make_pc_features</code>: avoid double <code>np.unique</code> scans over all spikes per cluster.</li>
+    <li><code>get_data_cpu</code> scatter loop: replace per-template <code>pid==j</code> with grouped indices (feeds <code>make_pc_features</code> / clustering).</li>
+    <li><code>CCG_metrics</code> / empty-guard hygiene (avoid behavioral drift vs pinned 4.1.2).</li>
     <li>Swarmsplitter <code>split</code> already uses <code>labels_in</code>; further tree prune cost is secondary.</li>
     <li>Short MEA fixture (1–5 batches) for optional smoke — only if disk/time allow; not a gate.</li>
   </ul>
@@ -1310,7 +1364,7 @@ pytest tests/ -q -m "not slow" -k "not wpca_wtemp"</code></pre>
   </p>
   <p class="mono" style="font-size:0.8rem;color:var(--muted)">
     File: docs/MEA_FIELD_TEST_CONTEXT.html · Branch: mea-optimizations · Host: fieldlab ·
-    HEAD: 32ee4cd · ahead origin 8 · Cycles 1–3 + skeptic · pre-compaction snapshot 2026-08-10
+    HEAD: ef94ab2 · ahead origin 10 · Cycles 1–4 + skeptic · 2026-08-10
   </p>
 </section>
 

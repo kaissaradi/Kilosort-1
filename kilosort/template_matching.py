@@ -6,7 +6,11 @@ from torch.nn.functional import conv1d, max_pool2d, max_pool1d
 from tqdm import tqdm
 
 from kilosort import CCG
-from kilosort.utils import get_spike_buffer_capacity, log_performance
+from kilosort.utils import (
+    get_spike_buffer_capacity,
+    group_indices_by_label,
+    log_performance,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -274,6 +278,17 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
     WtW = conv1d(W.reshape(-1, 1,nt), W.reshape(-1, 1 ,nt), padding = nt) 
     WtW = torch.flip(WtW, [2,])
 
+    # Spike index lists per cluster: replace repeated full-vector
+    # `clu2 == kk` masks. On merge, reassign labels and concat+sort indices so
+    # gather order still matches a boolean mask over `st` (ascending index).
+    spike_idx = group_indices_by_label(clu2)
+
+    # Wall renorm only changes when a merge rewrites Ww; skip it while we only
+    # advance the outer pointer over non-merge candidates.
+    renorm = True
+    mu = None
+    Wnorm = None
+
     t = 0
     nmerge = 0
     while t<NN:
@@ -290,8 +305,10 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
             t += 1
             continue
 
-        mu = (Ww**2).sum((1,2), keepdims=True)**.5
-        Wnorm = Ww / (1e-6 + mu)
+        if renorm:
+            mu = (Ww**2).sum((1,2), keepdims=True)**.5
+            Wnorm = Ww / (1e-6 + mu)
+            renorm = False
 
         UtU = torch.einsum('lk, jlm -> jkm',  Wnorm[kk], Wnorm)
         ctc = torch.einsum('jkm, kml -> jl', UtU, WtW)
@@ -302,7 +319,7 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
         jsort = np.argsort(cmax.cpu().numpy())[::-1]
 
         if mode == 'ccg':
-            st0 = st[:,0][clu2==kk] / ops['fs']
+            st0 = st[spike_idx[kk], 0] / ops['fs']
         
         is_ccg  = 0
         for j in range(NN):
@@ -311,7 +328,7 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
                 break
             # compare with CCG
             if mode == 'ccg':
-                st1 = st[:,0][clu2==jj] / ops['fs']
+                st1 = st[spike_idx[jj], 0] / ops['fs']
                 _, is_ccg, _ = CCG.check_CCG(st0, st1, acg_threshold=acg_threshold,
                                              ccg_threshold=ccg_threshold)        
             else:
@@ -321,9 +338,8 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
             if is_ccg:
                 is_merged[jj] = 1
                 dt = (imax[kk] -imax[jj]).item()
+                idx = spike_idx[jj]
                 if dt != 0 and check_dt:
-                    # Get spike indices for cluster jj
-                    idx = (clu2 == jj)
                     # Update tF and Wall with shifted features
                     tF, Wall = roll_features(W, tF, Ww, idx, jj, dt)
                     # Shift spike times
@@ -333,7 +349,11 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
                 Ww[jj] = 0
                 ns[kk] += ns[jj]
                 ns[jj] = 0
-                clu2[clu2==jj] = kk            
+                clu2[idx] = kk
+                # Preserve ascending-index gather order of `clu2 == kk`.
+                spike_idx[kk] = np.sort(np.concatenate((spike_idx[kk], idx)))
+                del spike_idx[jj]
+                renorm = True
 
                 break
 
