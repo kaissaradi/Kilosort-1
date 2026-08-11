@@ -160,7 +160,12 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None,
 
 
 def align_U(U, ops, device=torch.device('cuda')):
-    Uex = torch.einsum('xyz, zt -> xty', U.to(device), ops['wPCA'])
+    U = U.to(device)
+    # Empty-cluster mean templates are intentionally NaN; treat as zero so
+    # argmax / roll stay defined and do not poison finite units.
+    if not torch.isfinite(U).all():
+        U = torch.nan_to_num(U, nan=0.0, posinf=0.0, neginf=0.0)
+    Uex = torch.einsum('xyz, zt -> xty', U, ops['wPCA'])
     X = Uex.reshape(-1, ops['Nchan']).T
     X = conv1d(X.unsqueeze(1), ops['wTEMP'].unsqueeze(1), padding=ops['nt']//2)
     Xmax = X.abs().max(0)[0].max(0)[0].reshape(-1, ops['nt'])

@@ -272,6 +272,22 @@ def test_merging_function_template_mode_matches_reference():
     assert Ww_g.shape[0] < Wall.shape[0]
 
 
+def test_align_U_handles_nan_templates():
+    from kilosort.template_matching import align_U
+    torch.manual_seed(0)
+    n_units, n_chan, n_pcs, nt = 4, 6, 3, 11
+    Wall = torch.randn(n_units, n_chan, n_pcs)
+    Wall[1] = float('nan')  # empty-cluster mean
+    wPCA = torch.randn(n_pcs, nt)
+    wPCA = wPCA / (wPCA.norm(dim=1, keepdim=True) + 1e-6)
+    wTEMP = torch.randn(2, nt)
+    wTEMP = wTEMP / (wTEMP.norm(dim=1, keepdim=True) + 1e-6)
+    ops = {'wPCA': wPCA, 'wTEMP': wTEMP, 'nt': nt, 'Nchan': n_chan}
+    Unew, imax = align_U(Wall, ops, device=torch.device('cpu'))
+    assert torch.isfinite(Unew).all()
+    assert imax.shape == (n_units,)
+
+
 def test_prepare_matching_fused_equals_two_step():
     """Single-einsum ctc must match historical UtU then WtW contraction."""
     torch.manual_seed(1)
