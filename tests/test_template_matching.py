@@ -339,7 +339,7 @@ def test_run_matching_precomputed_U_time_matches_inline_einsum():
     ctc = prepare_matching(ops, U)
     st1, a1, th1, X1 = run_matching(ops, X.clone(), U, ctc, device=device)
 
-    # Reference: same body but inline einsum (historical)
+    # Reference: same body but inline einsum + n=2 stride (historical GPU path)
     nm = (U ** 2).sum(-1).sum(-1)
     s = nm.clamp_min(1e-30).rsqrt()
     Us = U * s.view(-1, 1, 1)

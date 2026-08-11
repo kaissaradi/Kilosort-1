@@ -72,6 +72,28 @@ def _spikes_for_templates(n_templates, nspikes, nchanraw, nfeatures, seed=1):
     return PID, tF
 
 
+def test_get_data_cpu_accepts_tensor_pid():
+    """PID as torch.Tensor must not crash (from_numpy only accepted ndarray)."""
+    n_templates, nchanraw, nfeatures, nspikes = 10, 5, 3, 40
+    iC, xy = _synthetic_unique_imap(n_templates, nchanraw, n_chans_total=40, seed=3)
+    PID_np, tF = _spikes_for_templates(n_templates, nspikes, nchanraw, nfeatures, seed=4)
+    ops = {}
+    Xd_np, ig_np, ch_np = get_data_cpu(
+        ops, xy, iC, PID_np, tF, ycenter=0.0, xcenter=50.0,
+        dmin=100.0, dminx=100.0, merge_dim=True,
+    )
+    Xd_t, ig_t, ch_t = get_data_cpu(
+        ops, xy, iC, torch.from_numpy(PID_np), tF, ycenter=0.0, xcenter=50.0,
+        dmin=100.0, dminx=100.0, merge_dim=True,
+    )
+    if Xd_np is None:
+        assert Xd_t is None
+    else:
+        assert torch.equal(Xd_np, Xd_t)
+        assert torch.equal(ig_np, ig_t)
+        assert torch.equal(ch_np, ch_t)
+
+
 def test_empty_igood_returns_none():
     n_templates, nchanraw, nfeatures = 8, 4, 3
     iC, xy = _synthetic_unique_imap(n_templates, nchanraw, n_chans_total=32, seed=2)

@@ -105,6 +105,7 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None,
     # Prefetch: a worker thread reads batch i+1 from disk while batch i runs
     # on the GPU. Yields exactly what padded_batch_to_torch(i, ops) returns.
     batches = bfile.iter_batches(ops)
+    ibatch = -1
     try:
         for ibatch in prog:
             if ibatch % 100 == 0:
@@ -127,9 +128,15 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None,
                 th_amps = th_amps[~neg_spikes,:]
 
             nsp = len(stt) 
-            if k+nsp>st.shape[0]:                     
-                st = np.concatenate((st, np.zeros_like(st)), 0)
-                tF  = torch.cat((tF,  torch.zeros_like(tF)), 0)
+            if k+nsp>st.shape[0]:
+                # Double capacity: copy only the live prefix, not a full zeros_like.
+                new_cap = max(k + nsp, st.shape[0] * 2)
+                st2 = np.zeros((new_cap, st.shape[1]), dtype=st.dtype)
+                st2[:k] = st[:k]
+                st = st2
+                tF2 = torch.zeros((new_cap,) + tF.shape[1:], dtype=tF.dtype)
+                tF2[:k] = tF[:k]
+                tF = tF2
 
             t_shift = ibatch * bfile.batch_downsampling * (ops['batch_size'])
             # Build all three columns on-device and move them in one transfer.
@@ -150,7 +157,8 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None,
         logger.debug(f'stt shape: {stt.shape}')
         raise
 
-    log_performance(logger, 'debug', f'Batch {ibatch}')
+    if ibatch >= 0:
+        log_performance(logger, 'debug', f'Batch {ibatch}')
 
     isort = np.argsort(st[:k,0])
     st = st[isort]
@@ -254,10 +262,10 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=None):
     trange = torch.arange(-nt, nt+1, device=device)
     tiwave = torch.arange(-(nt//2), nt//2+1, device=device)
 
-    # Growable peel buffer: dense MEA batches can exceed the historical 1e5
-    # cap and crash mid-assign. Double capacity on overflow (same growth rule
-    # as outer detect/extract spike buffers). Low-rate batches stay identical.
-    peel_cap = 100000
+    # Growable peel buffer. Cap at historical 1e5; start smaller so quiet
+    # batches do not reserve a full 100k×(2+1+1) int64/float slab up front.
+    NT = int(X.shape[-1])
+    peel_cap = min(100000, max(2048, NT // 8))
     st = torch.zeros((peel_cap, 2), dtype=torch.int64, device=device)
     amps = torch.zeros((peel_cap, 1), dtype=torch.float, device=device)
     th_amps = torch.zeros((peel_cap, 1), dtype=torch.float, device=device)
@@ -293,14 +301,11 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=None):
         need = k + nsp
         if need > st.shape[0]:
             new_cap = max(need, st.shape[0] * 2)
-            st = torch.cat((st, torch.zeros((new_cap - st.shape[0], 2),
-                                            dtype=st.dtype, device=device)), 0)
-            amps = torch.cat((amps, torch.zeros((new_cap - amps.shape[0], 1),
-                                                dtype=amps.dtype, device=device)), 0)
-            th_amps = torch.cat(
-                (th_amps, torch.zeros((new_cap - th_amps.shape[0], 1),
-                                      dtype=th_amps.dtype, device=device)), 0
-            )
+            # Grow by empty tail only (avoid zeros_like full-buffer copy).
+            extra = new_cap - st.shape[0]
+            st = torch.cat((st, st.new_zeros((extra, 2))), 0)
+            amps = torch.cat((amps, amps.new_zeros((extra, 1))), 0)
+            th_amps = torch.cat((th_amps, th_amps.new_zeros((extra, 1))), 0)
 
         st[k:k+nsp, 0] = iX[:,0]
         st[k:k+nsp, 1] = iY[:,0]
@@ -311,6 +316,9 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=None):
 
         k+= nsp
 
+        # n=2 splits the peel: advanced-index -= is last-write-wins on
+        # overlapping trange windows, so stride is load-bearing for identity
+        # (not just GPU memory). Keep stock n=2 on all devices.
         n = 2
         for j in range(n):
             # (n_sel, C, nt) -> (C, n_sel, nt) to match historical kil layout

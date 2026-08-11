@@ -417,6 +417,7 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
     # Prefetch: a worker thread reads batch i+1 from disk while batch i runs
     # on the GPU. Yields exactly what padded_batch_to_torch(i, ops) returns.
     batches = bfile.iter_batches(ops)
+    ibatch = -1
     try:
         for ibatch in prog:
             if ibatch % log_skip == 0:
@@ -430,8 +431,13 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
             nsp = len(xy)
 
             if k+nsp>st.shape[0]:
-                st = np.concatenate((st, np.zeros_like(st)), 0)
-                tF = np.concatenate((tF, np.zeros_like(tF)), 0)
+                new_cap = max(k + nsp, st.shape[0] * 2)
+                st2 = np.zeros((new_cap, st.shape[1]), dtype=st.dtype)
+                st2[:k] = st[:k]
+                st = st2
+                tF2 = np.zeros((new_cap,) + tF.shape[1:], dtype=tF.dtype)
+                tF2[:k] = tF[:k]
+                tF = tF2
 
             xsub = X[iC[:,xy[:,:1]], xy[:,1:2] + tarange]
             xfeat = xsub @ ops['wPCA'].T
@@ -453,7 +459,8 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
             k = k + nsp
             if clear_cache:
                 gc.collect()
-                torch.cuda.empty_cache()
+                if device.type == 'cuda' and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             if progress_bar is not None:
                 progress_bar.emit(int((ibatch+1) / bfile.n_batches * 100))
@@ -468,7 +475,8 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
             pass
         raise
             
-    log_performance(logger, 'debug', f'Batch {ibatch} of {nb-1} ({100*(ibatch/nb):.1f}%)')
+    if ibatch >= 0 and nb > 0:
+        log_performance(logger, 'debug', f'Batch {ibatch} of {nb-1} ({100*(ibatch/nb):.1f}%)')
 
     st = st[:k]
     tF = tF[:k]

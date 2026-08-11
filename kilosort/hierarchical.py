@@ -114,7 +114,22 @@ def maketree(M, iclust, iclust0):
     #iclust = swarmer.assign_iclust(M, ki, kj, m, iclust[::nskip], lam = 1)
     #iclust, nc  = swarmer.cleanup_index(iclust)
 
-    nc = np.max(iclust) + 1
+    iclust = np.asarray(iclust)
+    if iclust.size == 0:
+        # No spikes → empty tree / no leaves (caller should not split).
+        return (
+            np.zeros((0, 3), dtype=np.int32),
+            np.zeros((0, 3), dtype=np.float32),
+            [],
+        )
+    nc = int(np.max(iclust)) + 1
+    if nc <= 1:
+        # Single leaf: nothing to agglomerate.
+        return (
+            np.zeros((0, 3), dtype=np.int32),
+            np.zeros((0, 3), dtype=np.float32),
+            [[0]],
+        )
 
     cc, cneg        = prepare(M, iclust, iclust0, lam = 1)
     xtree, tstat, my_clus  = merge_reduce(cc, cneg, iclust)

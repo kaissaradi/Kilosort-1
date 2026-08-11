@@ -627,6 +627,13 @@ def compute_preprocessing(ops, device, tic0=np.nan, file_object=None):
     logger.info(f'N seconds: {bfile.n_samples/fs}')
     logger.info(f'N batches: {bfile.n_batches}')
 
+    if bfile.n_batches < 1 or bfile.n_samples < 1:
+        raise ValueError(
+            f'Recording has no usable batches (n_samples={bfile.n_samples}, '
+            f'n_batches={bfile.n_batches}). Check tmin/tmax, file length, '
+            f'and n_chan_bin.'
+        )
+
     whiten_mat = preprocessing.get_whitening_matrix(bfile, xc, yc, nskip=nskip,
                                                     nrange=whitening_range)
 

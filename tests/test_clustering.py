@@ -76,6 +76,22 @@ def test_neigh_mat_drops_self_edges_like_historical_zeroing():
     assert kn.shape == (n_samples, n_neigh)
 
 
+def test_maketree_empty_and_single_label():
+    from kilosort.hierarchical import maketree
+    from scipy.sparse import csr_matrix
+    # Empty labels
+    M0 = csr_matrix((0, 0), dtype=np.float32)
+    xt, ts, mc = maketree(M0, np.array([], dtype=np.int64), np.array([], dtype=np.int64))
+    assert xt.shape == (0, 3)
+    assert ts.shape == (0, 3)
+    assert mc == []
+    # Single cluster
+    M1 = csr_matrix((3, 2), dtype=np.float32)
+    xt, ts, mc = maketree(M1, np.zeros(3, dtype=np.int64), np.array([0, 0], dtype=np.int64))
+    assert xt.shape == (0, 3)
+    assert mc == [[0]]
+
+
 def test_mstats_zero_adjacency_finite():
     """Empty neighbor graph must not yield NaN ki/kj (0/0)."""
     M = csr_matrix((5, 3), dtype=np.float32)

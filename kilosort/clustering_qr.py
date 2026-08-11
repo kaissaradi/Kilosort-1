@@ -639,7 +639,9 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                         if v:
                             log_performance(logger, header='clustering_qr before gc')
                         gc.collect()
-                        torch.cuda.empty_cache()
+                        if (getattr(device, 'type', None) == 'cuda'
+                                and torch.cuda.is_available()):
+                            torch.cuda.empty_cache()
                         if v:
                             log_performance(logger, header='clustering_qr after gc')
 
@@ -731,7 +733,8 @@ def mean_cluster_templates(Xd, iclust, ichan, n_chan, n_pcs):
 
 def get_data_cpu(ops, xy, iC, PID, tF, ycenter, xcenter, dmin=20, dminx=32,
                  ix=None, merge_dim=True):
-    PID =  torch.from_numpy(PID).long()
+    # Accept numpy or tensor spike/template ids (export path often tensors).
+    PID = torch.as_tensor(PID).long()
 
     #iU = ops['iU'].cpu().numpy()
     #iC = ops['iCC'][:, ops['iU']]    
