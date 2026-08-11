@@ -279,9 +279,9 @@
       <div><strong>Branch</strong> · mea-optimizations</div>
       <div><strong>Fork</strong> · kaissaradi/Kilosort-1</div>
       <div><strong>Survey date</strong> · 2026-08-10</div>
-      <div><strong>Updated</strong> · 2026-08-10 · cycle 7 oracle + short e2e</div>
+      <div><strong>Updated</strong> · 2026-08-10 · cycle 7–8 oracle/e2e + pad/NaN</div>
       <div><strong>HEAD</strong> · see §15 / <code>git rev-parse --short HEAD</code></div>
-      <div><strong>Status</strong> · Living brief · cycles 1–7 · Litke oracle + short e2e green · profile next</div>
+      <div><strong>Status</strong> · Living brief · cycles 1–8 · e2e green · pad/NaN correctness</div>
     </div>
   </div>
   <div class="accent-bar"></div>
@@ -1590,17 +1590,15 @@ pytest tests/ -q --deselect tests/test_full_pipeline.py \
 
   <h3>Plausible next (ordered)</h3>
   <ol>
-    <li><strong>cProfile the short e2e</strong> — confirm peel / whitening SVD / clustering dominate; stop guessing micro-opts.</li>
-    <li><strong>Single-batch trailing pad</strong> — when <code>n_batches==1</code>, right edge of padded batch stays zeros (IO); accuracy for short clips.</li>
-    <li><strong>NaN guards</strong> — <code>yweighted</code> / <code>compute_spike_positions</code> when all weights mask to 0 (finite fallback; bit-identical on normal spikes).</li>
-    <li><strong>Run --runslow once</strong> — NP mini full pipeline overnight; close integration audit gap.</li>
-    <li><strong>Hunt cycle-5-class latent bugs</strong> rather than another 1.4× labels pass.</li>
+    <li><strong>Run --runslow once</strong> — NP mini full pipeline overnight; close integration audit gap (fast gate still deselects it).</li>
+    <li><strong>cProfile longer e2e</strong> if needed — KS runtime table already shows peel spike-det ~86% of tmax=5; further speed needs peel/GPU or non-identity.</li>
+    <li><strong>Hunt cycle-5-class latent bugs</strong> rather than another micro-opt pass.</li>
+    <li><strong>Swarm speed</strong> only if profile shows it — assume_sorted / check_split reuse.</li>
   </ol>
   <p class="note">
-    Already done: <code>get_data_cpu</code> scatter, group-by merge/PC, labels_in, clip/spike caps,
-    cycle-5 IO/whitening/empty-tree/CCG/peel/device-kNN, cycle-6 native Litke
-    <code>file_object</code>, <strong>cycle-7 bin2py oracle fixtures + short e2e green</strong>.
-    Safe CPU wins largely harvested; peel dominates wall time. No C/CUDA unpack.
+    Already done: cycle-5 correctness fixes, cycle-6 native Litke, <strong>cycle-7 bin2py oracle + short e2e
+    (110 units / 14 good / ~80s)</strong>, <strong>cycle-8 single-batch right pad + yweighted/position NaN guards</strong>
+    (bit-identical on normal paths). Peel dominates wall time. Push to origin when green.
   </p>
 </section>
 
@@ -1614,7 +1612,7 @@ pytest tests/ -q --deselect tests/test_full_pipeline.py \
   </p>
   <p class="mono" style="font-size:0.8rem;color:var(--muted)">
     File: docs/MEA_FIELD_TEST_CONTEXT.html · Branch: mea-optimizations · Host: fieldlab ·
-    Cycles 1–7 · Litke oracle + e2e green · 2026-08-10
+    Cycles 1–8 · e2e + pad/NaN · 2026-08-10
   </p>
 </section>
 

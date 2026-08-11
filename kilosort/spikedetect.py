@@ -300,7 +300,9 @@ def yweighted(yc, iC, adist, xy, device=torch.device('cuda')):
 
     yy = torch.from_numpy(yc).to(device)[iC]
     cF0 = torch.nn.functional.relu(adist)
-    cF0 = cF0/cF0.sum(0)
+    # clamp avoids 0/0 → NaN when a template column has no positive weight;
+    # bit-identical whenever sum(0) >= 1e-12 (normal case).
+    cF0 = cF0 / cF0.sum(0).clamp_min(1e-12)
 
     yct = (cF0 * yy[:,xy[:,0]]).sum(0)
     return yct

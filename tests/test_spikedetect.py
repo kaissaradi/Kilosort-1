@@ -1,9 +1,52 @@
 import numpy as np
 import torch
 
-from kilosort.spikedetect import extract_wPCA_wTEMP, nearest_chans
+from kilosort.spikedetect import extract_wPCA_wTEMP, nearest_chans, yweighted
 from kilosort.template_matching import prepare_extract
 from kilosort.utils import get_clip_buffer_capacity, get_spike_buffer_capacity
+
+
+def test_yweighted_finite_when_all_weights_zero():
+    """All-negative adist → relu sum 0 must not emit NaN template y-centers."""
+    device = torch.device('cpu')
+    yc = np.array([0., 10., 20., 30.], dtype=np.float32)
+    iC = torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.long)  # (nC, n_temp)
+    adist = -torch.ones(3, 2)  # no positive mass
+    xy = torch.zeros(2, 2, dtype=torch.long)
+    yct = yweighted(yc, iC, adist, xy, device=device)
+    assert torch.isfinite(yct).all()
+
+
+def test_yweighted_identity_on_normal_weights():
+    """clamp_min must not change results when sum(0) is safely positive.
+
+    Matches production shapes: iC (nC, n_templates), adist (nC, nsp),
+    xy (nsp, 2) with col0 = template index.
+    """
+    device = torch.device('cpu')
+    yc = np.array([0., 10., 20., 30., 40.], dtype=np.float32)
+    # 3 nearest chans × 4 templates
+    iC = torch.tensor(
+        [[0, 1, 2, 0], [1, 2, 3, 1], [2, 3, 4, 2]], dtype=torch.long
+    )
+    # 5 spikes; template indices 0,1,2,3,1
+    nsp = 5
+    xy = torch.tensor([[0, 10], [1, 20], [2, 30], [3, 40], [1, 50]], dtype=torch.long)
+    adist = torch.tensor(
+        [
+            [1.0, 0.5, 2.0, 1.0, 0.8],
+            [0.5, 1.5, 0.0, 0.5, 1.2],
+            [0.0, 1.0, 1.0, 0.5, 0.4],
+        ]
+    )
+    assert adist.shape == (3, nsp)
+    got = yweighted(yc, iC, adist, xy, device=device)
+    # Historical formula without clamp (sums > 0 here)
+    yy = torch.from_numpy(yc).to(device)[iC]
+    cF0 = torch.nn.functional.relu(adist)
+    cF0 = cF0 / cF0.sum(0)
+    exp = (cF0 * yy[:, xy[:, 0]]).sum(0)
+    assert torch.allclose(got, exp)
 
 
 def test_spike_buffer_capacity_scales_with_recording_length():

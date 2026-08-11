@@ -61,7 +61,9 @@ def compute_spike_positions(st, tF, ops):
     tmass = torch.norm(tF, 2, dim=-1)
     tmask = icc_mask[:, iU[st[:,1]]].T
     tmass = tmass * tmask
-    tmass = tmass / tmass.sum(1, keepdim=True)
+    # clamp avoids 0/0 → NaN when a spike has all-zero weights (e.g. fully
+    # masked channels or zero features). Bit-identical when sum >= 1e-12.
+    tmass = tmass / tmass.sum(1, keepdim=True).clamp_min(1e-12)
 
     # Get x,y coordinates of nearest channels.
     xc = torch.from_numpy(ops['xc'])

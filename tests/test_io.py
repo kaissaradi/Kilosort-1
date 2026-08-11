@@ -319,3 +319,56 @@ def test_short_last_batch_does_not_crash(tmp_path):
     for i in range(bfile.n_batches):
         X = bfile.padded_batch_to_torch(i)
         assert X.shape == (n_chan, NT + 2 * nt)
+
+
+def test_single_batch_right_edge_replicate(tmp_path):
+    """When n_batches==1, right pad must edge-replicate (not stay zeros).
+
+    First-batch path left-pads only; without a single-batch branch the tail
+    after real samples is torch.zeros — a hard discontinuity for filters.
+    Multi-batch first/last behaviour must stay unchanged.
+    """
+    n_chan = 4
+    NT, nt = 100, 10
+    rng = np.random.default_rng(0)
+
+    # --- single batch (n_samples < NT) ---
+    n_samples = 80
+    data = rng.integers(-200, 200, size=(n_samples, n_chan), dtype=np.int16)
+    path = tmp_path / 'single.bin'
+    data.tofile(path)
+    b1 = io.BinaryRWFile(
+        path, n_chan_bin=n_chan, fs=1000, NT=NT, nt=nt, device=torch.device('cpu'),
+    )
+    assert b1.n_batches == 1
+    X = b1.padded_batch_to_torch(0)
+    assert X.shape == (n_chan, NT + 2 * nt)
+    # Interior matches file (placed at columns nt : nt+n_samples)
+    interior = X[:, nt:nt + n_samples].cpu().numpy().T.astype(np.int16)
+    np.testing.assert_array_equal(interior, data)
+    # Left pad = edge replicate of first real sample
+    assert torch.equal(X[:, :nt], X[:, nt:nt + 1].expand(-1, nt))
+    # Right pad = edge replicate of last real sample (not zeros)
+    end = nt + n_samples
+    right = X[:, end:]
+    assert right.shape[1] > 0
+    assert not torch.all(right == 0)
+    assert torch.equal(right, X[:, end - 1:end].expand_as(right))
+
+    # --- multi-batch identity: first batch left-pads; last batch right-pads ---
+    n_multi = NT * 3 + 50
+    data_m = rng.integers(-200, 200, size=(n_multi, n_chan), dtype=np.int16)
+    path_m = tmp_path / 'multi.bin'
+    data_m.tofile(path_m)
+    bm = io.BinaryRWFile(
+        path_m, n_chan_bin=n_chan, fs=1000, NT=NT, nt=nt, device=torch.device('cpu'),
+    )
+    assert bm.n_batches > 1
+    X0 = bm.padded_batch_to_torch(0)
+    assert torch.equal(X0[:, :nt], X0[:, nt:nt + 1].expand(-1, nt))
+    # First multi-batch still has real right context from NT+nt read — not zeros
+    assert not torch.all(X0[:, -nt:] == 0)
+    Xlast = bm.padded_batch_to_torch(bm.n_batches - 1)
+    # Last batch right-pads by edge replicate of its last loaded sample
+    # Find first all-zero-or-replicated tail: last column equals previous
+    assert torch.equal(Xlast[:, -1:], Xlast[:, -2:-1])

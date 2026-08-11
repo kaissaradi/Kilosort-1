@@ -4,7 +4,11 @@ import pytest
 import torch
 
 from kilosort.clustering_qr import get_data_cpu, xy_templates
-from kilosort.postprocessing import make_pc_features, remove_duplicates
+from kilosort.postprocessing import (
+    compute_spike_positions,
+    make_pc_features,
+    remove_duplicates,
+)
 
 
 def reference_remove_duplicates(spike_times, spike_clusters, dt=15):
@@ -264,3 +268,53 @@ def test_make_pc_features_permutes_dims_for_phy():
     assert out.shape == (n_spikes, n_pcs, nearest_chans)
     assert ind.dtype == np.uint32
     assert ind.shape == (4, nearest_chans)
+
+
+def test_compute_spike_positions_finite_when_weights_zero():
+    """All-zero feature norms / masks must not emit NaN positions."""
+    n_spikes, n_near, n_pcs = 5, 4, 3
+    n_templates, n_chan = 3, 12
+    tF = torch.zeros(n_spikes, n_near, n_pcs)
+    st = np.zeros((n_spikes, 3), dtype=np.int64)
+    st[:, 1] = np.arange(n_spikes) % n_templates
+    ops = {
+        'iCC_mask': torch.ones(n_near, n_templates),
+        'iU': torch.arange(n_templates),
+        'iCC': torch.randint(0, n_chan, (n_near, n_templates)),
+        'xc': np.linspace(0, 100, n_chan).astype(np.float32),
+        'yc': np.linspace(0, 50, n_chan).astype(np.float32),
+    }
+    xs, ys = compute_spike_positions(st, tF, ops)
+    assert np.isfinite(xs).all()
+    assert np.isfinite(ys).all()
+
+
+def test_compute_spike_positions_identity_on_normal_weights():
+    """clamp_min must not change positions when weight sums are positive."""
+    n_spikes, n_near, n_pcs = 20, 5, 3
+    n_templates, n_chan = 4, 16
+    rng = np.random.default_rng(9)
+    tF = torch.from_numpy(rng.standard_normal((n_spikes, n_near, n_pcs)).astype(np.float32))
+    st = np.zeros((n_spikes, 3), dtype=np.int64)
+    st[:, 1] = rng.integers(0, n_templates, size=n_spikes)
+    ops = {
+        'iCC_mask': torch.ones(n_near, n_templates),
+        'iU': torch.arange(n_templates),
+        'iCC': torch.from_numpy(rng.integers(0, n_chan, size=(n_near, n_templates))),
+        'xc': np.linspace(0, 100, n_chan).astype(np.float32),
+        'yc': np.linspace(0, 50, n_chan).astype(np.float32),
+    }
+    xs, ys = compute_spike_positions(st, tF, ops)
+    # Manual historical formula (sums > 0 for random normal features)
+    cpu = torch.device('cpu')
+    tmass = torch.norm(tF, 2, dim=-1)
+    tmask = ops['iCC_mask'][:, ops['iU'][st[:, 1]]].T
+    tmass = tmass * tmask
+    tmass = tmass / tmass.sum(1, keepdim=True)
+    chs = ops['iCC'][:, ops['iU'][st[:, 1]]]
+    xc0 = torch.from_numpy(ops['xc'])[chs.T]
+    yc0 = torch.from_numpy(ops['yc'])[chs.T]
+    exp_x = (xc0 * tmass).sum(1).numpy()
+    exp_y = (yc0 * tmass).sum(1).numpy()
+    np.testing.assert_allclose(xs, exp_x, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(ys, exp_y, rtol=1e-5, atol=1e-5)

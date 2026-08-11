@@ -841,6 +841,15 @@ class BinaryRWFile:
                 X[:, self.nt : self.nt+nsamp] = torch.from_numpy(data).to(self.device).float()
                 X[:, :self.nt] = X[:, self.nt : self.nt+1]
                 bstart = self.imin - self.nt
+                if self.n_batches == 1:
+                    # Single batch is also the last. The first-batch path only
+                    # left-pads; without this, X[:, nt+nsamp:] stays zeros and
+                    # edge filters see a hard zero boundary. Match last-batch
+                    # right edge-replicate. Multi-batch path unchanged.
+                    end = self.nt + nsamp
+                    if end > 0 and end < X.shape[1]:
+                        X[:, end:] = X[:, end - 1 : end]
+                    bend += self.nt
             elif ibatch == self.n_batches-1:
                 X[:, :nsamp] = torch.from_numpy(data).to(self.device).float()
                 X[:, nsamp:] = X[:, nsamp-1:nsamp]
