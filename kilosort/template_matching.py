@@ -57,7 +57,8 @@ def prepare_extract(xc, yc, U, nC, position_limit, device=torch.device('cuda')):
     return iCC, iCC_mask, iU, Ucc
 
 
-def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
+def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None,
+            spike_capacity_hint=None):
     nC = ops['settings']['nearest_chans']
     position_limit = ops['settings']['position_limit']
     iCC, iCC_mask, iU, Ucc = prepare_extract(
@@ -75,6 +76,10 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
     # every batch — pure overhead across hundreds of MEA batches).
     match_cache = _matching_unit_cache(ops, U)
     spike_capacity = get_spike_buffer_capacity(bfile.n_batches)
+    # Learned extract often finds a similar spike count to universal detect;
+    # size the buffer from that hint so we avoid a mid-pass 2× realloc of tF.
+    if spike_capacity_hint is not None:
+        spike_capacity = max(spike_capacity, int(spike_capacity_hint))
     st = np.zeros((spike_capacity, 3), 'float64')
     tF = torch.zeros((spike_capacity, nC, ops['settings']['n_pcs']))
     k = 0

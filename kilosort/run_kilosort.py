@@ -1,4 +1,5 @@
 import time
+import gc
 from pathlib import Path
 import logging
 import warnings
@@ -819,6 +820,15 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
     Wall3 = template_matching.postprocess_templates(
         Wall, ops, clu, st0, tF, device=device
         )
+    # First-pass spike table is only needed for clustering / template postproc.
+    # Free it before learned extract allocates another (n_spikes × nC × nPC)
+    # buffer — important on 15 GB hosts with dense MEA.
+    n_univ_spikes = int(len(st0))
+    del st0, tF
+    if clear_cache:
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     elapsed = time.time() - tic
     total = time.time() - tic0
@@ -840,7 +850,8 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
     logger.info('Extracting spikes using cluster waveforms')
     logger.info('-'*40)
     st, tF, ops = template_matching.extract(
-        ops, bfile, Wall3, device=device, progress_bar=progress_bar
+        ops, bfile, Wall3, device=device, progress_bar=progress_bar,
+        spike_capacity_hint=int(n_univ_spikes * 1.5) + 10_000,
         )
    
     log_thread_count(logger)
