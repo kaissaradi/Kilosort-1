@@ -15,12 +15,29 @@ def test_labels_in_matches_numpy_isin():
                                   np.isin(np.array([], dtype=np.int64), members))
 
 
+def test_labels_in_handles_negative_ids_like_isin():
+    # Skeptic case: negatives must match np.isin, not be silently dropped.
+    labels = np.array([-1, 0, 1], dtype=np.int64)
+    members = [-1, 1]
+    np.testing.assert_array_equal(labels_in(labels, members),
+                                  np.isin(labels, members))
+    labels2 = np.array([-5, -1, 2, 7], dtype=np.int64)
+    members2 = [-5, 2, 99]
+    np.testing.assert_array_equal(labels_in(labels2, members2),
+                                  np.isin(labels2, members2))
+
+
 def test_labels_in_large_spike_vector_matches_isin():
     rng = np.random.default_rng(1)
     labels = rng.integers(0, 500, size=50_000)
     members = rng.choice(500, size=40, replace=False)
     np.testing.assert_array_equal(labels_in(labels, members),
                                   np.isin(labels, members))
+    # Mixed-sign random ids still match isin
+    labels_n = rng.integers(-50, 50, size=20_000)
+    members_n = rng.choice(np.arange(-50, 50), size=30, replace=False)
+    np.testing.assert_array_equal(labels_in(labels_n, members_n),
+                                  np.isin(labels_n, members_n))
 
 
 def _reference_new_clusters(iclust, my_clus, xtree):

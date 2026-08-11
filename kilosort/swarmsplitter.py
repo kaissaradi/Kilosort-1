@@ -8,8 +8,10 @@ def labels_in(labels, members):
     """Boolean membership of integer labels in `members` (np.isin-compatible).
 
     Hierarchical split/merge repeatedly tests spike labels against small leaf
-    member lists. A dense boolean table + gather is cheaper than hashing every
-    element when labels are non-negative cluster ids (the production path).
+    member lists. A dense boolean table over the closed integer range
+    ``[min, max]`` of both arrays (including negatives) plus a gather matches
+    ``np.isin`` while avoiding per-element hashing on dense cluster ids.
+    Pathologically huge sparse ranges fall back to ``np.isin``.
     """
     labels = np.asarray(labels)
     if labels.size == 0:
@@ -18,22 +20,16 @@ def labels_in(labels, members):
     if members.size == 0:
         return np.zeros(labels.shape, dtype=bool)
 
-    max_label = int(labels.max())
-    max_member = int(members.max()) if members.size else -1
-    size = max(max_label, max_member) + 1
-    if size <= 0:
-        return np.zeros(labels.shape, dtype=bool)
+    lo = int(min(labels.min(), members.min()))
+    hi = int(max(labels.max(), members.max()))
+    size = hi - lo + 1
+    # Guard sparse huge spans (e.g. a single very large id): hashing is fine.
+    if size > max(2_000_000, 8 * (labels.size + members.size)):
+        return np.isin(labels, members)
 
     table = np.zeros(size, dtype=bool)
-    # Ignore negative / out-of-range member ids the same way np.isin would miss them.
-    good = (members >= 0) & (members < size)
-    table[members[good]] = True
-
-    out = np.zeros(labels.shape, dtype=bool)
-    known = (labels >= 0) & (labels < size)
-    if np.any(known):
-        out[known] = table[labels[known]]
-    return out
+    table[members - lo] = True
+    return table[labels - lo]
 
 
 def count_elements(kk, iclust, my_clus, xtree):

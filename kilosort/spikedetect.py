@@ -18,6 +18,10 @@ from kilosort.utils import (
     log_performance,
 )
 
+# Historical sampling limit for wPCA/wTEMP clip collection. Initial capacity
+# may be smaller (see get_clip_buffer_capacity); the buffer grows up to this.
+CLIP_BUFFER_HARD_CAP = 500_000
+
 
 def my_max2d(X, dt):
     Xmax = max_pool2d(
@@ -55,8 +59,11 @@ def extract_snippets(X, nt, twav_min, Th_single_ch, loc_range=[4,5],
 def extract_wPCA_wTEMP(ops, bfile, nt=61, twav_min=20, Th_single_ch=6, nskip=25,
                        device=torch.device('cuda')):
 
-    # Scale the snippet buffer with recording length so short CPU runs do not
-    # reserve a full 500k×nt float32 slab up front.
+    # Scale the initial snippet buffer with recording length so short CPU runs
+    # do not reserve a full 500k×nt float32 slab up front. Grow (and, at the
+    # historical hard cap, partial-fill) so a single dense batch can never leave
+    # zero clips for TruncatedSVD — matching spike-buffer grow-on-overflow.
+    max_clips = CLIP_BUFFER_HARD_CAP
     n_clips = get_clip_buffer_capacity(bfile.n_batches, nskip=nskip)
     clips = np.zeros((n_clips, nt), 'float32')
     i = 0
@@ -67,14 +74,34 @@ def extract_wPCA_wTEMP(ops, bfile, nt=61, twav_min=20, Th_single_ch=6, nskip=25,
                                      Th_single_ch=Th_single_ch, device=device)
 
         nnew = len(clips_new)
+        if nnew == 0:
+            continue
 
-        if i+nnew>clips.shape[0]:
+        need = i + nnew
+        if need > clips.shape[0] and clips.shape[0] < max_clips:
+            new_cap = min(max_clips, max(clips.shape[0] * 2, need))
+            extra = new_cap - clips.shape[0]
+            clips = np.concatenate(
+                (clips, np.zeros((extra, nt), dtype=np.float32)), 0
+            )
+
+        if i + nnew > clips.shape[0]:
+            # At the historical sampling cap: keep what fits, stop.
+            room = clips.shape[0] - i
+            if room <= 0:
+                break
+            clips[i:i + room] = clips_new[:room].cpu().numpy()
+            i += room
             break
 
-        clips[i:i+nnew] = clips_new.cpu().numpy()
-        i+= nnew 
+        clips[i:i + nnew] = clips_new.cpu().numpy()
+        i += nnew
 
     clips = clips[:i]
+    if i == 0:
+        raise RuntimeError(
+            'extract_wPCA_wTEMP found no isolated peak clips; cannot fit wPCA/wTEMP'
+        )
     clips /= (clips**2).sum(1, keepdims=True)**.5
 
     model = TruncatedSVD(n_components=ops['settings']['n_pcs']).fit(clips)
