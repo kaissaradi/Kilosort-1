@@ -8,25 +8,39 @@ from kilosort.clustering_qr import xy_templates, get_data_cpu
 
 @njit("(int64[:], int32[:], int32)")
 def remove_duplicates(spike_times, spike_clusters, dt=15):
-    '''Removes same-cluster spikes that occur within `dt` samples.'''
-    keep = np.zeros_like(spike_times, bool_)
-    cluster_t0 = {}
-    for i in range(spike_times.size):
+    '''Removes same-cluster spikes that occur within `dt` samples.
+
+    Uses a dense last-time table indexed by cluster id instead of a typed
+    dictionary. That keeps the same first-keep / refractory-window rule while
+    avoiding per-spike hash lookups on the common dense 0..N-1 cluster labels.
+    '''
+    n = spike_times.size
+    keep = np.zeros(n, dtype=bool_)
+    if n == 0:
+        return spike_times, spike_clusters, keep
+
+    max_cluster = spike_clusters[0]
+    for i in range(1, n):
+        c = spike_clusters[i]
+        if c > max_cluster:
+            max_cluster = c
+
+    # Sentinel so the first spike of every cluster is kept (matches the old
+    # "t0 = t - dt" initialization for unseen labels).
+    last_t = np.empty(max_cluster + 1, dtype=np.int64)
+    seen = np.zeros(max_cluster + 1, dtype=bool_)
+
+    for i in range(n):
         t = spike_times[i]
         c = spike_clusters[i]
-        if c in cluster_t0:
-            t0 = cluster_t0[c]
-        else:
-            t0 = t - dt
-
-        if t >= (t0 + dt):
-            # Separate spike, reset t0 and keep spike
-            cluster_t0[c] = t
+        if not seen[c]:
+            last_t[c] = t
+            seen[c] = True
             keep[i] = True
-        else:
-            # Same spike, toss it out
-            continue
-    
+        elif t >= last_t[c] + dt:
+            last_t[c] = t
+            keep[i] = True
+
     return spike_times[keep], spike_clusters[keep], keep
 
 
