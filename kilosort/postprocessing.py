@@ -14,26 +14,35 @@ def remove_duplicates(spike_times, spike_clusters, dt=15):
     Uses a dense last-time table indexed by cluster id instead of a typed
     dictionary. That keeps the same first-keep / refractory-window rule while
     avoiding per-spike hash lookups on the common dense 0..N-1 cluster labels.
+    Negative cluster ids are supported via a min-offset (historical dict path
+    allowed any hashable id; stock export uses non-negative labels).
     '''
     n = spike_times.size
     keep = np.zeros(n, dtype=bool_)
     if n == 0:
         return spike_times, spike_clusters, keep
 
+    min_cluster = spike_clusters[0]
     max_cluster = spike_clusters[0]
     for i in range(1, n):
         c = spike_clusters[i]
         if c > max_cluster:
             max_cluster = c
+        if c < min_cluster:
+            min_cluster = c
+
+    # Offset so table index is always >= 0 even when labels are negative.
+    offset = -min_cluster if min_cluster < 0 else 0
+    table_size = max_cluster + offset + 1
 
     # Sentinel so the first spike of every cluster is kept (matches the old
     # "t0 = t - dt" initialization for unseen labels).
-    last_t = np.empty(max_cluster + 1, dtype=np.int64)
-    seen = np.zeros(max_cluster + 1, dtype=bool_)
+    last_t = np.empty(table_size, dtype=np.int64)
+    seen = np.zeros(table_size, dtype=bool_)
 
     for i in range(n):
         t = spike_times[i]
-        c = spike_clusters[i]
+        c = spike_clusters[i] + offset
         if not seen[c]:
             last_t[c] = t
             seen[c] = True

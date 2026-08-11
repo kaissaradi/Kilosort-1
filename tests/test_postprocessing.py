@@ -99,6 +99,27 @@ def test_remove_duplicates_gapped_cluster_ids():
     np.testing.assert_array_equal(out_c, spike_clusters)
 
 
+def test_remove_duplicates_negative_cluster_ids():
+    """Dense table must not crash / mis-index when labels are negative.
+
+    Historical dict path accepted any int id; offset-based indexing must match
+    the reference rule for mixed-sign labels.
+    """
+    spike_times = np.array([0, 5, 20, 25, 40], dtype=np.int64)
+    spike_clusters = np.array([-2, -2, 0, -2, 0], dtype=np.int32)
+    exp_t, exp_c, exp_keep = reference_remove_duplicates(
+        spike_times, spike_clusters, dt=15
+    )
+    got_t, got_c, got_keep = remove_duplicates(
+        spike_times.copy(), spike_clusters.copy(), dt=15
+    )
+    np.testing.assert_array_equal(got_keep, exp_keep)
+    np.testing.assert_array_equal(got_t, exp_t)
+    np.testing.assert_array_equal(got_c, exp_c)
+    # Within-window same-cluster drops still happen for negatives.
+    assert not got_keep[1]  # t=5 cluster -2 within 15 of t=0
+
+
 # ---------------------------------------------------------------------------
 # make_pc_features: group-by path vs historical per-cluster mask loop
 # ---------------------------------------------------------------------------
