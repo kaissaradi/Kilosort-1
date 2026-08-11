@@ -279,9 +279,9 @@
       <div><strong>Branch</strong> · mea-optimizations</div>
       <div><strong>Fork</strong> · kaissaradi/Kilosort-1</div>
       <div><strong>Survey date</strong> · 2026-08-10</div>
-      <div><strong>Updated</strong> · 2026-08-10 · cycle 6 native Litke IO</div>
+      <div><strong>Updated</strong> · 2026-08-10 · cycle 7 oracle + short e2e</div>
       <div><strong>HEAD</strong> · see §15 / <code>git rev-parse --short HEAD</code></div>
-      <div><strong>Status</strong> · Living brief · cycles 1–6 · Litke file_object live · e2e still pending</div>
+      <div><strong>Status</strong> · Living brief · cycles 1–7 · Litke oracle + short e2e green · profile next</div>
     </div>
   </div>
   <div class="accent-bar"></div>
@@ -1541,12 +1541,15 @@ pytest tests/ -q --deselect tests/test_full_pipeline.py \
     <tbody>
       <tr>
         <td>Full pipeline on real data <strong>20251204A</strong> (shortest run)</td>
-        <td><strong>Not started</strong> (IO unblocked)</td>
+        <td><strong>Done (cycle 7 short e2e)</strong></td>
         <td>
-          Correct exp id is <code>20251204A</code>. Prefer <code>data000</code>
-          (13&nbsp;G, 8 files, shortest; 519 ch, 20&nbsp;kHz, array_id 1551).
-          Use <code>LitkeRecording</code> + <code>tmax</code> for a short CPU smoke;
-          do not clobber <code>data/sorted/</code> goldens. Host 15&nbsp;GiB / 4c / no GPU.
+          <code>LitkeRecording(data000, drop_ttl=True)</code> + <code>tmax=5</code> +
+          <code>LITKE_519_ARRAY_30UM.mat</code> + Th 8/6, dmin=30, max_channel_distance=10,
+          device=cpu, non-golden path
+          <code>data/sorted/20251204A/data000/kilosort4_litke_smoke_tmax5/</code>.
+          Result: <strong>110 units (14 good), ~38k spikes, ~80&nbsp;s</strong>.
+          Runtime: spike det univ 63% + learned 23%; preprocessing ~3%. Not a golden match —
+          integration proof that native Litke + composition of branch changes sort.
         </td>
       </tr>
       <tr>
@@ -1559,6 +1562,18 @@ pytest tests/ -q --deselect tests/test_full_pipeline.py \
           not required for sorting on fieldlab. No Cython install needed.
         </td>
       </tr>
+      <tr>
+        <td>Litke decode vs lab bin2py (real data)</td>
+        <td><strong>Done (cycle 7)</strong></td>
+        <td>
+          Live bit-exact vs <code>bin2py_cythonext</code> on real
+          <code>20251204A/data000</code> windows (start / mid / 10M / file boundary).
+          Frozen fixtures (no runtime .so dep):
+          <code>tests/data/litke_real_519_bin2py_oracle.npz</code>,
+          <code>tests/data/litke_odd_bin2py_oracle.npz</code>.
+          Permanent tests in <code>test_litke.py</code> — catches self-consistent wrong nibble order.
+        </td>
+      </tr>
     </tbody>
   </table>
 
@@ -1569,25 +1584,23 @@ pytest tests/ -q --deselect tests/test_full_pipeline.py \
       <code>pytest tests/ -q --deselect tests/test_full_pipeline.py
       --deselect tests/test_spikedetect.py::test_wpca_wtemp</code>.</li>
     <li>Production params: Th 8/6, max_peels 100, dmin=pitch, max_channel_distance 10 in goldens (CLI default 32). Never clobber <code>data/sorted/</code> goldens.</li>
-    <li>Accuracy first: identity tests that call shipped functions; no approximate kNN/merge rewrites.</li>
-    <li>Commit code when green; update §15 in the same push of work; do not push remote unless asked.</li>
-    <li>MEA is primary; note NP-relevant fixes in §15 when they land.</li>
+    <li>Accuracy first: identity tests that call shipped functions; no approximate kNN/merge rewrites. Prefer correctness (NaN guards, pad) over micro-opts.</li>
+    <li>Commit often; <strong>push to origin/mea-optimizations</strong> when green (user wants remote backup). MEA primary.</li>
   </ol>
 
   <h3>Plausible next (ordered)</h3>
   <ol>
-    <li><strong>Short CPU e2e via LitkeRecording</strong> — <code>data000</code> +
-      <code>tmax</code> (e.g. 2–10&nbsp;s) + 30&nbsp;µm 519 probe + production Th 8/6;
-      write results under a <em>non-golden</em> path. Prove pipeline eats native Litke.</li>
+    <li><strong>cProfile the short e2e</strong> — confirm peel / whitening SVD / clustering dominate; stop guessing micro-opts.</li>
     <li><strong>Single-batch trailing pad</strong> — when <code>n_batches==1</code>, right edge of padded batch stays zeros (IO); accuracy for short clips.</li>
     <li><strong>NaN guards</strong> — <code>yweighted</code> / <code>compute_spike_positions</code> when all weights mask to 0 (finite fallback; bit-identical on normal spikes).</li>
-    <li><strong>Swarm speed</strong> — pass <code>assume_sorted=True</code> for chronological meta; reuse <code>ix1</code>/<code>ix2</code> in <code>check_split</code>.</li>
-    <li><strong>template_match identity test</strong> — eager path on synthetic batch (do not rewrite max/gather).</li>
+    <li><strong>Run --runslow once</strong> — NP mini full pipeline overnight; close integration audit gap.</li>
+    <li><strong>Hunt cycle-5-class latent bugs</strong> rather than another 1.4× labels pass.</li>
   </ol>
   <p class="note">
     Already done: <code>get_data_cpu</code> scatter, group-by merge/PC, labels_in, clip/spike caps,
-    cycle-5 IO/whitening/empty-tree/CCG/peel/device-kNN, <strong>cycle-6 native Litke
-    <code>file_object</code></strong>. No C/CUDA unpack — Numba is enough (~500k samp/s).
+    cycle-5 IO/whitening/empty-tree/CCG/peel/device-kNN, cycle-6 native Litke
+    <code>file_object</code>, <strong>cycle-7 bin2py oracle fixtures + short e2e green</strong>.
+    Safe CPU wins largely harvested; peel dominates wall time. No C/CUDA unpack.
   </p>
 </section>
 
@@ -1601,7 +1614,7 @@ pytest tests/ -q --deselect tests/test_full_pipeline.py \
   </p>
   <p class="mono" style="font-size:0.8rem;color:var(--muted)">
     File: docs/MEA_FIELD_TEST_CONTEXT.html · Branch: mea-optimizations · Host: fieldlab ·
-    Cycles 1–6 · Litke native IO · e2e still pending · 2026-08-10
+    Cycles 1–7 · Litke oracle + e2e green · 2026-08-10
   </p>
 </section>
 

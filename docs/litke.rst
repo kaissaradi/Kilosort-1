@@ -127,13 +127,21 @@ What not to do
 Correctness
 -----------
 
-* Unpack layout matches bin2py
+* Unpack layout matches lab bin2py
   (``unpack_bin_even_num_electrodes`` / ``unpack_bin_odd_num_electrodes``).
-* Unit tests: ``tests/test_litke.py`` (pack/unpack identity, multi‑file,
-  TTL drop, TTL save/onsets, ``BinaryRWFile`` smoke).
-* Field check on real ``20251204A/data000``: unpack bit‑exact vs lab
-  ``bin2py_cythonext``; electrode 0 shows large stim‑like swings while neural
-  channels stay in the normal MEA range.
+* **Frozen lab-oracle fixtures** (not self‑pack roundtrips):
+  ``tests/data/litke_real_519_bin2py_oracle.npz`` — real mid‑recording bytes
+  from ``20251204A/data000`` with expected int16 from
+  ``bin2py_cythonext``; ``tests/data/litke_odd_bin2py_oracle.npz`` for the
+  odd/512 path. ``tests/test_litke.py`` asserts bit‑exact unpack against
+  these. That catches self‑consistent‑but‑wrong nibble/sign bugs that
+  pack∋unpack identity tests cannot see.
+* Other unit tests: multi‑file, TTL drop/save/onsets, ``BinaryRWFile`` smoke.
+* Live field recheck (optional): import the lab ``.so`` and compare windows;
+  last run bit‑exact at start / mid / 10 M / multi‑file boundary.
+* Short CPU e2e (non‑golden): ``LitkeRecording`` + ``tmax=5`` + 30 µm 519
+  probe + Th 8/6 on ``20251204A/data000`` completed (~80 s): 110 units
+  (14 good), ~38k spikes. Runtime dominated by peel spike detection, not IO.
 
 API summary
 -----------

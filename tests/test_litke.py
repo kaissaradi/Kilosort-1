@@ -1,6 +1,7 @@
 """Identity and smoke tests for native Litke IO (kilosort.litke)."""
 
 import struct
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -205,3 +206,56 @@ def test_detect_ttl_onsets_chunk_boundary(tmp_path):
     with litke.LitkeRecording(path, drop_ttl=True) as rec:
         onsets = rec.detect_ttl_onsets(threshold=1000, chunk_samples=10)
         np.testing.assert_array_equal(onsets, np.array([24], dtype=np.int64))
+
+
+# ---------------------------------------------------------------------------
+# Real-data / lab-oracle fixtures (not self-pack roundtrips)
+# ---------------------------------------------------------------------------
+# these .npz files were produced once by decoding real Litke bytes (or
+# packing with lab bin2py_cythonext) and freezing the lab ground truth. They
+# catch self-consistent-but-wrong nibble/sign/interleave bugs that pack∋unpack
+# identity tests cannot see.
+
+_DATA = Path(__file__).resolve().parent / 'data'
+
+
+def test_real_519_unpack_matches_bin2py_oracle():
+    """Real 20251204A packed bytes must decode bit-exact to lab bin2py.
+
+    Fixture: tests/data/litke_real_519_bin2py_oracle.npz
+    packed_uint8 = exact mid-recording file bytes from data000;
+    expected_int16 = bin2py_cythonext.unpack_bin_even_num_electrodes.
+    """
+    path = _DATA / 'litke_real_519_bin2py_oracle.npz'
+    assert path.is_file(), f'missing oracle fixture {path}'
+    z = np.load(path)
+    packed = z['packed_uint8']
+    expected = z['expected_int16']
+    n_samples = int(z['n_samples'])
+    n_elec = int(z['n_electrodes'])
+    assert packed.size == n_samples * litke.bytes_per_sample(n_elec)
+    assert expected.shape == (n_samples, n_elec)
+
+    got = litke.unpack_samples(packed, n_samples, n_elec)
+    np.testing.assert_array_equal(got, expected)
+
+    # pure-Python path must agree too (catches numba-only skew)
+    py = litke.unpack_samples_python(packed, n_samples, n_elec)
+    np.testing.assert_array_equal(py, expected)
+
+
+def test_odd_unpack_matches_bin2py_oracle():
+    """Odd-electrode (512-board style) pack/unpack vs lab bin2py freeze."""
+    path = _DATA / 'litke_odd_bin2py_oracle.npz'
+    assert path.is_file(), f'missing oracle fixture {path}'
+    z = np.load(path)
+    packed = z['packed_uint8']
+    expected = z['expected_int16']
+    n_samples = int(z['n_samples'])
+    n_elec = int(z['n_electrodes'])
+    assert n_elec % 2 == 1
+
+    got = litke.unpack_samples(packed, n_samples, n_elec)
+    np.testing.assert_array_equal(got, expected)
+    py = litke.unpack_samples_python(packed, n_samples, n_elec)
+    np.testing.assert_array_equal(py, expected)
