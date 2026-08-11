@@ -128,7 +128,10 @@ def plot_spike_positions(clu, is_refractory, results_dir):
 
     # 10 colors in palette, last one is gray for non-frefractory
     clu = clu.copy()
-    bad_units = np.unique(clu)[is_refractory == 0]
+    # is_ref is indexed by cluster id 0..max (dense after merge remap).
+    # Index by label value, not by position in unique() (fails on gaps).
+    u = np.unique(clu)
+    bad_units = u[~np.asarray(is_refractory)[u.astype(int)]]
     bad_idx = np.isin(clu, bad_units)
     clu = np.mod(clu, 9)
     clu[bad_idx] = 9
