@@ -8,6 +8,41 @@ import torch
 from kilosort import io
 
 
+def test_fwav_cache_bit_identical_across_batches(torch_device):
+    """Fourier high-pass cache must match recompute-per-batch results."""
+    from kilosort.preprocessing import get_highpass_filter
+
+    torch.manual_seed(0)
+    n_chan, nt_len = 4, 512
+    hp = get_highpass_filter(fs=20000, cutoff=300, device=torch_device)
+    # Minimal BinaryFiltered without a real file: construct then inject tensors.
+    bf = io.BinaryFiltered.__new__(io.BinaryFiltered)
+    bf.chan_map = None
+    bf.whiten_mat = None
+    bf.hp_filter = hp
+    bf.dshift = None
+    bf.do_CAR = False
+    bf.invert_sign = False
+    bf.artifact_threshold = np.inf
+    bf.device = torch_device
+    bf._fwav_cache = None
+    bf._fwav_cache_nt = None
+
+    X0 = torch.randn(n_chan, nt_len, device=torch_device)
+    # First call populates cache
+    y1 = bf.filter(X0.clone())
+    assert bf._fwav_cache is not None
+    assert bf._fwav_cache_nt == nt_len
+    # Second call reuses cache — bit-identical to first on same input
+    y2 = bf.filter(X0.clone())
+    assert torch.equal(y1, y2)
+    # Bust cache and recompute explicitly
+    bf._fwav_cache = None
+    bf._fwav_cache_nt = None
+    y3 = bf.filter(X0.clone())
+    assert torch.equal(y1, y3)
+
+
 def test_probe_io():
     # Create one-column probe with 5 contacts, spaced 1um apart.
     json_probe = {

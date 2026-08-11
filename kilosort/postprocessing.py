@@ -152,6 +152,10 @@ def make_pc_features(ops, spike_templates, spike_clusters, tF):
             ops, xy, iC, spike_templates, tF, None, None,
             dmin=ops['dmin'], dminx=ops['dminx'], ix=ix, merge_dim=False
             )
+        # Cluster with no matching templates/channels: skip rather than crash
+        # Phy export on edge-case remaps.
+        if Xd is None or igood is None or len(igood) == 0:
+            continue
 
         # Take mean of features across spikes, find channels w/ largest norm
         spike_mean = Xd.mean(0)

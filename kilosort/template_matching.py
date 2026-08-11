@@ -203,6 +203,14 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
     trange = torch.arange(-nt, nt+1, device=device)
     tiwave = torch.arange(-(nt//2), nt//2+1, device=device)
 
+    # Unit waveforms in sample time, once per call. The peel used to re-einsum
+    # U[selected] @ W on every hit (up to max_peels times). Per-unit matmul is
+    # independent, so indexing a precomputed (n_units, C, nt) is bit-identical
+    # and avoids the dominant CPU cost of learned matching on dense MEA.
+    # Layout matches historical einsum('ijk, jl -> kil', U[sel], W) after
+    # permute: (C, n_sel, nt).
+    U_time = torch.einsum('ijk, jl -> ikl', U, W)
+
     # Growable peel buffer: dense MEA batches can exceed the historical 1e5
     # cap and crash mid-assign. Double capacity on overflow (same growth rule
     # as outer detect/extract spike buffers). Low-rate batches stay identical.
@@ -259,8 +267,10 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
 
         n = 2
         for j in range(n):
-            Xres[:, iX[j::n] + tiwave]  -= amp[j::n] * torch.einsum('ijk, jl -> kil', U[iY[j::n,0]], W)
-            B[   :, iX[j::n] + trange]  -= amp[j::n] * ctc[:,iY[j::n,0],:]
+            # (n_sel, C, nt) -> (C, n_sel, nt) to match historical kil layout
+            waves = U_time[iY[j::n, 0]].permute(1, 0, 2)
+            Xres[:, iX[j::n] + tiwave] -= amp[j::n] * waves
+            B[:, iX[j::n] + trange] -= amp[j::n] * ctc[:, iY[j::n, 0], :]
 
     st = st[:k]
     amps = amps[:k]

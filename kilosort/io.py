@@ -1055,6 +1055,11 @@ class BinaryFiltered(BinaryRWFile):
         self.do_CAR = do_CAR
         self.invert_sign=invert_sign
         self.artifact_threshold = artifact_threshold
+        # Cache Fourier-domain high-pass for each batch length. Historical path
+        # re-ran fft_highpass on every batch (identical NT for all but possibly
+        # the ragged last batch) — pure overhead on CPU MEA sorts.
+        self._fwav_cache = None
+        self._fwav_cache_nt = None
 
     def filter(self, X, ops=None, ibatch=None, skip_preproc=False):
         # pick only the channels specified in the chanMap
@@ -1074,7 +1079,11 @@ class BinaryFiltered(BinaryRWFile):
 
         # high-pass filtering in the Fourier domain (much faster than filtfilt etc)
         if self.hp_filter is not None:
-            fwav = fft_highpass(self.hp_filter, NT=X.shape[1])
+            nt_len = int(X.shape[1])
+            if self._fwav_cache is None or self._fwav_cache_nt != nt_len:
+                self._fwav_cache = fft_highpass(self.hp_filter, NT=nt_len)
+                self._fwav_cache_nt = nt_len
+            fwav = self._fwav_cache
             X = torch.real(ifft(fft(X) * torch.conj(fwav)))
             X = fftshift(X, dim = -1)
 

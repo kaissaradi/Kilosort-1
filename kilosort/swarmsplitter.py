@@ -39,15 +39,27 @@ def count_elements(kk, iclust, my_clus, xtree):
 
 def check_split(Xd, kk, xtree, iclust, my_clus):
     ixy = labels_in(iclust, my_clus[xtree[kk, 2]])
+    # Empty membership (remapped labels / fully pruned branch): not bimodal.
+    if not np.any(ixy):
+        return np.zeros(0, dtype=np.float64), 0.0
+
     iclu = iclust[ixy]
     labels = 2*labels_in(iclu, my_clus[xtree[kk, 0]]) - 1
 
     Xs = Xd[ixy]
+    # One class empty → weighted LS / bimod_score are meaningless; treat as
+    # non-bimodal rather than solving a singular/zero-weight system.
+    pos = labels > 0
+    neg = labels < 0
+    if not np.any(pos) or not np.any(neg):
+        return np.zeros(Xs.shape[0], dtype=np.float64), 0.0
+
+    Xs = Xs.copy()
     Xs[:,-1] = 1
 
     w = np.ones((Xs.shape[0],1))
-    w[labels>0] = np.mean(labels<0)
-    w[labels<0] = np.mean(labels>0)
+    w[pos] = np.mean(neg)
+    w[neg] = np.mean(pos)
 
     CC = Xs.T @ (Xs * w)
     CC = CC + .01 * np.eye(CC.shape[0])

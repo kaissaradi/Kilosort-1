@@ -1,7 +1,16 @@
 import numpy as np
 import torch
 
-from kilosort.clustering_qr import kmeans_plusplus, mean_cluster_templates, x_centers
+from scipy.sparse import csr_matrix
+
+from kilosort.clustering_qr import (
+    Mstats,
+    kmeans_plusplus,
+    mean_cluster_templates,
+    x_centers,
+)
+from kilosort.hierarchical import Mstats as hierarchical_Mstats
+from kilosort.hierarchical import prepare as hierarchical_prepare
 from kilosort.io import load_probe
 from kilosort.utils import PROBE_DIR
 
@@ -48,6 +57,32 @@ def test_mean_cluster_templates_accepts_torch_iclust():
     W = mean_cluster_templates(Xd, iclust, ichan, n_chan=8, n_pcs=6)
     assert W.shape == (2, 8, 6)
     assert torch.isfinite(W[:, [2, 3], :]).all()
+
+
+def test_mstats_zero_adjacency_finite():
+    """Empty neighbor graph must not yield NaN ki/kj (0/0)."""
+    M = csr_matrix((5, 3), dtype=np.float32)
+    m, ki, kj = Mstats(M, device=torch.device('cpu'))
+    assert float(m) == 0.0
+    assert torch.isfinite(ki).all()
+    assert torch.isfinite(kj).all()
+    assert torch.count_nonzero(ki) == 0
+    assert torch.count_nonzero(kj) == 0
+
+    m2, ki2, kj2 = hierarchical_Mstats(M)
+    assert m2 == 0.0
+    assert np.all(np.isfinite(ki2))
+    assert np.all(np.isfinite(kj2))
+
+
+def test_hierarchical_prepare_zero_m_no_divide():
+    M = csr_matrix((4, 2), dtype=np.float32)
+    iclust = np.array([0, 0, 1, 1], dtype=np.int64)
+    iclust0 = np.array([0, 1], dtype=np.int64)
+    cc, cneg = hierarchical_prepare(M, iclust, iclust0)
+    assert np.all(np.isfinite(cc))
+    assert np.all(np.isfinite(cneg))
+    assert np.allclose(cneg, 0.001)
 
 
 def test_kmeans_plusplus_handles_low_rank_residual():

@@ -168,8 +168,17 @@ def Mstats(M, device=torch.device('cuda')):
     m = M.sum()
     ki = np.array(M.sum(1)).flatten()
     kj = np.array(M.sum(0)).flatten()
-    ki = m * ki/ki.sum()
-    kj = m * kj/kj.sum()
+    # All-zero adjacency (e.g. single spike after self-edges removed) used to
+    # produce 0/0 → NaN and poison assign_iclust / hierarchical prepare.
+    ki_sum = float(ki.sum())
+    kj_sum = float(kj.sum())
+    if ki_sum <= 0 or kj_sum <= 0 or float(m) == 0:
+        ki = np.zeros_like(ki, dtype=np.float64)
+        kj = np.zeros_like(kj, dtype=np.float64)
+        m = 0.0
+    else:
+        ki = m * ki / ki_sum
+        kj = m * kj / kj_sum
 
     ki = torch.from_numpy(ki).to(device)
     kj = torch.from_numpy(kj).to(device)
@@ -242,7 +251,10 @@ def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
     ones_e = torch.ones(n_spikes * n_neigh, dtype=torch.float64, device=device)
     rows_off = torch.arange(n_spikes, device=device).unsqueeze(-1) * nclust
 
-    scale = lam / m
+    # m==0 (no edges): lam/m is undefined; disable the modularity penalty so
+    # assignments reduce to pure neighbor votes (and stay finite).
+    use_lam = (lam > 0) and (float(m) != 0)
+    scale = (lam / m) if use_lam else 0.0
     prev = None
     # The exit test compares iclust against its value CHECK_EVERY iterations
     # earlier, which detects any cycle of period p dividing CHECK_EVERY. That
@@ -254,16 +266,16 @@ def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
     for t in range(niter):
         # given iclust, reassign isub (rows are subset nodes, cols clusters)
         idxS = (kn * nclust + iclust.unsqueeze(-1)).flatten()
-        kN = torch.bincount(iclust, minlength=nclust).double() if lam > 0 else None
+        kN = torch.bincount(iclust, minlength=nclust).double() if use_lam else None
         _counts_into(bufS, idxS, ones_e,
-                     kj if lam > 0 else None, kN, scale)
+                     kj if use_lam else None, kN, scale)
         isub = torch.argmax(bufS, 1)
 
         # given isub, reassign iclust (rows are spikes, cols clusters)
         idxN = (rows_off + isub[kn]).flatten()
-        kN = torch.bincount(isub, minlength=nclust).double() if lam > 0 else None
+        kN = torch.bincount(isub, minlength=nclust).double() if use_lam else None
         _counts_into(bufN, idxN, ones_e,
-                     ki if lam > 0 else None, kN, scale)
+                     ki if use_lam else None, kN, scale)
         iclust = torch.argmax(bufN, 1)
 
         if can_exit and (t + 1) % CHECK_EVERY == 0:
@@ -282,9 +294,9 @@ def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
     # Final isub at the reduced cluster count, same as stock's trailing call.
     bufS = bufS[:, :nclust].contiguous()
     idxS = (kn * nclust + iclust.unsqueeze(-1)).flatten()
-    kN = torch.bincount(iclust, minlength=nclust).double() if lam > 0 else None
+    kN = torch.bincount(iclust, minlength=nclust).double() if use_lam else None
     _counts_into(bufS, idxS, ones_e,
-                 kj if lam > 0 else None, kN, scale)
+                 kj if use_lam else None, kN, scale)
     isub = torch.argmax(bufS, 1)
 
     return iclust.cpu().numpy(), isub.cpu().numpy(), M, iclust_init

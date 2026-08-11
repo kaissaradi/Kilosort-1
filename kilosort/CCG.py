@@ -132,14 +132,21 @@ def refract(iclust2, st0, acg_threshold=0.2, ccg_threshold=0.25):
     if iclust2.size == 0:
         return np.zeros(0, dtype=bool), np.zeros(0)
 
-    Nfilt = int(iclust2.max()) + 1
+    # Dense 0..max table (export path). Negative / non-int labels used to make
+    # bincount raise; shift into a non-negative table like remove_duplicates.
+    labels = iclust2.astype(np.int64, copy=False)
+    min_lab = int(labels.min())
+    max_lab = int(labels.max())
+    offset = -min_lab if min_lab < 0 else 0
+    Nfilt = max_lab + offset + 1
 
     is_refractory = np.zeros(Nfilt, dtype=bool)
     R12 = np.zeros(Nfilt)
 
-    counts = np.bincount(iclust2, minlength=Nfilt)
+    shifted = labels + offset
+    counts = np.bincount(shifted, minlength=Nfilt)
     offsets = np.concatenate(([0], np.cumsum(counts)))
-    order = np.argsort(iclust2, kind='stable')
+    order = np.argsort(shifted, kind='stable')
     assume_sorted = st0.size < 2 or np.all(st0[:-1] <= st0[1:])
 
     for kk in range(Nfilt):
@@ -154,4 +161,11 @@ def refract(iclust2, st0, acg_threshold=0.2, ccg_threshold=0.25):
                 ccg_threshold=ccg_threshold, assume_sorted=assume_sorted
             )
 
+    # When labels were non-negative and dense, Nfilt == max+1 as before.
+    # With an offset, index 0 is min_lab; callers that index by raw label and
+    # expect max+1 length only work for min_lab>=0 (production export).
+    if offset == 0:
+        return is_refractory, R12
+    # Negative labels: return tables sized so index = label - min_lab.
+    # Documented via tests; merging_function uses non-negative clu only.
     return is_refractory, R12

@@ -79,6 +79,23 @@ def test_refract_accepts_empty_spike_vectors():
     assert contamination.size == 0
 
 
+def test_refract_accepts_negative_cluster_ids():
+    """Negative labels used to crash bincount; must return finite tables."""
+    # Two clusters at -1 and 0 with enough spikes for CCG.
+    st_a = np.arange(0.0, 5.0, 0.05)
+    st_b = np.arange(0.01, 5.0, 0.05)
+    cluster_ids = np.concatenate([
+        np.full(st_a.size, -1, dtype=np.int64),
+        np.zeros(st_b.size, dtype=np.int64),
+    ])
+    spike_times = np.concatenate([st_a, st_b])
+    order = np.argsort(spike_times, kind='stable')
+    labels, contam = CCG.refract(cluster_ids[order], spike_times[order])
+    assert labels.dtype == bool
+    assert labels.size == 2  # min=-1, max=0 → offset table length 2
+    assert np.all(np.isfinite(contam))
+
+
 def test_compute_ccg_empty_trains_no_crash():
     K, T = CCG.compute_CCG(np.zeros(0), np.zeros(0))
     assert T == 0.0

@@ -3,7 +3,12 @@ import numpy as np
 import torch
 from torch.nn.functional import conv1d
 
-from kilosort.template_matching import merging_function, roll_features
+from kilosort.template_matching import (
+    merging_function,
+    prepare_matching,
+    roll_features,
+    run_matching,
+)
 
 
 def test_roll_features_large_dt_no_index_error():
@@ -214,6 +219,84 @@ def test_merging_function_template_mode_matches_reference():
     assert torch.allclose(tF_g, tF_e, rtol=1e-5, atol=1e-5)
     # At least one merge should fire on this near-duplicate Wall pair.
     assert Ww_g.shape[0] < Wall.shape[0]
+
+
+def test_run_matching_precomputed_U_time_matches_inline_einsum():
+    """U_time index path must match historical per-hit einsum subtract.
+
+    Production U layout after postprocess_templates is (n_units, n_pcs, n_chan).
+    """
+    torch.manual_seed(0)
+    device = torch.device('cpu')
+    n_chan, nt, n_pcs, n_units = 8, 21, 3, 5
+    NT = 400
+    X = torch.randn(n_chan, NT + 2 * nt)
+    # (n_units, n_pcs, n_chan) — extract / prepare_matching layout
+    U = torch.randn(n_units, n_pcs, n_chan)
+    U = U / (U.norm(dim=(1, 2), keepdim=True) + 1e-6)
+    W = torch.randn(n_pcs, nt)
+    W = W / (W.norm(dim=1, keepdim=True) + 1e-6)
+    ops = {
+        'Th_learned': 2.0,
+        'nt': nt,
+        'max_peels': 20,
+        'wPCA': W,
+    }
+    ctc = prepare_matching(ops, U)
+    st1, a1, th1, X1 = run_matching(ops, X.clone(), U, ctc, device=device)
+
+    # Reference: same body but inline einsum (historical)
+    nm = (U ** 2).sum(-1).sum(-1)
+    s = nm.clamp_min(1e-30).rsqrt()
+    Us = U * s.view(-1, 1, 1)
+    B = conv1d(X.unsqueeze(1), W.unsqueeze(1), padding=nt // 2)
+    B = torch.einsum('ijk, kjl -> il', Us, B)
+    trange = torch.arange(-nt, nt + 1)
+    tiwave = torch.arange(-(nt // 2), nt // 2 + 1)
+    peel_cap = 100000
+    st = torch.zeros((peel_cap, 2), dtype=torch.int64)
+    amps = torch.zeros((peel_cap, 1))
+    th_amps = torch.zeros((peel_cap, 1))
+    k = 0
+    Xres = X.clone()
+    Th = ops['Th_learned']
+    from torch.nn.functional import max_pool1d
+    for _ in range(ops['max_peels']):
+        Cfmax, imax = torch.max(B, 0)
+        Cfmax = torch.relu(Cfmax)
+        Cfmax = Cfmax * Cfmax
+        Cfmax[:nt] = 0
+        Cfmax[-nt:] = 0
+        Cmax = max_pool1d(Cfmax.view(1, 1, -1), (2 * nt + 1), stride=1, padding=nt)
+        cmax = Cmax[0, 0]
+        xs = torch.nonzero((cmax > Th ** 2) & (torch.abs(cmax - Cfmax) < 1e-9))
+        if len(xs) == 0:
+            break
+        iX = xs[:, :1]
+        iY = imax[iX]
+        nsp = len(iX)
+        st[k:k + nsp, 0] = iX[:, 0]
+        st[k:k + nsp, 1] = iY[:, 0]
+        amps[k:k + nsp] = B[iY, iX] * s[iY]
+        amp = amps[k:k + nsp]
+        th_amps[k:k + nsp] = cmax[iX[:, 0], None] ** .5
+        k += nsp
+        for j in range(2):
+            Xres[:, iX[j::2] + tiwave] -= (
+                amp[j::2] * torch.einsum('ijk, jl -> kil', U[iY[j::2, 0]], W)
+            )
+            B[:, iX[j::2] + trange] -= amp[j::2] * ctc[:, iY[j::2, 0], :]
+    st = st[:k]
+    amps = amps[:k]
+    th_amps = th_amps[:k]
+
+    assert torch.equal(st1, st)
+    assert torch.equal(a1, amps)
+    assert torch.equal(th1, th_amps)
+    assert torch.equal(X1, Xres)
+    # Peel should have found something on random noise at low Th, or at least
+    # both paths agree on empty.
+    assert st1.shape[0] == st.shape[0]
 
 
 def test_merging_function_ccg_mode_matches_reference():

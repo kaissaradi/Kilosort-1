@@ -15,8 +15,13 @@ def Mstats(M):
     m = M.sum()
     ki = np.array(M.sum(1)).flatten()
     kj = np.array(M.sum(0)).flatten()
-    ki = m * ki/ki.sum()
-    kj = m * kj/kj.sum()
+    # Guard 0/0 when adjacency is empty after self-edges are zeroed.
+    ki_sum = float(ki.sum())
+    kj_sum = float(kj.sum())
+    if ki_sum <= 0 or kj_sum <= 0 or float(m) == 0:
+        return 0.0, np.zeros_like(ki, dtype=np.float64), np.zeros_like(kj, dtype=np.float64)
+    ki = m * ki / ki_sum
+    kj = m * kj / kj_sum
     return m, ki, kj
 
 def prepare(M, iclust, iclust0, lam=1):
@@ -24,7 +29,11 @@ def prepare(M, iclust, iclust0, lam=1):
     q,r = cluster_qr(M, iclust, iclust0)
     cc = (q @ M @ r).toarray()
     nc = cc.shape[0]
-    cneg = .001 + np.outer(q @ ki , kj @ r)/m
+    # m==0 → no edges; keep cneg as the small prior only (avoid /0).
+    if m == 0:
+        cneg = .001 + np.zeros((nc, nc), dtype=np.float64)
+    else:
+        cneg = .001 + np.outer(q @ ki , kj @ r)/m
     return cc, cneg
 
 def merge_reduce(cc, cneg, iclust):

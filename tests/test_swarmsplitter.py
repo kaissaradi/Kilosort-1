@@ -1,6 +1,12 @@
 import numpy as np
 
-from kilosort.swarmsplitter import bimod_score, check_CCG, labels_in, new_clusters
+from kilosort.swarmsplitter import (
+    bimod_score,
+    check_CCG,
+    check_split,
+    labels_in,
+    new_clusters,
+)
 
 
 def test_labels_in_matches_numpy_isin():
@@ -176,3 +182,27 @@ def test_bimod_score_finite_on_empty_and_normal():
     s1 = bimod_score(np.concatenate([left, right]))
     assert np.isfinite(s1)
     assert s1 > s0
+
+
+def test_check_split_empty_membership_returns_zero_score():
+    """No spikes in parent leaf → score 0, no linalg crash."""
+    Xd = np.random.default_rng(0).standard_normal((20, 5)).astype(np.float64)
+    iclust = np.zeros(20, dtype=np.int64)
+    # Tree node 2 is parent of leaves 0,1 but members list empty for leaf 0
+    xtree = np.array([[0, 1, 2]], dtype=np.int32)
+    my_clus = [[], [1], []]  # parent membership empty → ixy all False
+    xproj, score = check_split(Xd, 0, xtree, iclust, my_clus)
+    assert score == 0.0
+    assert xproj.size == 0
+
+
+def test_check_split_single_class_returns_zero_score():
+    """All spikes on one side of a proposed split → non-bimodal."""
+    rng = np.random.default_rng(2)
+    Xd = rng.standard_normal((30, 6)).astype(np.float64)
+    iclust = np.zeros(30, dtype=np.int64)  # all label 0
+    xtree = np.array([[0, 1, 2]], dtype=np.int32)
+    my_clus = [[0], [1], [0, 1]]  # parent has 0 and 1; only 0 present in data
+    xproj, score = check_split(Xd, 0, xtree, iclust, my_clus)
+    assert score == 0.0
+    assert xproj.shape == (30,)
