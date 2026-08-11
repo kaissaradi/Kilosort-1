@@ -648,10 +648,13 @@ class BinaryRWFile:
                     else min(np.int64(tmax*self.fs), self.total_samples)
         self.n_batches_raw = np.int64(np.ceil(self.n_samples / self.NT))
         # Check if last batch is too small. If so, drop those samples.
+        # Must adjust n_batches_raw here: set_downsampling is what creates
+        # self.n_batches, so decrementing self.n_batches was a NameError crash
+        # on any recording whose final batch fell under nt samples.
         a, b = self._get_batch_edges(self.n_batches_raw-1)
         batch_size = b - a - self.nt
         if batch_size < self.nt:
-            self.n_batches -= 1  # 4.1.2-compat: see mea-optimizations pin commit
+            self.n_batches_raw -= 1  # 4.1.2-compat: see mea-optimizations pin commit
             self.imax -= batch_size
 
         self.set_downsampling(batch_downsampling)

@@ -203,9 +203,13 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
     trange = torch.arange(-nt, nt+1, device=device)
     tiwave = torch.arange(-(nt//2), nt//2+1, device=device)
 
-    st = torch.zeros((100000,2), dtype = torch.int64, device = device)
-    amps = torch.zeros((100000,1), dtype = torch.float, device = device)
-    th_amps = torch.zeros((100000,1), dtype = torch.float, device = device)
+    # Growable peel buffer: dense MEA batches can exceed the historical 1e5
+    # cap and crash mid-assign. Double capacity on overflow (same growth rule
+    # as outer detect/extract spike buffers). Low-rate batches stay identical.
+    peel_cap = 100000
+    st = torch.zeros((peel_cap, 2), dtype=torch.int64, device=device)
+    amps = torch.zeros((peel_cap, 1), dtype=torch.float, device=device)
+    th_amps = torch.zeros((peel_cap, 1), dtype=torch.float, device=device)
     k = 0
 
     Xres = X.clone()
@@ -232,6 +236,18 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
         iY = imax[iX]
 
         nsp = len(iX)
+        need = k + nsp
+        if need > st.shape[0]:
+            new_cap = max(need, st.shape[0] * 2)
+            st = torch.cat((st, torch.zeros((new_cap - st.shape[0], 2),
+                                            dtype=st.dtype, device=device)), 0)
+            amps = torch.cat((amps, torch.zeros((new_cap - amps.shape[0], 1),
+                                                dtype=amps.dtype, device=device)), 0)
+            th_amps = torch.cat(
+                (th_amps, torch.zeros((new_cap - th_amps.shape[0], 1),
+                                      dtype=th_amps.dtype, device=device)), 0
+            )
+
         st[k:k+nsp, 0] = iX[:,0]
         st[k:k+nsp, 1] = iY[:,0]
         # B is scaled by s, so B_stock[iY,iX]/nm[iY] == B[iY,iX]*s[iY].

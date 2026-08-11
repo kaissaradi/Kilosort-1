@@ -41,9 +41,13 @@ def test_labels_in_large_spike_vector_matches_isin():
 
 
 def _reference_new_clusters(iclust, my_clus, xtree):
-    """Historical isin-based remapping (identity oracle for the shipped path)."""
+    """Isin-based remapping oracle for non-empty trees.
+
+    Empty-tree policy: preserve labels (stock zeros was a multi-cluster collapse
+    bug; tests assert the fixed behavior explicitly).
+    """
     if len(xtree) == 0:
-        return np.zeros_like(iclust)
+        return np.asarray(iclust).copy()
 
     xtree = np.array(xtree, copy=True)
     nc = xtree.max() + 1
@@ -108,10 +112,31 @@ def test_new_clusters_collapses_merged_leaf_membership():
     assert got[0] != got[3]
 
 
-def test_new_clusters_empty_tree_returns_zeros():
-    iclust = np.array([0, 1, 0], dtype=np.int64)
-    got = new_clusters(iclust, my_clus=[[0], [1]], xtree=[], tstat=None)
-    np.testing.assert_array_equal(got, np.zeros_like(iclust))
+def test_new_clusters_empty_tree_preserves_labels():
+    """Fully-split tree must not collapse multi-cluster labels to zero."""
+    iclust = np.array([0, 1, 0, 1, 2], dtype=np.int64)
+    got = new_clusters(iclust, my_clus=[[0], [1], [2]], xtree=[], tstat=None)
+    np.testing.assert_array_equal(got, iclust)
+    assert got is not iclust  # copy, not alias
+    # Single-cluster still all zeros after preserve (already zeros).
+    single = np.zeros(4, dtype=np.int64)
+    np.testing.assert_array_equal(
+        new_clusters(single, my_clus=[[0]], xtree=[], tstat=None), single
+    )
+
+
+def test_check_CCG_zero_span_returns_false():
+    # All equal times → T==0; must not nan / throw.
+    st = np.array([1.0, 1.0, 1.0])
+    is_ref, cross = check_CCG(st, st)
+    assert bool(is_ref) is False
+    assert bool(cross) is False
+
+
+def test_check_CCG_empty_returns_false():
+    is_ref, cross = check_CCG(np.array([]), np.array([0.1, 0.2]))
+    assert bool(is_ref) is False
+    assert bool(cross) is False
 
 
 def test_check_CCG_acg_no_copy_matches_explicit_pair():

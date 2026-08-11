@@ -36,6 +36,33 @@ def test_whitening_local_matches_per_channel_argsort():
                                           device=torch.device('cpu'))
     torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)
 
+
+def test_get_whitening_matrix_single_batch(tmp_path):
+    """One-batch files used to hit CC/k with k==0 (empty range over n_batches-1)."""
+    n_chan, NT, nt = 6, 500, 21
+    n_samples = NT  # exactly one full batch
+    path = tmp_path / 'one_batch.bin'
+    rng = np.random.default_rng(0)
+    data = rng.integers(-100, 100, size=(n_samples, n_chan), dtype=np.int16)
+    data.tofile(path)
+
+    xc = np.arange(n_chan, dtype=np.float64) * 30.0
+    yc = np.zeros(n_chan, dtype=np.float64)
+    bfile = io.BinaryFiltered(
+        path,
+        n_chan_bin=n_chan,
+        fs=20000,
+        NT=NT,
+        nt=nt,
+        chan_map=np.arange(n_chan),
+        device=torch.device('cpu'),
+        do_CAR=False,
+    )
+    assert bfile.n_batches == 1
+    Wrot = kpp.get_whitening_matrix(bfile, xc, yc, nskip=25, nrange=4)
+    assert Wrot.shape == (n_chan, n_chan)
+    assert torch.isfinite(Wrot).all()
+
 class TestFiltering:
     # 2 seconds of time samples at 30Khz, 1 channel
     t = np.linspace(0, 2, 60000, False, dtype='float32')[np.newaxis,...]

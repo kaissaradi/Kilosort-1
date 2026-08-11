@@ -290,3 +290,32 @@ def test_downsampling(bfile):
     # But batch(i) should be the same as batch(j*3)
     assert torch.allclose(b15a, b5b)
     assert nbb <= 3*nba
+
+
+def test_short_last_batch_does_not_crash(tmp_path):
+    """Last batch shorter than `nt` used to AttributeError on n_batches.
+
+    BinaryRWFile adjusted `self.n_batches` before set_downsampling created
+    that attribute. The drop must apply to n_batches_raw, then n_batches is
+    derived. MEA short fixtures and truncated tmax runs hit this path.
+    """
+    n_chan = 4
+    NT, nt = 100, 10
+    # With these params, n_samples=209 yields 3 raw batches and a too-short
+    # final batch (reproduced crash before the fix).
+    n_samples = 209
+    path = tmp_path / 'short_tail.bin'
+    np.zeros((n_samples, n_chan), dtype=np.int16).tofile(path)
+
+    bfile = io.BinaryRWFile(
+        path, n_chan_bin=n_chan, fs=1000, NT=NT, nt=nt, device=torch.device('cpu'),
+    )
+    assert bfile.n_batches_raw == 2
+    assert bfile.n_batches == 2
+    # Dropped 9 residual samples so the last kept batch is valid.
+    assert bfile.imax == 200
+    assert bfile.n_samples == 200
+    # Must be able to read every reported batch.
+    for i in range(bfile.n_batches):
+        X = bfile.padded_batch_to_torch(i)
+        assert X.shape == (n_chan, NT + 2 * nt)

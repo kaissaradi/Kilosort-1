@@ -1,8 +1,53 @@
 import numpy as np
+import torch
 
-from kilosort.clustering_qr import x_centers
+from kilosort.clustering_qr import mean_cluster_templates, x_centers
 from kilosort.io import load_probe
 from kilosort.utils import PROBE_DIR
+
+
+def _reference_mean_cluster_templates(Xd, iclust, ichan, n_chan, n_pcs):
+    """Historical per-label boolean-mask mean used in clustering_qr.run."""
+    if isinstance(iclust, torch.Tensor):
+        iclust_t = iclust
+    else:
+        iclust_t = torch.as_tensor(iclust)
+    Nfilt = int(iclust_t.max().item()) + 1 if iclust_t.numel() else 0
+    W = torch.zeros((Nfilt, n_chan, n_pcs), dtype=Xd.dtype)
+    for j in range(Nfilt):
+        w = Xd[iclust_t == j].mean(0)
+        W[j, ichan, :] = torch.reshape(w, (-1, n_pcs))
+    return W
+
+
+def test_mean_cluster_templates_matches_mask_loop():
+    rng = np.random.default_rng(11)
+    n_spikes, n_feat, n_chan_local, n_pcs = 2000, 48, 8, 6
+    # Flattened local features (merge_dim=True style)
+    Xd = torch.from_numpy(rng.standard_normal((n_spikes, n_feat)).astype(np.float32))
+    iclust = rng.integers(0, 25, size=n_spikes).astype(np.int64)
+    # Leave a gap so empty-cluster NaN path is exercised
+    iclust[iclust == 7] = 8
+    ichan = torch.arange(n_chan_local, dtype=torch.long)
+    n_chan = 64
+
+    got = mean_cluster_templates(Xd, iclust, ichan, n_chan, n_pcs)
+    ref = _reference_mean_cluster_templates(Xd, iclust, ichan, n_chan, n_pcs)
+    assert got.shape == ref.shape
+    # NaNs for empty labels; equal elsewhere
+    both_nan = torch.isnan(got) & torch.isnan(ref)
+    assert torch.equal(torch.nan_to_num(got, nan=0.0), torch.nan_to_num(ref, nan=0.0))
+    assert both_nan.any()  # gap at label 7
+
+
+def test_mean_cluster_templates_accepts_torch_iclust():
+    Xd = torch.randn(100, 12)
+    iclust = torch.zeros(100, dtype=torch.long)
+    iclust[40:] = 1
+    ichan = torch.tensor([2, 3])
+    W = mean_cluster_templates(Xd, iclust, ichan, n_chan=8, n_pcs=6)
+    assert W.shape == (2, 8, 6)
+    assert torch.isfinite(W[:, [2, 3], :]).all()
 
 
 def random_np2(n_chans=384, n_shanks=4):
@@ -71,7 +116,7 @@ class TestCenters:
         probe = random_np2(n_shanks=3)
         self.ops['xc'] = probe['xc']
         centers = x_centers(self.ops)
-        assert len(centers == 3)
+        assert len(centers) == 3
         true = np.array([22, 272, 522, 772])
         for c in centers:
             # Each center is within 2 microns of exactly one true center

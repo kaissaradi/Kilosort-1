@@ -12,7 +12,7 @@ import faiss
 from tqdm import tqdm 
 
 from kilosort import hierarchical, swarmsplitter
-from kilosort.utils import log_performance
+from kilosort.utils import group_indices_by_label, log_performance
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,7 @@ def _knn_gpu(Xd, Xsub, n_neigh, device):
         torch.backends.cuda.matmul.allow_tf32 = prev_tf32
 
 
-def neigh_mat(Xd, nskip=1, n_neigh=10, max_sub=25000):
+def neigh_mat(Xd, nskip=1, n_neigh=10, max_sub=25000, device=None):
     # Xd is spikes by PCA features in a local neighborhood
     # finding n_neigh neighbors of each spike to a subset of every nskip spike
 
@@ -79,6 +79,10 @@ def neigh_mat(Xd, nskip=1, n_neigh=10, max_sub=25000):
 
     # n_nodes are the # subsampled spikes
     n_nodes = Xsub.shape[0]
+    if n_nodes == 0:
+        raise ValueError('neigh_mat: empty neighbor subset (n_nodes==0)')
+    # topk / faiss require k <= n_nodes; tiny centers can undershoot n_neigh.
+    n_neigh = int(min(n_neigh, n_nodes))
 
     # search is much faster if array is contiguous
     Xd = np.ascontiguousarray(Xd)
@@ -86,8 +90,15 @@ def neigh_mat(Xd, nskip=1, n_neigh=10, max_sub=25000):
 
     # exact neighbor search ("brute force")
     # kn is n_spikes by n_neigh, contains integer indices into Xsub
-    if torch.cuda.is_available():
-        kn = _knn_gpu(Xd, Xsub, n_neigh, torch.device('cuda'))
+    # Honor caller's device: pure-CPU fieldlab must not jump onto CUDA just
+    # because a GPU is visible (OOM / non-repro "CPU" runs).
+    use_gpu = (
+        device is not None
+        and getattr(device, 'type', None) == 'cuda'
+        and torch.cuda.is_available()
+    )
+    if use_gpu:
+        kn = _knn_gpu(Xd, Xsub, n_neigh, device)
     else:
         index = faiss.IndexFlatL2(dim)   # build the index
         index.add(Xsub)    # add vectors to the index
@@ -198,7 +209,9 @@ def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
         # kn: n_spikes by n_neigh with integer indices into the spike subset
         #     used for neighbor-finding determined by nskip.
         # M:  n_spikes by nsub, adjacency matrix representation of kn.
-        kn, M = neigh_mat(Xd, nskip=nskip, n_neigh=n_neigh, max_sub=max_sub)
+        kn, M = neigh_mat(
+            Xd, nskip=nskip, n_neigh=n_neigh, max_sub=max_sub, device=device
+        )
     m, ki, kj = Mstats(M, device=device)
 
     if verbose:
@@ -527,10 +540,15 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
     xcent = x_centers(ops)
     nsp = st.shape[0]
     nearest_center, _, _ = get_nearest_centers(xy, xcent, ycent)
-    total_centers = np.unique(nearest_center).size
-    
+    # Membership set: `ii not in nearest_center` on a torch tensor is a full
+    # linear scan every empty lattice point (common on sparse MEA grids).
+    occupied_centers = set(nearest_center.unique().tolist())
+    total_centers = len(occupied_centers)
+
     clu = np.zeros(nsp, 'int32')
-    Wall = torch.zeros((0, ops['Nchan'], ops['settings']['n_pcs']))
+    # Collect per-center templates then cat once — avoids O(n_centers)
+    # quadratic realloc from repeated torch.cat on a growing Wall.
+    wall_parts = []
     Nfilt = None
     nearby_chans_empty = 0
     nmax = 0
@@ -538,13 +556,14 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                 mininterval=10 if progress_bar else None)
     t = 0
     v = False
-    
+    n_pcs = ops['settings']['n_pcs']
+
     try:
         for jj in prog:
             for kk in np.arange(len(ycent)):
                 # Get data for all templates that were closest to this x,y center.
                 ii = kk + jj*ycent.size
-                if ii not in nearest_center:
+                if ii not in occupied_centers:
                     # No templates are nearest to this center, skip it.
                     continue
                 else:
@@ -576,7 +595,7 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                         torch.cuda.reset_peak_memory_stats(device)
                     v = True
                 if Xd.shape[0] < 1000:
-                    iclust = torch.zeros((Xd.shape[0],))
+                    iclust = np.zeros(Xd.shape[0], dtype=np.int32)
                 else:
                     if mode == 'template':
                         st0 = st[igood,0]/ops['fs']
@@ -612,13 +631,11 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                 Nfilt = int(iclust.max() + 1)
                 nmax += Nfilt
 
-                # we need the new templates here         
-                W = torch.zeros((Nfilt, ops['Nchan'], ops['settings']['n_pcs']))
-                for j in range(Nfilt):
-                    w = Xd[iclust==j].mean(0)
-                    W[j, ichan, :] = torch.reshape(w, (-1, ops['settings']['n_pcs'])).cpu()
-                
-                Wall = torch.cat((Wall, W), 0)
+                # Per-cluster feature means → templates. One group-by replaces
+                # Nfilt full boolean scans of iclust (same mean as the loop).
+                wall_parts.append(
+                    mean_cluster_templates(Xd, iclust, ichan, ops['Nchan'], n_pcs)
+                )
 
                 if progress_bar is not None:
                     progress_bar.emit(int((kk+1) / len(ycent) * 100))
@@ -640,6 +657,11 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
             f'\ndmin, dminx, and xcenter are: {dmin, dminx, xcup.mean()}'
         )
 
+    if not wall_parts:
+        raise ValueError(
+            'Wall is empty after `clustering_qr.run`, cannot continue clustering.'
+        )
+    Wall = torch.cat(wall_parts, 0)
     if Wall.sum() == 0:
         # Wall is empty, unspecified reason
         raise ValueError(
@@ -647,6 +669,38 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
         )
 
     return clu, Wall
+
+
+def mean_cluster_templates(Xd, iclust, ichan, n_chan, n_pcs):
+    """Mean features per cluster label → (Nfilt, n_chan, n_pcs) templates.
+
+    Numerically matches the historical loop
+    ``for j in range(Nfilt): W[j, ichan] = Xd[iclust==j].mean(0).reshape(...)``
+    including empty-cluster NaNs from a zero-row mean.
+    """
+    if isinstance(iclust, torch.Tensor):
+        iclust_np = iclust.detach().cpu().numpy()
+    else:
+        iclust_np = np.asarray(iclust)
+    iclust_np = iclust_np.astype(np.int64, copy=False)
+    Nfilt = int(iclust_np.max()) + 1 if iclust_np.size else 0
+    W = torch.zeros((Nfilt, n_chan, n_pcs), dtype=Xd.dtype)
+    if Nfilt == 0:
+        return W
+
+    groups = group_indices_by_label(iclust_np)
+    empty_mean = None
+    for j in range(Nfilt):
+        idxs = groups.get(j)
+        if idxs is None:
+            # Match torch mean over an empty selection → NaN features.
+            if empty_mean is None:
+                empty_mean = Xd[:0].mean(0)
+            w = empty_mean
+        else:
+            w = Xd[idxs].mean(0)
+        W[j, ichan, :] = torch.reshape(w, (-1, n_pcs))
+    return W
 
 
 def get_data_cpu(ops, xy, iC, PID, tF, ycenter, xcenter, dmin=20, dminx=32,

@@ -84,13 +84,18 @@ def check_CCG(st1, st2=None, nbins = 500, tbin  = 1/1000, assume_sorted=False):
     # not mutate spike times in place, so a defensive copy is wasted memory.
     if st2 is None:
         st2 = st1
-    K , T = compute_CCG(st1, st2, nbins = nbins, tbin = tbin,
-                        assume_sorted=assume_sorted)
-    # NOTE: upstream 4.1.3+ added an empty/zero guard here, but it was written
-    # as `len(st2 == 0)` (len of a bool array -- always truthy for non-empty
-    # st2), which makes check_CCG unconditionally return (False, False) and
-    # silently disables refractoriness checks. Removed to keep the validated
-    # 4.1.2 behavior; see mea-optimizations pin commit.
+    st1 = np.asarray(st1)
+    st2 = np.asarray(st2)
+    # Correct empty / zero-span guard (upstream 4.1.3 wrote `len(st2 == 0)`,
+    # which is always truthy for non-empty st2 and disabled all CCG checks).
+    # T==0 (all equal times) still divides by T in CCG_metrics → nans → both
+    # flags false; short-circuit instead of computing garbage.
+    if st1.size == 0 or st2.size == 0:
+        return False, False
+    K, T = compute_CCG(st1, st2, nbins=nbins, tbin=tbin,
+                       assume_sorted=assume_sorted)
+    if T == 0:
+        return False, False
     R12, Q12, Q00 = CCG_metrics(st1, st2, K, T,  nbins = nbins, tbin = tbin)
     is_refractory    = R12<.1  and (Q12<.2  or Q00<.25)
     cross_refractory = R12<.25 and (Q12<.05 or Q00<.25)
@@ -171,9 +176,12 @@ def split(Xd, xtree, tstat, iclust, my_clus, verbose = True, meta = None):
 
 def new_clusters(iclust, my_clus, xtree, tstat):
 
-    if len(xtree)==0:
-        return np.zeros_like(iclust)
-         
+    # Empty tree after split() means every hierarchical merge was rejected:
+    # leaves are the original labels. Returning zeros (historical stock) silently
+    # collapses multi-cluster centers into a single cluster — a real correctness
+    # bug on fully-split trees. Preserve labels instead.
+    if len(xtree) == 0:
+        return np.asarray(iclust).copy()
 
     nc = xtree.max() + 1
 

@@ -104,18 +104,27 @@ def get_whitening_matrix(f, xc, yc, nskip=25, nrange=32):
     # collect the covariance matrix across channels
     CC = torch.zeros((n_chan, n_chan), device=f.device)
     k = 0
-    for j in range(0, f.n_batches-1, nskip):
+    # Historical loop skipped the final batch (`range(0, n_batches-1, ...)`).
+    # On single-batch fixtures that made the range empty and divided by k==0.
+    # Use at least batch 0; when n_batches>1 keep the same upper bound as before.
+    n_scan = max(1, int(f.n_batches) - 1)
+    for j in range(0, n_scan, nskip):
         # load data with high-pass filtering (see the Binary file class)
-        X = f.padded_batch_to_torch(j)        
-        
+        X = f.padded_batch_to_torch(j)
+
         # remove padding
         X = X[:, f.nt : -f.nt]
 
         # cumulative covariance matrix
         CC = CC + (X @ X.T)/X.shape[1]
-        
-        k+=1
-        
+
+        k += 1
+
+    if k == 0:
+        raise ValueError(
+            'get_whitening_matrix found no batches to average; '
+            f'n_batches={f.n_batches}'
+        )
     CC = CC / k
 
     # compute the local whitening filters and collect back into Wrot
