@@ -678,10 +678,24 @@ def get_data_cpu(ops, xy, iC, PID, tF, ycenter, xcenter, dmin=20, dminx=32,
     ichan, imap = torch.unique(iC[:, ix], return_inverse=True)
     nchan = ichan.nelement()
 
-    dd = torch.zeros((nspikes, nchan, nfeatures))
-    for k,j in enumerate(ix.nonzero()[:,0]):
-        ij = torch.nonzero(pid==j)[:, 0]
-        dd[ij.unsqueeze(-1), imap[:,k]] = data[ij]
+    # Vectorized scatter: map each spike's template id to its column in imap,
+    # then place (nchanraw) raw-channel slots into the unique-channel tensor.
+    # Matches the historical per-template loop:
+    #   for k, j in enumerate(ix.nonzero()[:, 0]):
+    #       ij = torch.nonzero(pid == j)[:, 0]
+    #       dd[ij.unsqueeze(-1), imap[:, k]] = data[ij]
+    # Real nearest-channel maps have unique slots per template column; duplicate
+    # slots keep the same last-write-wins advanced-index semantics as the loop.
+    sel = ix.nonzero()[:, 0]
+    lookup = torch.full((ix.numel(),), -1, dtype=torch.long)
+    lookup[sel] = torch.arange(sel.numel(), dtype=torch.long)
+    k_per = lookup[pid]
+    rows = torch.arange(nspikes, dtype=torch.long).unsqueeze(1).expand(
+        nspikes, nchanraw
+    )
+    cols = imap[:, k_per].T
+    dd = torch.zeros((nspikes, nchan, nfeatures), dtype=data.dtype)
+    dd[rows, cols] = data
 
     if merge_dim:
         Xd = torch.reshape(dd, (nspikes, -1))
