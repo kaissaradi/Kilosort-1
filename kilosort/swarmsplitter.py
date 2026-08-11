@@ -3,15 +3,48 @@ from numba import njit
 import math
 from kilosort.CCG import compute_CCG, CCG_metrics
 
+
+def labels_in(labels, members):
+    """Boolean membership of integer labels in `members` (np.isin-compatible).
+
+    Hierarchical split/merge repeatedly tests spike labels against small leaf
+    member lists. A dense boolean table + gather is cheaper than hashing every
+    element when labels are non-negative cluster ids (the production path).
+    """
+    labels = np.asarray(labels)
+    if labels.size == 0:
+        return np.zeros(0, dtype=bool)
+    members = np.asarray(members, dtype=np.int64).ravel()
+    if members.size == 0:
+        return np.zeros(labels.shape, dtype=bool)
+
+    max_label = int(labels.max())
+    max_member = int(members.max()) if members.size else -1
+    size = max(max_label, max_member) + 1
+    if size <= 0:
+        return np.zeros(labels.shape, dtype=bool)
+
+    table = np.zeros(size, dtype=bool)
+    # Ignore negative / out-of-range member ids the same way np.isin would miss them.
+    good = (members >= 0) & (members < size)
+    table[members[good]] = True
+
+    out = np.zeros(labels.shape, dtype=bool)
+    known = (labels >= 0) & (labels < size)
+    if np.any(known):
+        out[known] = table[labels[known]]
+    return out
+
+
 def count_elements(kk, iclust, my_clus, xtree):
-    n1 = np.isin(iclust, my_clus[xtree[kk, 0]]).sum()
-    n2 = np.isin(iclust, my_clus[xtree[kk, 1]]).sum()
+    n1 = labels_in(iclust, my_clus[xtree[kk, 0]]).sum()
+    n2 = labels_in(iclust, my_clus[xtree[kk, 1]]).sum()
     return n1, n2
 
 def check_split(Xd, kk, xtree, iclust, my_clus):
-    ixy = np.isin(iclust, my_clus[xtree[kk, 2]])
+    ixy = labels_in(iclust, my_clus[xtree[kk, 2]])
     iclu = iclust[ixy]
-    labels = 2*np.isin(iclu, my_clus[xtree[kk, 0]]) - 1
+    labels = 2*labels_in(iclu, my_clus[xtree[kk, 0]]) - 1
 
     Xs = Xd[ixy]
     Xs[:,-1] = 1
@@ -97,8 +130,8 @@ def split(Xd, xtree, tstat, iclust, my_clus, verbose = True, meta = None):
         if not valid_merge[kk]:
             continue;
 
-        ix1 = np.isin(iclust, my_clus[xtree[kk, 0]])
-        ix2 = np.isin(iclust, my_clus[xtree[kk, 1]])
+        ix1 = labels_in(iclust, my_clus[xtree[kk, 0]])
+        ix2 = labels_in(iclust, my_clus[xtree[kk, 1]])
 
         criterion = 0
         score = np.nan

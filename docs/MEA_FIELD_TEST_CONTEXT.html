@@ -279,7 +279,7 @@
       <div><strong>Branch</strong> · mea-optimizations</div>
       <div><strong>Fork</strong> · kaissaradi/Kilosort-1</div>
       <div><strong>Survey date</strong> · 2026-08-10</div>
-      <div><strong>Updated</strong> · 2026-08-10 (cycle 2)</div>
+      <div><strong>Updated</strong> · 2026-08-10 (cycle 3)</div>
       <div><strong>Status</strong> · Living brief + CPU opt log</div>
     </div>
   </div>
@@ -1016,7 +1016,7 @@ nproc; free -h; nvidia-smi || true</code></pre>
   <div class="callout ok">
     <div class="tag">Fast suite gate (latest)</div>
     <code>pytest tests/ -q -m "not slow" -k "not wpca_wtemp"</code>
-    → <strong>48 passed, 2 deselected</strong> (slow full pipeline + wpca/SIGILL host limit).
+    → <strong>50 passed, 2 deselected</strong> (slow full pipeline + wpca/SIGILL host limit).
   </div>
 
   <h3>Cycle 1 — spike buffers, CCG, duplicates</h3>
@@ -1109,6 +1109,25 @@ get_clip_buffer_capacity(n_batches, nskip=25) =
     500k×nt float32 slab (~122&nbsp;MiB at nt=61).
   </p>
 
+  <h3>Cycle 3 — dense label membership</h3>
+  <table>
+    <thead>
+      <tr><th>Change</th><th>Axis</th><th>Module</th><th>Lock-in test</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>labels_in</code> dense membership (replaces hot <code>np.isin</code>)</td>
+        <td>speed</td>
+        <td><code>swarmsplitter</code> split / check_split / count_elements</td>
+        <td><code>test_labels_in_matches_numpy_isin</code></td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    Micro-bench (200k labels, 80 members): <code>labels_in</code> ≈1.0&nbsp;ms vs
+    <code>np.isin</code> ≈1.5&nbsp;ms per call on fieldlab.
+  </p>
+
   <h3>Micro-bench snapshots (fieldlab, indicative)</h3>
   <table>
     <thead>
@@ -1163,7 +1182,7 @@ pytest tests/ -q -m "not slow" -k "not wpca_wtemp"</code></pre>
   </p>
   <p class="mono" style="font-size:0.8rem;color:var(--muted)">
     File: docs/MEA_FIELD_TEST_CONTEXT.html · Branch: mea-optimizations · Host: fieldlab ·
-    Cycles: 1 (buffers/CCG/duplicates) · 2 (clips/whitening/swarm)
+    Cycles: 1 · 2 · 3 (labels_in)
   </p>
 </section>
 

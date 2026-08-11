@@ -1,6 +1,26 @@
 import numpy as np
 
-from kilosort.swarmsplitter import check_CCG, new_clusters
+from kilosort.swarmsplitter import check_CCG, labels_in, new_clusters
+
+
+def test_labels_in_matches_numpy_isin():
+    labels = np.array([0, 1, 2, 1, 4, 0, 3], dtype=np.int64)
+    members = [1, 3, 9]
+    np.testing.assert_array_equal(labels_in(labels, members),
+                                  np.isin(labels, members))
+    # Empty edges
+    np.testing.assert_array_equal(labels_in(labels, []),
+                                  np.isin(labels, []))
+    np.testing.assert_array_equal(labels_in(np.array([], dtype=np.int64), members),
+                                  np.isin(np.array([], dtype=np.int64), members))
+
+
+def test_labels_in_large_spike_vector_matches_isin():
+    rng = np.random.default_rng(1)
+    labels = rng.integers(0, 500, size=50_000)
+    members = rng.choice(500, size=40, replace=False)
+    np.testing.assert_array_equal(labels_in(labels, members),
+                                  np.isin(labels, members))
 
 
 def _reference_new_clusters(iclust, my_clus, xtree):
