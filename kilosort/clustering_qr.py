@@ -567,6 +567,8 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
     xcent = x_centers(ops)
     nsp = st.shape[0]
     nearest_center, _, _ = get_nearest_centers(xy, xcent, ycent)
+    # get_data_cpu converts PID every center; hoist once (long tensor).
+    iclust_template_t = torch.as_tensor(iclust_template).long()
     # Membership set: `ii not in nearest_center` on a torch tensor is a full
     # linear scan every empty lattice point (common on sparse MEA grids).
     # Also precompute boolean ix masks once so each occupied center does not
@@ -616,7 +618,7 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                         v = True
 
                 Xd, igood, ichan = get_data_cpu(
-                    ops, xy, iC, iclust_template, tF, ycent[kk], xcent[jj],
+                    ops, xy, iC, iclust_template_t, tF, ycent[kk], xcent[jj],
                     dmin=dmin, dminx=dminx, ix=ix,
                     )
                 if Xd is None:
