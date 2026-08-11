@@ -279,8 +279,9 @@
       <div><strong>Branch</strong> · mea-optimizations</div>
       <div><strong>Fork</strong> · kaissaradi/Kilosort-1</div>
       <div><strong>Survey date</strong> · 2026-08-10</div>
-      <div><strong>Updated</strong> · 2026-08-10 (skeptic fixes)</div>
-      <div><strong>Status</strong> · Living brief + CPU opt log</div>
+      <div><strong>Updated</strong> · 2026-08-10 · pre-compaction</div>
+      <div><strong>HEAD</strong> · 32ee4cd (ahead origin by 8)</div>
+      <div><strong>Status</strong> · Living brief · cycles 1–3 + skeptic fixes</div>
     </div>
   </div>
   <div class="accent-bar"></div>
@@ -1006,18 +1007,82 @@ nproc; free -h; nvidia-smi || true</code></pre>
 
 <!-- 15 CPU OPTIMIZATION LOG -->
 <section id="cpu-log">
-  <h2>15 · CPU optimization log (living)</h2>
+  <h2>15 · CPU optimization log (living · pre-compaction)</h2>
   <p class="lede">
-    Fieldlab is the gate for pure-CPU correctness. Each cycle keeps numerical identity
-    (unit-level vs independent references) and extends the in-repo pytest surface.
-    Full MEA multi-GB e2e remains a non-goal on this host.
+    Fieldlab is the gate for pure-CPU correctness. Cycles keep numerical identity
+    (unit-level vs independent references) and extend the in-repo pytest surface.
+    Full MEA multi-GB e2e remains a non-goal on this host. This section is the
+    handoff snapshot for agents after context compaction — read it first.
   </p>
 
   <div class="callout ok">
-    <div class="tag">Fast suite gate (latest)</div>
-    <code>pytest tests/ -q -m "not slow" -k "not wpca_wtemp"</code>
-    → <strong>53 passed, 2 deselected</strong> (slow full pipeline + wpca/SIGILL host limit).
+    <div class="tag">Snapshot · 2026-08-10</div>
+    Branch <code>mea-optimizations</code> · HEAD <code>32ee4cd</code> ·
+    <strong>local ahead of origin by 8</strong> · working tree clean after report commit ·
+    not pushed unless user asks.
   </div>
+
+  <div class="callout ok">
+    <div class="tag">Fast suite gate (latest verified)</div>
+    <code>pytest tests/ -q -m "not slow" -k "not wpca_wtemp"</code>
+    → <strong>53 passed, 2 deselected</strong> · pure units
+    <strong>30 passed</strong> · skeptic-fix extract/labels tests
+    <strong>5 passed ×2</strong>.
+  </div>
+
+  <h3>Commit map (this goal stack, newest first)</h3>
+  <table>
+    <thead>
+      <tr><th>SHA</th><th>Summary</th><th>Axis</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="mono">32ee4cd</td>
+        <td>Clip buffer grow-on-overflow + partial-fill; <code>labels_in</code> negative isin parity</td>
+        <td>bug / memory / accuracy</td>
+      </tr>
+      <tr>
+        <td class="mono">1ccd815</td>
+        <td>Dense <code>labels_in</code> for swarm split hot paths</td>
+        <td>speed</td>
+      </tr>
+      <tr>
+        <td class="mono">ca34d89</td>
+        <td>Living CPU log in this HTML brief (§15)</td>
+        <td>docs</td>
+      </tr>
+      <tr>
+        <td class="mono">b5c526a</td>
+        <td>Clip capacity, swarm ACG no-copy, <code>new_clusters</code> remap, whitening nearest</td>
+        <td>memory / speed</td>
+      </tr>
+      <tr>
+        <td class="mono">c206905</td>
+        <td>Initial MEA fieldlab engineering brief (HTML)</td>
+        <td>docs</td>
+      </tr>
+      <tr>
+        <td class="mono">67d7869</td>
+        <td><code>remove_duplicates</code> dense last-time table (numba)</td>
+        <td>speed</td>
+      </tr>
+      <tr>
+        <td class="mono">d2c6caf</td>
+        <td><code>CCG.refract</code> group-by + <code>assume_sorted</code></td>
+        <td>speed</td>
+      </tr>
+      <tr>
+        <td class="mono">7382c58</td>
+        <td>Scaled spike buffers; cheaper nearest-chan distances</td>
+        <td>memory / speed</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="mono" style="font-size:0.8rem;color:var(--muted)">
+    Earlier on branch (pre-cycle): <code>3ea6903</code> torch.compile template_match ·
+    <code>beaaeb8</code> tail micro-opts · <code>bf789fc</code> bit-exact times ·
+    <code>142786e</code> pin 4.1.2 MEA behavior.
+  </p>
 
   <h3>Cycle 1 — spike buffers, CCG, duplicates</h3>
   <table>
@@ -1103,10 +1168,16 @@ nproc; free -h; nvidia-smi || true</code></pre>
 
 get_clip_buffer_capacity(n_batches, nskip=25) =
     n_used = max(1, ceil(n_batches / nskip))
-    min(5e5, max(1e4, n_used * 5e3))</code></pre>
+    min(5e5, max(1e4, n_used * 5e3))
+
+# extract_wPCA_wTEMP (after skeptic fix):
+#   start at get_clip_buffer_capacity(...)
+#   grow: double until need met or CLIP_BUFFER_HARD_CAP (500_000)
+#   at hard cap: partial-fill remaining room, then stop
+#   if zero clips after all batches: RuntimeError (never silent SVD fail)</code></pre>
   <p>
-    Short fieldlab fixtures therefore allocate ~10k–20k clips instead of a fixed
-    500k×nt float32 slab (~122&nbsp;MiB at nt=61).
+    Short fieldlab fixtures therefore allocate ~10k–20k clips initially instead of a fixed
+    500k×nt float32 slab (~122&nbsp;MiB at nt=61), but still absorb a dense first batch.
   </p>
 
   <h3>Cycle 3 — dense label membership</h3>
@@ -1128,20 +1199,22 @@ get_clip_buffer_capacity(n_batches, nskip=25) =
     <code>np.isin</code> ≈1.5&nbsp;ms per call on fieldlab.
   </p>
 
-  <h3>Skeptic fixes (post cycle 3)</h3>
+  <h3>Skeptic fixes (required; shipped in 32ee4cd)</h3>
   <table>
     <thead>
-      <tr><th>Issue</th><th>Fix</th><th>Lock-in test</th></tr>
+      <tr><th>Issue</th><th>Severity</th><th>Fix</th><th>Lock-in test</th></tr>
     </thead>
     <tbody>
       <tr>
-        <td>Clip capacity shrink could leave 0 clips if first batch &gt; capacity</td>
+        <td>Clip capacity shrink hard-broke when first batch peaks &gt; capacity → empty clips → TruncatedSVD crash</td>
+        <td>high</td>
         <td>Grow-on-overflow up to <code>CLIP_BUFFER_HARD_CAP</code>; partial-fill at cap; explicit empty error</td>
-        <td><code>test_extract_wpca_grows_when_first_batch_exceeds_capacity</code>, <code>test_extract_wpca_partial_fills_at_hard_cap</code></td>
+        <td><code>test_extract_wpca_grows_when_first_batch_exceeds_capacity</code>, <code>test_extract_wpca_partial_fills_at_hard_cap</code> (drive shipped <code>extract_wPCA_wTEMP</code>)</td>
       </tr>
       <tr>
-        <td><code>labels_in</code> dropped negative ids vs <code>np.isin</code></td>
-        <td>Dense table over closed <code>[min,max]</code> range (incl. negatives); sparse fallback to isin</td>
+        <td><code>labels_in</code> dropped negative ids vs <code>np.isin</code> (e.g. <code>[-1,0,1]</code> / <code>[-1,1]</code>)</td>
+        <td>high</td>
+        <td>Dense table over closed <code>[min,max]</code> (incl. negatives); sparse huge ranges fall back to isin</td>
         <td><code>test_labels_in_handles_negative_ids_like_isin</code></td>
       </tr>
     </tbody>
@@ -1168,12 +1241,29 @@ get_clip_buffer_capacity(n_batches, nskip=25) =
         <td>200k spikes · 200 labels · pair merges</td>
         <td>~9&nbsp;ms/call (cycle 2)</td>
       </tr>
+      <tr>
+        <td><code>labels_in</code> vs <code>np.isin</code></td>
+        <td>200k labels · 80 members</td>
+        <td>~1.0 vs ~1.5&nbsp;ms/call (cycle 3)</td>
+      </tr>
     </tbody>
   </table>
 
-  <h3>Commands agents should re-run</h3>
-  <pre><code>conda activate kilosort
+  <h3>Test surface (in-repo)</h3>
+  <ul>
+    <li><code>tests/test_ccg.py</code> — refract / ACG / assume_sorted</li>
+    <li><code>tests/test_spikedetect.py</code> — spike + clip capacity; nearest_chans; extract grow/partial-fill</li>
+    <li><code>tests/test_postprocessing.py</code> — remove_duplicates identity</li>
+    <li><code>tests/test_swarmsplitter.py</code> — labels_in, new_clusters, check_CCG (new file)</li>
+    <li><code>tests/test_preprocessing.py</code> — whitening_local vs per-channel argsort</li>
+  </ul>
+
+  <h3>Commands agents should re-run after compact</h3>
+  <pre><code>source ~/miniconda3/etc/profile.d/conda.sh   # or conda info --base
+conda activate kilosort
 cd /home/kais/Documents/Development/data/Kilosort-1
+git status -sb    # expect mea-optimizations, clean or report-only delta
+python -c "import kilosort; print(kilosort.__file__)"
 
 # Pure CPU units (no wpca SIGILL path)
 pytest tests/test_ccg.py tests/test_spikedetect.py tests/test_postprocessing.py \
@@ -1189,6 +1279,24 @@ pytest tests/ -q -m "not slow" -k "not wpca_wtemp"</code></pre>
     with modern torch kernels. Deselect on fieldlab; do not treat as an app logic failure
     without a newer CPU or CPU-build torch.
   </div>
+
+  <h3>Post-compaction playbook (next agent)</h3>
+  <ol>
+    <li>Open this file (§15) + <code>git log --oneline -12</code> before inventing new work.</li>
+    <li>Keep production lab params: Th 8/6, max_peels 100, dmin=pitch; do not rewrite goldens under <code>data/sorted/</code>.</li>
+    <li>Prefer pure NumPy/numba/CPU torch paths with identity tests that call shipped functions.</li>
+    <li>Update this §15 whenever a cycle or skeptic fix lands; commit docs with the code.</li>
+    <li>Do not push unless the user explicitly asks.</li>
+    <li>Non-goals still hold: full multi-GB MEA e2e on fieldlab, GPU-only as primary deliverable.</li>
+  </ol>
+
+  <h3>Plausible next CPU wins (not started)</h3>
+  <ul>
+    <li><code>merging_function</code>: reduce repeated <code>clu2==kk</code> full-vector masks; optional per-cluster time index.</li>
+    <li><code>make_pc_features</code>: avoid double <code>np.unique</code> scans over all spikes per cluster.</li>
+    <li>Swarmsplitter <code>split</code> already uses <code>labels_in</code>; further tree prune cost is secondary.</li>
+    <li>Short MEA fixture (1–5 batches) for optional smoke — only if disk/time allow; not a gate.</li>
+  </ul>
 </section>
 
 <section>
@@ -1197,11 +1305,12 @@ pytest tests/ -q -m "not slow" -k "not wpca_wtemp"</code></pre>
     Living agent-facing engineering brief from a live host survey plus CPU optimization cycles.
     Paths are absolute for this machine. If the workspace moves, re-verify roots in §05.
     Do not treat verbal parameter memory as source of truth over logs and
-    <code>run_kilosort4.py</code>. Update §15 whenever a CPU cycle lands.
+    <code>run_kilosort4.py</code>. <strong>Update §15 before every context compaction</strong>
+    and whenever a CPU cycle or skeptic fix lands.
   </p>
   <p class="mono" style="font-size:0.8rem;color:var(--muted)">
     File: docs/MEA_FIELD_TEST_CONTEXT.html · Branch: mea-optimizations · Host: fieldlab ·
-    Cycles: 1 · 2 · 3 (labels_in)
+    HEAD: 32ee4cd · ahead origin 8 · Cycles 1–3 + skeptic · pre-compaction snapshot 2026-08-10
   </p>
 </section>
 
