@@ -1,0 +1,1015 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>MEA · Kilosort Field Context &amp; Test Spec</title>
+<meta name="description" content="Engineering context document for agents building CPU/GPU test environments and optimizing Kilosort for Litke MEA data." />
+<style>
+  :root {
+    --bg: #f4f4f0;
+    --paper: #ffffff;
+    --ink: #0a0a0a;
+    --muted: #5a5a5a;
+    --line: #0a0a0a;
+    --accent: #c41e3a;
+    --soft: #e8e8e2;
+    --code-bg: #f0f0ea;
+    --ok: #1a5c3a;
+    --warn: #8a5a00;
+    --bad: #8b1a1a;
+    --max: 52rem;
+    --gutter: 1.25rem;
+  }
+
+  * { box-sizing: border-box; }
+  html { font-size: 16px; scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Helvetica Neue", Helvetica, Arial, sans-serif;
+    font-weight: 400;
+    line-height: 1.55;
+    letter-spacing: 0.01em;
+  }
+
+  /* Swiss top bar */
+  .mast {
+    border-bottom: 3px solid var(--ink);
+    background: var(--paper);
+  }
+  .mast-inner {
+    max-width: calc(var(--max) + 12rem);
+    margin: 0 auto;
+    padding: 1.75rem var(--gutter) 1.5rem;
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 1rem;
+    align-items: end;
+  }
+  .mast h1 {
+    margin: 0;
+    font-size: clamp(1.5rem, 3.5vw, 2.15rem);
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    line-height: 1.1;
+    text-transform: uppercase;
+  }
+  .mast .meta {
+    text-align: right;
+    font-size: 0.75rem;
+    line-height: 1.4;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .mast .meta strong { color: var(--ink); font-weight: 600; }
+  .accent-bar {
+    height: 6px;
+    background: var(--accent);
+  }
+
+  .layout {
+    max-width: calc(var(--max) + 12rem);
+    margin: 0 auto;
+    padding: 0 var(--gutter) 4rem;
+    display: grid;
+    grid-template-columns: 14rem 1fr;
+    gap: 2.5rem;
+  }
+  @media (max-width: 900px) {
+    .layout { grid-template-columns: 1fr; }
+    nav.toc { position: static !important; }
+  }
+
+  nav.toc {
+    position: sticky;
+    top: 1rem;
+    align-self: start;
+    padding-top: 2rem;
+    font-size: 0.78rem;
+    line-height: 1.35;
+  }
+  nav.toc .label {
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 0.65rem;
+    margin-bottom: 0.75rem;
+    color: var(--muted);
+  }
+  nav.toc ol {
+    margin: 0;
+    padding: 0 0 0 1.1rem;
+    color: var(--ink);
+  }
+  nav.toc a {
+    color: var(--ink);
+    text-decoration: none;
+    border-bottom: 1px solid transparent;
+  }
+  nav.toc a:hover { border-bottom-color: var(--accent); color: var(--accent); }
+  nav.toc li { margin: 0.35rem 0; }
+
+  main { padding-top: 2rem; min-width: 0; }
+
+  section {
+    background: var(--paper);
+    border: 1px solid var(--ink);
+    margin-bottom: 1.25rem;
+    padding: 1.5rem 1.5rem 1.75rem;
+  }
+  section > h2 {
+    margin: 0 0 1rem;
+    padding-bottom: 0.6rem;
+    border-bottom: 2px solid var(--ink);
+    font-size: 0.95rem;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+  h3 {
+    margin: 1.4rem 0 0.5rem;
+    font-size: 0.85rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    color: var(--ink);
+  }
+  h3:first-of-type { margin-top: 0.5rem; }
+  p { margin: 0.55rem 0; max-width: 42rem; }
+  ul, ol { margin: 0.4rem 0 0.6rem; padding-left: 1.25rem; max-width: 44rem; }
+  li { margin: 0.25rem 0; }
+  strong { font-weight: 600; }
+  em { font-style: italic; }
+
+  .lede {
+    font-size: 1.05rem;
+    line-height: 1.5;
+    max-width: 40rem;
+    border-left: 4px solid var(--accent);
+    padding-left: 1rem;
+    margin: 0.5rem 0 1rem;
+  }
+
+  .callout {
+    border: 1px solid var(--ink);
+    background: var(--soft);
+    padding: 0.85rem 1rem;
+    margin: 1rem 0;
+    font-size: 0.9rem;
+  }
+  .callout.warn { border-left: 4px solid var(--warn); }
+  .callout.bad { border-left: 4px solid var(--bad); }
+  .callout.ok { border-left: 4px solid var(--ok); }
+  .callout .tag {
+    display: inline-block;
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    margin-bottom: 0.25rem;
+  }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+    margin: 0.75rem 0 1rem;
+    font-variant-numeric: tabular-nums;
+  }
+  th, td {
+    border: 1px solid var(--ink);
+    padding: 0.45rem 0.6rem;
+    text-align: left;
+    vertical-align: top;
+  }
+  th {
+    background: var(--ink);
+    color: var(--paper);
+    font-weight: 600;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    font-size: 0.72rem;
+  }
+  tr:nth-child(even) td { background: #fafaf6; }
+  code, .path {
+    font-family: "SF Mono", "Menlo", "Consolas", "Liberation Mono", monospace;
+    font-size: 0.84em;
+    background: var(--code-bg);
+    padding: 0.08em 0.28em;
+    border: 1px solid #d8d8d0;
+  }
+  pre {
+    background: var(--ink);
+    color: #f0f0ea;
+    padding: 1rem 1.1rem;
+    overflow-x: auto;
+    font-family: "SF Mono", "Menlo", "Consolas", "Liberation Mono", monospace;
+    font-size: 0.75rem;
+    line-height: 1.45;
+    margin: 0.75rem 0;
+  }
+  pre code { background: none; border: none; color: inherit; padding: 0; font-size: inherit; }
+
+  .grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 0.75rem;
+  }
+  @media (max-width: 640px) { .grid-2 { grid-template-columns: 1fr; } }
+
+  .stat {
+    border: 1px solid var(--ink);
+    padding: 0.75rem 0.9rem;
+  }
+  .stat .k {
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    font-weight: 700;
+  }
+  .stat .v {
+    font-size: 1.15rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    margin-top: 0.15rem;
+  }
+  .stat .s { font-size: 0.78rem; color: var(--muted); margin-top: 0.2rem; }
+
+  .flow {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+    align-items: center;
+    margin: 0.75rem 0 1rem;
+    font-size: 0.8rem;
+  }
+  .flow .step {
+    border: 1px solid var(--ink);
+    padding: 0.4rem 0.55rem;
+    background: var(--paper);
+    font-weight: 600;
+  }
+  .flow .arrow { color: var(--accent); font-weight: 700; }
+
+  footer {
+    max-width: calc(var(--max) + 12rem);
+    margin: 0 auto;
+    padding: 1rem var(--gutter) 3rem;
+    font-size: 0.72rem;
+    color: var(--muted);
+    border-top: 1px solid #ccc;
+  }
+  .mono { font-variant-numeric: tabular-nums; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header class="mast">
+  <div class="mast-inner">
+    <div>
+      <h1>MEA Field Context<br />&amp; Test Environment Spec</h1>
+    </div>
+    <div class="meta">
+      <div><strong>Document type</strong> · Agent engineering brief</div>
+      <div><strong>Host</strong> · fieldlab (CPU-only)</div>
+      <div><strong>Branch</strong> · mea-optimizations</div>
+      <div><strong>Fork</strong> · kaissaradi/Kilosort-1</div>
+      <div><strong>Survey date</strong> · 2026-08-10</div>
+      <div><strong>Status</strong> · Context freeze (no code changes)</div>
+    </div>
+  </div>
+  <div class="accent-bar"></div>
+</header>
+
+<div class="layout">
+<nav class="toc" aria-label="Contents">
+  <div class="label">Contents</div>
+  <ol>
+    <li><a href="#purpose">Purpose</a></li>
+    <li><a href="#constraints">Machine constraints</a></li>
+    <li><a href="#repos">Repos &amp; branches</a></li>
+    <li><a href="#pipeline">Data pipeline</a></li>
+    <li><a href="#paths">Filesystem map</a></li>
+    <li><a href="#params">Sorting parameters</a></li>
+    <li><a href="#probes">Probes &amp; spacing</a></li>
+    <li><a href="#native-tests">Native KS tests</a></li>
+    <li><a href="#mea-opts">MEA optimization work</a></li>
+    <li><a href="#test-strategy">Test strategy</a></li>
+    <li><a href="#colab">Colab / remote GPU</a></li>
+    <li><a href="#gaps">Open gaps</a></li>
+    <li><a href="#agent">Agent playbook</a></li>
+    <li><a href="#glossary">Glossary</a></li>
+  </ol>
+</nav>
+
+<main>
+
+<!-- 1 PURPOSE -->
+<section id="purpose">
+  <h2>01 · Purpose</h2>
+  <p class="lede">
+    This document is a self-contained engineering brief for any human or agent that must
+    build a local testing environment and improve Kilosort for <strong>Litke multi-electrode
+    array (MEA)</strong> recordings. It encodes machine limits, data layout, conversion
+    semantics, production parameters, native upstream tests, and recommended work tracks
+    for <strong>accuracy</strong>, <strong>speed</strong>, and <strong>memory</strong>.
+  </p>
+  <p>
+    Primary product under development: the fork branch <code>mea-optimizations</code> of
+    Kilosort (Python / PyTorch), used by the Manookin lab MEA pipeline
+    (<code>MEA-fieldlab</code>). Production sorts historically run on a GPU workstation;
+    this host (<code>fieldlab</code>) is for development, micro-benchmarks, and CPU regression—
+    not full-length chunk sorts.
+  </p>
+  <div class="callout ok">
+    <div class="tag">Design intent for agents</div>
+    Prefer small, reproducible fixtures; preserve bit-exactness where the branch claims it;
+    never assume Neuropixels defaults for Litke data; never assume a CUDA device is present
+    on fieldlab.
+  </div>
+</section>
+
+<!-- 2 CONSTRAINTS -->
+<section id="constraints">
+  <h2>02 · Machine constraints (fieldlab)</h2>
+  <p>
+    All claims below were verified with shell probes on host <code>fieldlab</code>
+    (2026-08-10). Treat this machine as <strong>CPU-only and power-limited</strong>.
+  </p>
+  <div class="grid-2">
+    <div class="stat">
+      <div class="k">CPU</div>
+      <div class="v">i5-3570K · 4c / 4t</div>
+      <div class="s">3.40 GHz · no hyperthreading</div>
+    </div>
+    <div class="stat">
+      <div class="k">Memory</div>
+      <div class="v">15 GiB total</div>
+      <div class="s">~12 GiB available at survey</div>
+    </div>
+    <div class="stat">
+      <div class="k">GPU</div>
+      <div class="v">None usable</div>
+      <div class="s">nvidia-smi fails · no /dev/nvidia*</div>
+    </div>
+    <div class="stat">
+      <div class="k">Disk (data)</div>
+      <div class="v">~806 G used</div>
+      <div class="s">~197 G free on / · 83% full</div>
+    </div>
+  </div>
+  <table>
+    <thead>
+      <tr><th>Check</th><th>Result</th><th>Implication</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>CUDA in conda <code>kilosort</code></td>
+        <td><code>torch 2.8.0+cu128</code>, <code>cuda.is_available() == False</code></td>
+        <td>CPU torch only; cu* wheel is irrelevant without driver</td>
+      </tr>
+      <tr>
+        <td>Kilosort import</td>
+        <td><code>4.1.6.dev1+…</code> (editable / prior install)</td>
+        <td>Confirm install points at <code>mea-optimizations</code> before timing work</td>
+      </tr>
+      <tr>
+        <td>Full MEA sort history</td>
+        <td>Log shows RTX 4000 Ada 19.54 GB on another host path</td>
+        <td>Golden full runs live on GPU lab machines, not fieldlab</td>
+      </tr>
+    </tbody>
+  </table>
+  <div class="callout bad">
+    <div class="tag">Hard limit</div>
+    Do not plan end-to-end sorts of multi-hour Litke chunks on this host. Target micro-kernels,
+    short time windows (seconds to ~60 s), and upstream unit tests. Overnight CPU smokes are
+    possible only for tiny fixtures.
+  </div>
+</section>
+
+<!-- 3 REPOS -->
+<section id="repos">
+  <h2>03 · Repositories &amp; branches</h2>
+  <table>
+    <thead>
+      <tr><th>Role</th><th>Path / remote</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Kilosort fork (workspace)</td>
+        <td><code>/home/kais/Documents/Development/data/Kilosort-1</code></td>
+        <td>Branch <code>mea-optimizations</code> @ <code>3ea6903</code>, tracks <code>origin/mea-optimizations</code></td>
+      </tr>
+      <tr>
+        <td>Remote</td>
+        <td><code>https://github.com/kaissaradi/Kilosort-1.git</code></td>
+        <td>User fork; not necessarily synced to MouseLand main</td>
+      </tr>
+      <tr>
+        <td>Lab pipeline</td>
+        <td><code>/home/kais/Documents/Development/MEA-fieldlab</code></td>
+        <td>Convert, pipeline, <code>run_kilosort4.py</code>, probes</td>
+      </tr>
+      <tr>
+        <td>Data root</td>
+        <td><code>/home/kais/Documents/Development/data</code></td>
+        <td><code>raw/</code>, <code>sorted/</code>, <code>h5/</code>, this fork</td>
+      </tr>
+    </tbody>
+  </table>
+  <h3>mea-optimizations recent commits (newest first)</h3>
+  <table>
+    <thead>
+      <tr><th>SHA</th><th>Summary</th><th>Accuracy claim</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="mono">3ea6903</td>
+        <td>spikedetect: <code>torch.compile</code> template_match loop body (~1.20×)</td>
+        <td>Bit-exact claimed</td>
+      </tr>
+      <tr>
+        <td class="mono">beaaeb8</td>
+        <td>spikedetect: exact tail micro-opts in template_match</td>
+        <td>Exactness-focused</td>
+      </tr>
+      <tr>
+        <td class="mono">bf789fc</td>
+        <td>Bit-exact spike times in single-transfer path; deterministic wTEMP</td>
+        <td>Bit-exact spike times</td>
+      </tr>
+      <tr>
+        <td class="mono">142786e</td>
+        <td>Pin validated 4.1.2 behavior for MEA pipeline</td>
+        <td>Behavioral pin</td>
+      </tr>
+      <tr>
+        <td class="mono">52da0c6</td>
+        <td>io: prefetch batch reads on worker thread; single host transfer per batch</td>
+        <td>I/O / transfer</td>
+      </tr>
+      <tr>
+        <td class="mono">e416927</td>
+        <td>clustering_qr: GPU kNN in neigh_mat; scatter early-exit cluster loop</td>
+        <td>GPU-oriented clustering</td>
+      </tr>
+      <tr>
+        <td class="mono">fd93a73</td>
+        <td>template_matching: fold nm scaling, fuse peel reduction, single host transfer in extract</td>
+        <td>Matching / peel</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    Theme: reduce host↔device transfers, tighten hot loops, optionally compile, keep
+    numerical identity where asserted. Several optimizations assume GPU; on fieldlab they
+    must either fall back cleanly to CPU or be gated.
+  </p>
+</section>
+
+<!-- 4 PIPELINE -->
+<section id="pipeline">
+  <h2>04 · Data pipeline (Litke → Kilosort)</h2>
+  <p>
+    Litke raw data is <strong>not</strong> Neuropixels AP binary. It arrives as large
+    (~1.8&nbsp;GB) per-file Litke bins that must be joined, channel-selected, transposed,
+    and written as int16 time-major binaries that Kilosort understands.
+  </p>
+
+  <div class="flow">
+    <span class="step">Raw Litke bins</span>
+    <span class="arrow">→</span>
+    <span class="step">prepare_data.sh</span>
+    <span class="arrow">→</span>
+    <span class="step">convert_join… -b</span>
+    <span class="arrow">→</span>
+    <span class="step">chunkN.bin</span>
+    <span class="arrow">→</span>
+    <span class="step">run_kilosort4.py</span>
+    <span class="arrow">→</span>
+    <span class="step">sorted/…/kilosort4/</span>
+  </div>
+
+  <h3>Orchestration</h3>
+  <ul>
+    <li><code>MEA-fieldlab/src/utilities/pipeline.sh</code> — full experiment/chunk orchestration (spacing, CAR, sort, process spikes, dedup).</li>
+    <li><code>prepare_data.sh</code> — builds file list, calls converter with <code>-b</code>.</li>
+    <li><code>convert_join_litke_datasets_for_yass.py</code> — actual binary rewrite (also used historically for YASS).</li>
+    <li><code>run_kilosort4.py</code> — builds settings + probe, calls <code>kilosort.run_kilosort</code>.</li>
+    <li>Alternate converters: <code>convert_litke_to_yass.py</code>, <code>litke_to_binary.sh</code>.</li>
+  </ul>
+
+  <h3>Conversion semantics (critical for fixtures)</h3>
+  <p>
+    In <code>convert_join_litke_datasets_for_yass.py</code>, the reader uses
+    <code>bin2py.PyBinFileReader(..., is_row_major=True)</code>. Samples on connected
+    channels are written as:
+  </p>
+  <pre><code>samples_to_write = np.ascontiguousarray(
+    samples_connected_channels.T.astype(np.int16)
+)
+samples_to_write.tofile(yass_binfile_output)</code></pre>
+  <p>
+    Interpretation for agents: <strong>transpose then flatten to little-endian int16</strong>,
+    yielding a Kilosort-style <code>(ntime, nchan)</code> memory order in the file.
+    Do not invent a new layout for tests; reuse this converter or match it exactly.
+  </p>
+
+  <h3>pipeline.sh → kilosort invocation</h3>
+  <pre><code># When ALG is 4 (conceptual excerpt):
+python run_kilosort4.py ${EXP} ${CHUNK} -e ${ARRAY_SPACING} [-c for CAR]</code></pre>
+  <p>
+    Binary expected at <code>${TMP_PATH}${CHUNK}.bin</code> (under sorted experiment folder).
+    On fieldlab, for <code>20251204A</code>, the large intermediate <code>chunk1.bin</code>
+    was <strong>not</strong> present at survey—only kilosort result directories and raw Litke bins.
+  </p>
+</section>
+
+<!-- 5 PATHS -->
+<section id="paths">
+  <h2>05 · Filesystem map</h2>
+
+  <h3>Data root</h3>
+  <table>
+    <thead>
+      <tr><th>Path</th><th>Size (approx)</th><th>Contents</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>…/data/raw/</code></td>
+        <td>484 G</td>
+        <td>Litke raw trees: <code>&lt;EXP&gt;/dataXXX/*.bin</code> (~1.8 G each)</td>
+      </tr>
+      <tr>
+        <td><code>…/data/sorted/</code></td>
+        <td>316 G</td>
+        <td>Per-experiment chunks, KS outputs, post-process artifacts</td>
+      </tr>
+      <tr>
+        <td><code>…/data/h5/</code></td>
+        <td>7.1 G</td>
+        <td>HDF5 companions / other formats</td>
+      </tr>
+      <tr>
+        <td><code>…/data/Kilosort-1/</code></td>
+        <td>16 M (code)</td>
+        <td>This fork workspace</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Canonical example: 20251204A</h3>
+  <table>
+    <thead>
+      <tr><th>Kind</th><th>Path</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Raw</td>
+        <td><code>/home/kais/Documents/Development/data/raw/20251204A/{data000…data003}/</code> (~190 G)</td>
+      </tr>
+      <tr>
+        <td>Raw file example</td>
+        <td><code>…/data000/data000000.bin</code> (~1.8 G), last file often shorter (~789 M)</td>
+      </tr>
+      <tr>
+        <td>KS results</td>
+        <td><code>…/sorted/20251204A/chunk1/kilosort4/</code></td>
+      </tr>
+      <tr>
+        <td>Useful result files</td>
+        <td>
+          <code>spike_times.npy</code>, <code>spike_clusters.npy</code>,
+          <code>templates.npy</code>, <code>channel_positions.npy</code>,
+          <code>channel_map.npy</code>, <code>ops.npy</code>, <code>params.py</code>,
+          <code>kilosort4.log</code>, <code>whitening_mat*.npy</code>
+        </td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    <code>params.py</code> for that run: <code>n_channels_dat = 519</code>,
+    <code>sample_rate = 20000</code>, <code>dtype = int16</code>, <code>hp_filtered = False</code>.
+  </p>
+
+  <h3>Pipeline &amp; probe assets</h3>
+  <table>
+    <thead>
+      <tr><th>Asset</th><th>Path</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>run_kilosort4</td>
+        <td><code>…/MEA-fieldlab/src/utilities/run_kilosort4.py</code></td>
+      </tr>
+      <tr>
+        <td>pipeline</td>
+        <td><code>…/MEA-fieldlab/src/utilities/pipeline.sh</code></td>
+      </tr>
+      <tr>
+        <td>prepare / convert</td>
+        <td><code>prepare_data.sh</code>, <code>convert_join_litke_datasets_for_yass.py</code></td>
+      </tr>
+      <tr>
+        <td>Probe maps</td>
+        <td><code>…/MEA-fieldlab/src/pipeline_utilities/kilosort/*.mat</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Probe files present</h3>
+  <ul>
+    <li><code>LITKE_519_ARRAY_30UM.mat</code> — 30 µm, 519-channel class</li>
+    <li><code>LITKE_512_ARRAY.mat</code> — default 60 µm path in runner</li>
+    <li><code>LITKE_519_ARRAY_120UM.mat</code> (+ variants)</li>
+    <li><code>MCS_60_ARRAY_200UM.mat</code></li>
+    <li>Geometry helpers: <code>512Coords.mat</code>, <code>512coords.txt</code>, <code>chanMap512_jacked.mat</code>, <code>ksSettings.mat</code></li>
+  </ul>
+</section>
+
+<!-- 6 PARAMS -->
+<section id="params">
+  <h2>06 · Sorting parameters (production truth)</h2>
+  <p>
+    Prefer the production log over verbal memory. The following were read from
+    <code>sorted/20251204A/chunk1/kilosort4/kilosort4.log</code> (Kilosort 4.0.32 on GPU host).
+  </p>
+
+  <table>
+    <thead>
+      <tr><th>Parameter</th><th>Production value</th><th>Code default in run_kilosort4.py</th></tr>
+    </thead>
+    <tbody>
+      <tr><td><code>n_chan_bin</code> / Nchan</td><td>519</td><td>from pitch branch (512 / 519 / 60)</td></tr>
+      <tr><td><code>fs</code></td><td>20000</td><td>20000</td></tr>
+      <tr><td><code>batch_size</code></td><td>60000 (~3.0 s)</td><td>60000</td></tr>
+      <tr><td><code>Th_universal</code></td><td><strong>8</strong></td><td>8</td></tr>
+      <tr><td><code>Th_learned</code></td><td><strong>6</strong></td><td>6</td></tr>
+      <tr><td><code>Th_single_ch</code></td><td>3.0</td><td>3.0 (comment: upstream default often 6)</td></tr>
+      <tr><td><code>max_peels</code></td><td><strong>100</strong></td><td>100 (CLI <code>-p</code>)</td></tr>
+      <tr><td><code>dmin</code> / <code>dminx</code></td><td><strong>30</strong></td><td>from <code>--electrode_pitch</code></td></tr>
+      <tr><td><code>nblocks</code></td><td>0 (no drift correction)</td><td>0 unless drift flag</td></tr>
+      <tr><td><code>nearest_chans</code></td><td>19</td><td>19 (second ring on hex-ish array)</td></tr>
+      <tr><td><code>whitening_range</code></td><td>37</td><td>37</td></tr>
+      <tr><td><code>min_template_size</code></td><td>10</td><td>10</td></tr>
+      <tr><td><code>n_templates</code> / <code>n_pcs</code></td><td>6 / 6</td><td>6 / 6</td></tr>
+      <tr><td><code>do_CAR</code></td><td>False</td><td>opt-in <code>-c</code></td></tr>
+      <tr><td><code>invert_sign</code></td><td>True</td><td>set in runner call path</td></tr>
+      <tr><td>N batches (this chunk)</td><td>298</td><td>—</td></tr>
+    </tbody>
+  </table>
+
+  <div class="callout warn">
+    <div class="tag">Memory vs code</div>
+    Operators recalled “max_peels ≈ 50” and “thresholds ≈ 9”. The checked code defaults and
+    the 20251204A log show <strong>max_peels=100</strong>, <strong>Th_universal=8</strong>,
+    <strong>Th_learned=6</strong>. Treat other experiments as unknown until their logs/ops are
+    opened. CLI: <code>-p/--max_peels</code>, thresholds currently fixed in <code>get_settings</code>
+    unless the runner is extended.
+  </div>
+
+  <h3>Pitch → probe selection (run_kilosort4.py)</h3>
+  <pre><code>if electrode_pitch == 30:
+    probe_name = 'LITKE_519_ARRAY_30UM'   # 519 channels
+elif electrode_pitch == 60:
+    probe_name = 'LITKE_512_ARRAY'        # typical 60 µm path
+# also: 120 → LITKE_519_ARRAY_120UM; MCS 60-channel path exists</code></pre>
+  <p>
+    <code>dmin</code> and <code>dminx</code> are set equal to electrode pitch. That is the
+    “template spacing” control for this lab, not a separate KS flag named
+    <code>template_spacing</code>.
+  </p>
+
+  <h3>Binary size planning (519 ch, int16, 20 kHz)</h3>
+  <table>
+    <thead>
+      <tr><th>Duration</th><th>Samples</th><th>Size</th><th>Batches @ 60k</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>1 batch</td><td>60 000</td><td>≈ 62.3 MB</td><td>1</td></tr>
+      <tr><td>10 s</td><td>200 000</td><td>≈ 207.6 MB</td><td>~3.3</td></tr>
+      <tr><td>60 s</td><td>1 200 000</td><td>≈ 1.25 GB</td><td>20</td></tr>
+      <tr><td>Full chunk (298 batches example)</td><td>~17.9 M</td><td>tens of GB order</td><td>298</td></tr>
+    </tbody>
+  </table>
+  <p>
+    Formula: <code>bytes = n_samples × n_channels × 2</code> with
+    <code>n_samples = fs × seconds</code>.
+  </p>
+</section>
+
+<!-- 7 PROBES -->
+<section id="probes">
+  <h2>07 · Probes, spacing, geometry</h2>
+  <ul>
+    <li><strong>20251204A</strong> is <strong>30 µm</strong> spacing (log: <code>dmin/dminx = 30</code>, 519 channels, 30UM probe). Confirm with ops/log for any other experiment before assuming 60.</li>
+    <li>Operator belief: remaining common datasets use <strong>60 µm</strong> unless otherwise labeled. Validate per run via <code>ops.npy</code> or log.</li>
+    <li>Channel positions for completed sorts are available as <code>channel_positions.npy</code> and <code>channel_map.npy</code> in each kilosort4 folder—prefer these for post-hoc geometry over re-deriving from mats when comparing results.</li>
+    <li>Hex-like dense arrays: <code>nearest_chans=19</code> corresponds to two rings of neighbors in lab comments.</li>
+  </ul>
+  <div class="callout">
+    <div class="tag">Accuracy note</div>
+    Wrong pitch or probe mat silently degrades clustering (template spacing, whitening
+    neighborhoods, center placement). Any MEA fixture must ship with the matching
+    <code>.mat</code> and the same <code>dmin</code>/<code>n_chan_bin</code>.
+  </div>
+</section>
+
+<!-- 8 NATIVE TESTS -->
+<section id="native-tests">
+  <h2>08 · Native Kilosort test pipeline</h2>
+  <p>
+    Upstream tests live in the fork under <code>tests/</code>. They use a <strong>Neuropixels</strong>
+    mini binary—not Litke. They remain the first gate for fork regressions on CPU.
+  </p>
+  <table>
+    <thead>
+      <tr><th>Item</th><th>Detail</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Config</td>
+        <td><code>pytest.ini</code>, <code>tox.ini</code>, <code>environment_cpu.yml</code>, <code>environment.yml</code></td>
+      </tr>
+      <tr>
+        <td>Fixtures</td>
+        <td><code>tests/conftest.py</code> — session fixtures for device, downloads, data dir</td>
+      </tr>
+      <tr>
+        <td>CLI flags</td>
+        <td><code>--gpu</code>, <code>--runslow</code>, <code>--download binary|results|both</code></td>
+      </tr>
+      <tr>
+        <td>Test data</td>
+        <td><code>~/.kilosort/.test_data/ZFM-02370_mini.imec0.ap.short.bin</code> (present on fieldlab)</td>
+      </tr>
+      <tr>
+        <td>Full pipeline test</td>
+        <td><code>tests/test_full_pipeline.py</code> marked <code>@pytest.mark.slow</code>; NP 385 ch; loose spike/unit count tolerances (2.5% / 5%)</td>
+      </tr>
+      <tr>
+        <td>Unit modules</td>
+        <td>dtype, io, preprocessing, spikedetect, clustering, parameters, logging</td>
+      </tr>
+      <tr>
+        <td>CI</td>
+        <td>GitHub Actions: Ubuntu/macOS/Windows, Python 3.9–3.10, tox, <strong>no GPU</strong></td>
+      </tr>
+    </tbody>
+  </table>
+  <pre><code># Typical local invocation (after conda activate kilosort + editable install of fork)
+cd /home/kais/Documents/Development/data/Kilosort-1
+pytest tests/ -q                    # fast suite
+pytest tests/ --runslow -q          # includes full NP pipeline
+# pytest tests/ --gpu --runslow     # only if CUDA works; not on fieldlab</code></pre>
+  <div class="callout warn">
+    <div class="tag">Scope boundary</div>
+    Passing native NP tests does <strong>not</strong> prove Litke MEA correctness or speed.
+    It only reduces the chance of breaking shared KS infrastructure.
+  </div>
+</section>
+
+<!-- 9 MEA OPTS -->
+<section id="mea-opts">
+  <h2>09 · MEA optimization surfaces</h2>
+  <p>
+    When improving the fork, concentrate measurements on the modules touched by
+    <code>mea-optimizations</code>:
+  </p>
+  <table>
+    <thead>
+      <tr><th>Area</th><th>Why it matters on MEA</th><th>Metric axes</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Spike detection / template_match</td>
+        <td>Hot loop; compile + tail micro-opts; peel iterations scale cost with max_peels</td>
+        <td>time/batch, bit-exact st, peak memory</td>
+      </tr>
+      <tr>
+        <td>Host transfer coalescing</td>
+        <td>519 ch × long batches; single transfer per batch cuts PCIe/copy overhead on GPU</td>
+        <td>wall time, transfer count (GPU), identity of outputs</td>
+      </tr>
+      <tr>
+        <td>I/O prefetch worker</td>
+        <td>Overlaps disk read of huge bins with compute</td>
+        <td>batch wait time, disk util, memory (extra buffer)</td>
+      </tr>
+      <tr>
+        <td>Template matching / peel reduction</td>
+        <td>Fold nm scaling; fused reduction</td>
+        <td>time, residual energy, spike counts</td>
+      </tr>
+      <tr>
+        <td>clustering_qr</td>
+        <td>GPU kNN / scatter early-exit — GPU-first</td>
+        <td>cluster counts, assignment agreement, time</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    Accuracy criteria used by the branch language: <strong>bit-exact</strong> where claimed
+    (spike times, compiled body), else numerical / count tolerances. For MEA golden
+    comparison against lab GPU outputs, start with:
+  </p>
+  <ul>
+    <li>Spike times and cluster IDs (after any keep-mask)</li>
+    <li>Number of units and spikes within agreed bounds</li>
+    <li>Optional: templates / whitening matrices if intermediate pins are needed</li>
+  </ul>
+</section>
+
+<!-- 10 TEST STRATEGY -->
+<section id="test-strategy">
+  <h2>10 · Recommended test strategy on fieldlab</h2>
+
+  <h3>Track A — Upstream regression (always first)</h3>
+  <ul>
+    <li>Editable install of <code>mea-optimizations</code> into conda env <code>kilosort</code>.</li>
+    <li>Run fast pytest; optionally <code>--runslow</code> on NP mini bin already cached.</li>
+    <li>Goal: catch generic breakages; CPU only.</li>
+  </ul>
+
+  <h3>Track B — MEA micro-benchmarks (primary local work)</h3>
+  <ul>
+    <li>Build a fixture binary: 1–5 batches or 10–60 s from Litke raw via the official converter.</li>
+    <li>Pair with correct probe mat and settings dict cloned from production (table in §06).</li>
+    <li>Benchmark only modified functions when possible (unit-level tensors) for speed/memory.</li>
+    <li>For bit-exact claims: fixed seeds / deterministic wTEMP paths; compare arrays with equality.</li>
+  </ul>
+
+  <h3>Track C — Short end-to-end smoke</h3>
+  <ul>
+    <li>60 s MEA bin ≈ 1.25 GB; feasible on disk; CPU wall time may be long—use reduced peels for iterative speed work, but keep a “production-params” golden job separate.</li>
+    <li>Store outputs under a dedicated results dir; do not overwrite lab goldens in <code>sorted/</code>.</li>
+  </ul>
+
+  <h3>Track D — Full parity (off-box)</h3>
+  <ul>
+    <li>Requires GPU workstation (e.g. prior RTX 4000 Ada machine). Use for final acceptance of speedups and for regenerating goldens.</li>
+    <li>fieldlab cannot substitute.</li>
+  </ul>
+
+  <h3>Suggested fixture recipe (conceptual)</h3>
+  <pre><code># 1) Convert one short Litke recording (or truncate after convert)
+# 2) Prefer reusing convert_join_litke_datasets_for_yass.py for layout fidelity
+# 3) Run with settings matching §06, device='cpu' on fieldlab
+# 4) Optionally compare subset of spikes against GPU golden if times align
+
+settings = {
+  'n_chan_bin': 519,
+  'fs': 20000,
+  'batch_size': 60000,
+  'nblocks': 0,
+  'Th_universal': 8,
+  'Th_learned': 6,
+  'Th_single_ch': 3.0,
+  'max_peels': 100,   # or lower only for profiling, not for golden accuracy
+  'dmin': 30,
+  'dminx': 30,
+  'nearest_chans': 19,
+  'whitening_range': 37,
+  # … remaining keys from get_settings / production ops
+}</code></pre>
+
+  <h3>Memory discipline on 15 GiB</h3>
+  <ul>
+    <li>Avoid loading entire multi-GB bins into RAM; stream as KS does.</li>
+    <li>Prefetch buffers add peak memory—measure RSS when testing I/O changes.</li>
+    <li>Prefer float32 batch views already used by KS; do not introduce full-float64 copies.</li>
+    <li>Close concurrent heavy processes; leave headroom for OS cache of sequential reads.</li>
+  </ul>
+</section>
+
+<!-- 11 COLAB -->
+<section id="colab">
+  <h2>11 · Colab / free GPU assessment</h2>
+  <p>
+    Free Colab GPUs can accelerate short MEA fixtures, but full raw trees are a poor fit.
+  </p>
+  <table>
+    <thead>
+      <tr><th>Approach</th><th>Feasible?</th><th>Notes</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Upload full raw experiment</td>
+        <td>No (practical)</td>
+        <td>Hundreds of GB; timeouts; session disk limits</td>
+      </tr>
+      <tr>
+        <td>Upload prebuilt 30–60 s .bin + probe mat</td>
+        <td>Yes</td>
+        <td>~0.2–1.3 GB; best Colab path</td>
+      </tr>
+      <tr>
+        <td>Drive-mounted lab data</td>
+        <td>Maybe</td>
+        <td>Bandwidth and auth friction; still prefer short fixtures</td>
+      </tr>
+      <tr>
+        <td>Replacing fieldlab for unit tests</td>
+        <td>Unnecessary</td>
+        <td>CPU pytest is fine locally</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>
+    Recommendation: build fixtures on fieldlab (disk has raw), optionally run GPU timing on
+    Colab or the lab GPU box; keep goldens versioned by commit SHA and settings hash.
+  </p>
+</section>
+
+<!-- 12 GAPS -->
+<section id="gaps">
+  <h2>12 · Open gaps &amp; decisions</h2>
+  <ol>
+    <li><strong>Param authority:</strong> Confirm whether any experiment intentionally used peels=50 or Th≈9; if so, document CLI history. Else standardize on log-backed 8/6/100.</li>
+    <li><strong>Editable install alignment:</strong> Ensure conda <code>kilosort</code> imports this branch’s sources before any benchmark.</li>
+    <li><strong>Missing chunk bins on fieldlab:</strong> Recreate short fixtures from raw; do not assume <code>chunk1.bin</code> is local.</li>
+    <li><strong>Golden policy:</strong> Define bit-exact vs tolerance comparisons per stage (detect vs cluster vs full).</li>
+    <li><strong>GPU-only paths:</strong> clustering_qr kNN and transfer opts need CPU fallbacks or skip markers in local tests.</li>
+    <li><strong>Disk pressure:</strong> 83% full—delete intermediate bins carefully; prefer one small fixture.</li>
+  </ol>
+</section>
+
+<!-- 13 AGENT PLAYBOOK -->
+<section id="agent">
+  <h2>13 · Agent playbook (do this first)</h2>
+  <ol>
+    <li>Confirm branch: <code>git -C …/Kilosort-1 status -sb</code> → <code>mea-optimizations</code>.</li>
+    <li>Confirm device: <code>python -c "import torch; print(torch.cuda.is_available())"</code> → expect <code>False</code> on fieldlab.</li>
+    <li>Activate <code>conda activate kilosort</code>; install fork editable if needed.</li>
+    <li>Run native fast tests; fix breakages before MEA work.</li>
+    <li>Do not invent binary layout—use lab converter or match transpose/int16 contract.</li>
+    <li>Copy settings from §06 for 30 µm / 519 ch; change pitch only with matching probe.</li>
+    <li>For speed PRs: report time, peak RSS, and accuracy method (bit-exact / tolerance / spike-count).</li>
+    <li>For memory PRs: report peak RSS and extra buffers (prefetch depth, pinned host memory).</li>
+    <li>Never overwrite production <code>sorted/…/kilosort4</code> goldens without explicit user approval.</li>
+    <li>Prefer small reversible edits; keep numerical identity tests adjacent to optimized kernels.</li>
+  </ol>
+  <h3>Environment commands (reference)</h3>
+  <pre><code>source ~/miniconda3/etc/profile.d/conda.sh
+conda activate kilosort
+cd /home/kais/Documents/Development/data/Kilosort-1
+pip install -e .   # when rebinding env to this tree
+pytest tests/ -q
+
+# Hardware facts
+nproc; free -h; nvidia-smi || true</code></pre>
+  <h3>Key code entry points</h3>
+  <ul>
+    <li>Lab runner: <code>MEA-fieldlab/src/utilities/run_kilosort4.py</code> → <code>get_settings()</code>, probe load, <code>run_kilosort(...)</code></li>
+    <li>KS package: <code>kilosort/</code> under the fork (spikedetect, io, clustering, template matching)</li>
+    <li>Tests: <code>tests/test_*.py</code>, fixtures in <code>conftest.py</code></li>
+  </ul>
+</section>
+
+<!-- 14 GLOSSARY -->
+<section id="glossary">
+  <h2>14 · Glossary</h2>
+  <table>
+    <thead>
+      <tr><th>Term</th><th>Meaning in this project</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>Litke</td><td>MEA acquisition system; multi-GB per-file raw bins, row-major reader in lab tools</td></tr>
+      <tr><td>chunk</td><td>Logical join of one or more dataXXX folders into one sort job / .bin</td></tr>
+      <tr><td>peel</td><td>Matching-pursuit iteration subtracting templates from residual in a batch</td></tr>
+      <tr><td>dmin / dminx</td><td>Spatial template grid spacing (µm); lab sets equal to electrode pitch</td></tr>
+      <tr><td>CAR</td><td>Common average reference; optional via <code>-c</code>; off in the logged 20251204A run</td></tr>
+      <tr><td>bit-exact</td><td>Identical numerical outputs vs reference path (branch claim for some edits)</td></tr>
+      <tr><td>fieldlab</td><td>This development host: 4-core CPU, 15 GiB RAM, no GPU</td></tr>
+      <tr><td>MEA-fieldlab</td><td>Lab analysis pipeline repo (convert, sort wrappers, Vision handoff)</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section>
+  <h2>Document control</h2>
+  <p>
+    Generated as an agent-facing engineering context freeze from a live host survey.
+    Paths are absolute for this machine. If the workspace moves, re-verify roots in §05.
+    Do not treat verbal parameter memory as source of truth over logs and
+    <code>run_kilosort4.py</code>.
+  </p>
+  <p class="mono" style="font-size:0.8rem;color:var(--muted)">
+    File: docs/MEA_FIELD_TEST_CONTEXT.html · Branch: mea-optimizations · Host: fieldlab
+  </p>
+</section>
+
+</main>
+</div>
+
+<footer>
+  Swiss-grid engineering brief · MEA / Kilosort · for human and LLM agents · no warranty · verify before destructive ops
+</footer>
+
+</body>
+</html>
