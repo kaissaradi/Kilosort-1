@@ -77,3 +77,23 @@ def test_refract_accepts_empty_spike_vectors():
     assert labels.dtype == bool
     assert labels.size == 0
     assert contamination.size == 0
+
+
+def test_compute_ccg_empty_trains_no_crash():
+    K, T = CCG.compute_CCG(np.zeros(0), np.zeros(0))
+    assert T == 0.0
+    assert K.shape[0] == 1001
+    assert K.sum() == 0
+
+
+def test_check_ccg_empty_and_zero_span():
+    # Empty
+    is_ref, cross, R12 = CCG.check_CCG(np.array([]))
+    assert is_ref is False and cross is False
+    # All equal times → T==0
+    is_ref, cross, R12 = CCG.check_CCG(np.array([1.0, 1.0, 1.0]))
+    assert is_ref is False and cross is False
+    # Non-degenerate still returns a finite R12
+    times = np.arange(0, 5, 0.05)
+    is_ref, cross, R12 = CCG.check_CCG(times)
+    assert np.isfinite(R12)

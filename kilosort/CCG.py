@@ -9,6 +9,12 @@ from tqdm import trange
 def compute_CCG(st1, st2, tbin = 1/1000, nbins = 500,
                 assume_sorted=False):
 
+    K = np.zeros(2*nbins+1,)
+    # Empty trains: avoid st1.max() / st2.max() on zero-length arrays.
+    # Callers treat T==0 as non-refractory (see check_CCG).
+    if len(st1) == 0 or len(st2) == 0:
+        return K, 0.0
+
     if not assume_sorted:
         st1 = np.sort(st1)
         st2 = np.sort(st2)
@@ -20,7 +26,6 @@ def compute_CCG(st1, st2, tbin = 1/1000, nbins = 500,
     ihigh = 0
     j = 0
 
-    K = np.zeros(2*nbins+1,)
     while j<len(st2):
         while (ihigh<len(st1)) and (st1[ihigh] <= st2[j]+dt):
             ihigh += 1
@@ -87,10 +92,18 @@ def check_CCG(st1, st2=None, nbins = 500, tbin  = 1/1000, acg_threshold=0.2,
     #       `acg_threshold=0.1` in your run settings for stricter criteria.
     # ACG path: reuse the same array. compute_CCG rebinds sorted views and does
     # not mutate spike times in place, so a defensive copy is wasted memory.
+    st1 = np.asarray(st1)
     if st2 is None:
         st2 = st1
+    else:
+        st2 = np.asarray(st2)
+    # Empty / zero-span: CCG_metrics divides by T and by len(st)*len(st2).
+    if st1.size == 0 or st2.size == 0:
+        return False, False, np.nan
     K, T = compute_CCG(st1, st2, nbins=nbins, tbin=tbin,
                        assume_sorted=assume_sorted)
+    if T == 0:
+        return False, False, np.nan
     R12, Q12, Q00 = CCG_metrics(st1, st2, K, T,  nbins = nbins, tbin = tbin)
     is_refractory    = R12<acg_threshold  and (Q12<.2)#  or Q00<.25)
     cross_refractory = R12<ccg_threshold and (Q12<.05)# or Q00<.25)
