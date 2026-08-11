@@ -1040,8 +1040,11 @@ nproc; free -h; nvidia-smi || true</code></pre>
       <li><code>LitkeRecording(path, drop_ttl=True)</code> is a Kilosort
         <code>file_object</code>: shape <code>(n_samples, n_chan)</code>, dtype int16,
         multi-file folders joined like <code>PyBinFileReader</code>.</li>
-      <li>Default <code>drop_ttl=True</code> matches lab converter (TTL ch0 dropped →
-        519 or 512 channels for probe maps).</li>
+      <li>Default <code>drop_ttl=True</code> matches lab converter
+        (<strong>electrode 0 = visual-stim TTL, not spikes</strong> — dropped →
+        519/512 neural channels). Export sync with
+        <code>get_ttl</code> / <code>save_ttl</code> / <code>detect_ttl_onsets</code>
+        (lab thr=1000). Unpack bit-exact vs bin2py cythonext on data000.</li>
       <li>Field proof: <code>…/raw/20251204A/data000</code> → shape
         <code>(17860000, 519)</code>, array_id 1551, fs 20&nbsp;kHz, ~0.04&nbsp;s for 20k
         samples (~500k samp/s) on fieldlab CPU — C/CUDA not needed.</li>
