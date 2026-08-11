@@ -279,7 +279,8 @@
       <div><strong>Branch</strong> · mea-optimizations</div>
       <div><strong>Fork</strong> · kaissaradi/Kilosort-1</div>
       <div><strong>Survey date</strong> · 2026-08-10</div>
-      <div><strong>Status</strong> · Context freeze (no code changes)</div>
+      <div><strong>Updated</strong> · 2026-08-10 (cycle 2)</div>
+      <div><strong>Status</strong> · Living brief + CPU opt log</div>
     </div>
   </div>
   <div class="accent-bar"></div>
@@ -303,6 +304,7 @@
     <li><a href="#gaps">Open gaps</a></li>
     <li><a href="#agent">Agent playbook</a></li>
     <li><a href="#glossary">Glossary</a></li>
+    <li><a href="#cpu-log">CPU optimization log</a></li>
   </ol>
 </nav>
 
@@ -811,8 +813,19 @@ pytest tests/ --runslow -q          # includes full NP pipeline
         <td>GPU kNN / scatter early-exit — GPU-first</td>
         <td>cluster counts, assignment agreement, time</td>
       </tr>
+      <tr>
+        <td>CCG / postprocess / swarm</td>
+        <td>CPU-heavy refractory checks and remaps on dense MEA spike lists</td>
+        <td>identity vs refs, ms/call, RSS for short runs</td>
+      </tr>
+      <tr>
+        <td>Whitening / clip buffers</td>
+        <td>Nearest-channel Wrot + wPCA clip allocation on 512/519 ch probes</td>
+        <td>Wrot identity, capacity vs n_batches, peak RSS</td>
+      </tr>
     </tbody>
   </table>
+  <p>See <a href="#cpu-log">§15</a> for the living list of landed CPU changes and test gates.</p>
   <p>
     Accuracy criteria used by the branch language: <strong>bit-exact</strong> where claimed
     (spike times, compiled body), else numerical / count tolerances. For MEA golden
@@ -991,16 +1004,166 @@ nproc; free -h; nvidia-smi || true</code></pre>
   </table>
 </section>
 
+<!-- 15 CPU OPTIMIZATION LOG -->
+<section id="cpu-log">
+  <h2>15 · CPU optimization log (living)</h2>
+  <p class="lede">
+    Fieldlab is the gate for pure-CPU correctness. Each cycle keeps numerical identity
+    (unit-level vs independent references) and extends the in-repo pytest surface.
+    Full MEA multi-GB e2e remains a non-goal on this host.
+  </p>
+
+  <div class="callout ok">
+    <div class="tag">Fast suite gate (latest)</div>
+    <code>pytest tests/ -q -m "not slow" -k "not wpca_wtemp"</code>
+    → <strong>48 passed, 2 deselected</strong> (slow full pipeline + wpca/SIGILL host limit).
+  </div>
+
+  <h3>Cycle 1 — spike buffers, CCG, duplicates</h3>
+  <table>
+    <thead>
+      <tr><th>Change</th><th>Axis</th><th>Module</th><th>Lock-in test</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Scaled spike buffers via <code>get_spike_buffer_capacity</code></td>
+        <td>memory</td>
+        <td><code>utils</code>, <code>spikedetect</code>, <code>template_matching</code></td>
+        <td><code>test_spikedetect</code></td>
+      </tr>
+      <tr>
+        <td>Nearest-chan via one <code>argsort</code> + <code>take_along_axis</code></td>
+        <td>speed</td>
+        <td><code>spikedetect.nearest_chans</code>, <code>prepare_extract</code></td>
+        <td><code>test_spikedetect</code></td>
+      </tr>
+      <tr>
+        <td><code>CCG.refract</code> stable group-by + <code>assume_sorted</code></td>
+        <td>speed</td>
+        <td><code>CCG.py</code></td>
+        <td><code>test_ccg</code></td>
+      </tr>
+      <tr>
+        <td>ACG path no longer copies <code>st1</code></td>
+        <td>memory</td>
+        <td><code>CCG.check_CCG</code></td>
+        <td><code>test_ccg</code></td>
+      </tr>
+      <tr>
+        <td><code>remove_duplicates</code> dense last-time table (numba)</td>
+        <td>speed</td>
+        <td><code>postprocessing.py</code></td>
+        <td><code>test_postprocessing</code></td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Cycle 2 — clips, whitening, swarm remaps</h3>
+  <table>
+    <thead>
+      <tr><th>Change</th><th>Axis</th><th>Module</th><th>Lock-in test</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Scaled wPCA/wTEMP clip buffer via <code>get_clip_buffer_capacity</code></td>
+        <td>memory</td>
+        <td><code>utils</code>, <code>spikedetect.extract_wPCA_wTEMP</code></td>
+        <td><code>test_clip_buffer_capacity_*</code></td>
+      </tr>
+      <tr>
+        <td>Swarmsplitter ACG no-copy + <code>assume_sorted</code> plumb-through</td>
+        <td>memory / speed</td>
+        <td><code>swarmsplitter.check_CCG</code></td>
+        <td><code>test_swarmsplitter</code></td>
+      </tr>
+      <tr>
+        <td><code>new_clusters</code> dense leaf remap (no O(leaves)·isin)</td>
+        <td>speed</td>
+        <td><code>swarmsplitter.new_clusters</code></td>
+        <td><code>test_swarmsplitter</code> vs isin oracle</td>
+      </tr>
+      <tr>
+        <td><code>whitening_local</code> precomputes nearest indices once</td>
+        <td>speed</td>
+        <td><code>preprocessing.whitening_local</code></td>
+        <td><code>test_whitening_local_matches_*</code></td>
+      </tr>
+      <tr>
+        <td><code>Wrot</code> dtype follows <code>CC.dtype</code></td>
+        <td>bug/robustness</td>
+        <td><code>preprocessing.whitening_local</code></td>
+        <td>float32 identity test</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Capacity formulas (CPU RAM discipline)</h3>
+  <pre><code>get_spike_buffer_capacity(n_batches) =
+    min(1e6, max(1e4, 1e4 * n_batches))
+
+get_clip_buffer_capacity(n_batches, nskip=25) =
+    n_used = max(1, ceil(n_batches / nskip))
+    min(5e5, max(1e4, n_used * 5e3))</code></pre>
+  <p>
+    Short fieldlab fixtures therefore allocate ~10k–20k clips instead of a fixed
+    500k×nt float32 slab (~122&nbsp;MiB at nt=61).
+  </p>
+
+  <h3>Micro-bench snapshots (fieldlab, indicative)</h3>
+  <table>
+    <thead>
+      <tr><th>Path</th><th>Workload</th><th>Result</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>remove_duplicates</code></td>
+        <td>200k spikes · 200 clusters</td>
+        <td>~1.3&nbsp;ms/call after numba warm (cycle 1)</td>
+      </tr>
+      <tr>
+        <td><code>whitening_local</code></td>
+        <td>128 ch · nrange=32</td>
+        <td>~54&nbsp;ms/call (cycle 2; SVD still dominates)</td>
+      </tr>
+      <tr>
+        <td><code>new_clusters</code></td>
+        <td>200k spikes · 200 labels · pair merges</td>
+        <td>~9&nbsp;ms/call (cycle 2)</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h3>Commands agents should re-run</h3>
+  <pre><code>conda activate kilosort
+cd /home/kais/Documents/Development/data/Kilosort-1
+
+# Pure CPU units (no wpca SIGILL path)
+pytest tests/test_ccg.py tests/test_spikedetect.py tests/test_postprocessing.py \
+       tests/test_swarmsplitter.py tests/test_preprocessing.py \
+       -k "not wpca_wtemp" -q
+
+# Default fast gate
+pytest tests/ -q -m "not slow" -k "not wpca_wtemp"</code></pre>
+
+  <div class="callout warn">
+    <div class="tag">Host limit</div>
+    <code>test_wpca_wtemp</code> can raise <strong>Illegal instruction</strong> on this old CPU
+    with modern torch kernels. Deselect on fieldlab; do not treat as an app logic failure
+    without a newer CPU or CPU-build torch.
+  </div>
+</section>
+
 <section>
   <h2>Document control</h2>
   <p>
-    Generated as an agent-facing engineering context freeze from a live host survey.
+    Living agent-facing engineering brief from a live host survey plus CPU optimization cycles.
     Paths are absolute for this machine. If the workspace moves, re-verify roots in §05.
     Do not treat verbal parameter memory as source of truth over logs and
-    <code>run_kilosort4.py</code>.
+    <code>run_kilosort4.py</code>. Update §15 whenever a CPU cycle lands.
   </p>
   <p class="mono" style="font-size:0.8rem;color:var(--muted)">
-    File: docs/MEA_FIELD_TEST_CONTEXT.html · Branch: mea-optimizations · Host: fieldlab
+    File: docs/MEA_FIELD_TEST_CONTEXT.html · Branch: mea-optimizations · Host: fieldlab ·
+    Cycles: 1 (buffers/CCG/duplicates) · 2 (clips/whitening/swarm)
   </p>
 </section>
 
