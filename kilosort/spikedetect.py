@@ -368,9 +368,12 @@ def nearest_chans(ys, yc, xs, xc, nC, device=torch.device('cuda')):
     return iC, ds
 
 
-def yweighted(yc, iC, adist, xy, device=torch.device('cuda')):    
-
-    yy = torch.from_numpy(yc).to(device)[iC]
+def yweighted(yc, iC, adist, xy, device=torch.device('cuda'), yc_t=None):
+    # yc_t: optional pre-moved contact y-coords (detect reuses across batches).
+    if yc_t is None:
+        yy = torch.as_tensor(yc, device=device)[iC]
+    else:
+        yy = yc_t[iC]
     cF0 = torch.nn.functional.relu(adist)
     # clamp avoids 0/0 → NaN when a template column has no positive weight;
     # bit-identical whenever sum(0) >= 1e-12 (normal case).
@@ -432,6 +435,8 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
     k = 0
     nt = ops['nt']
     tarange = torch.arange(-(nt//2),nt//2+1, device = device)
+    # Contact y-coords once for yweighted (was torch.from_numpy every batch).
+    yc_t = torch.as_tensor(yc, device=device)
     # Scratch peak buffers reused by template_match across batches
     tm_scratch = {}
     logger.info('Detecting spikes...')
@@ -452,7 +457,7 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
             xy, imax, amp, adist = template_match(
                 X, ops, iC, iC2, weigh, device=device, scratch=tm_scratch
             )
-            yct = yweighted(yc, iC, adist, xy, device=device)
+            yct = yweighted(yc, iC, adist, xy, device=device, yc_t=yc_t)
             nsp = len(xy)
 
             if k+nsp>st.shape[0]:

@@ -1074,8 +1074,12 @@ class BinaryFiltered(BinaryRWFile):
             X = X[self.chan_map]
 
         if self.invert_sign:
+            # Out-of-place: X may share storage with a numpy memmap via
+            # __getitem__ (from_numpy); in-place mul_ segfaults on that path.
             X = X * -1
 
+        # Out-of-place demean / CAR for the same memmap-safety reason. The
+        # padded_batch_to_torch path could use sub_, but __getitem__ cannot.
         X = X - X.mean(1, keepdim=True)
         if self.do_CAR:
             # remove the mean of each channel, and the median across channels
