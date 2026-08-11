@@ -6,10 +6,12 @@ import math
 from tqdm import trange 
 
 @njit()
-def compute_CCG(st1, st2, tbin = 1/1000, nbins = 500):
+def compute_CCG(st1, st2, tbin = 1/1000, nbins = 500,
+                assume_sorted=False):
 
-    st1 = np.sort(st1)
-    st2 = np.sort(st2)
+    if not assume_sorted:
+        st1 = np.sort(st1)
+        st2 = np.sort(st2)
 
     dt = nbins * tbin
     T = np.maximum(st1.max(), st2.max()) - np.minimum(st1.min(), st2.min())
@@ -78,14 +80,17 @@ def CCG_metrics(st1, st2, K, T, nbins=None, tbin=None):
     return R12, Q12, Q00
 
 def check_CCG(st1, st2=None, nbins = 500, tbin  = 1/1000, acg_threshold=0.2,
-              ccg_threshold=0.25):
+              ccg_threshold=0.25, assume_sorted=False):
     # NOTE: The default `acg_threshold=0.2` is different from the value of 0.1
     #       used for the Kilosort4 paper. We felt this better reflects common
     #       practice for determining 'good' units, but you can set
     #       `acg_threshold=0.1` in your run settings for stricter criteria.
+    # ACG path: reuse the same array. compute_CCG rebinds sorted views and does
+    # not mutate spike times in place, so a defensive copy is wasted memory.
     if st2 is None:
-        st2 = st1.copy()
-    K , T= compute_CCG(st1, st2, nbins = nbins, tbin = tbin)
+        st2 = st1
+    K, T = compute_CCG(st1, st2, nbins=nbins, tbin=tbin,
+                       assume_sorted=assume_sorted)
     R12, Q12, Q00 = CCG_metrics(st1, st2, K, T,  nbins = nbins, tbin = tbin)
     is_refractory    = R12<acg_threshold  and (Q12<.2)#  or Q00<.25)
     cross_refractory = R12<ccg_threshold and (Q12<.05)# or Q00<.25)
@@ -102,20 +107,38 @@ def similarity(Wall, W, nt=61):
     return similar_templates
 
 def refract(iclust2, st0, acg_threshold=0.2, ccg_threshold=0.25):
-    
-    Nfilt = iclust2.max()+1
+    """Estimate refractory labels and contamination for every cluster.
 
-    is_refractory    = np.zeros(Nfilt, )
-    cross_refractory = np.zeros(Nfilt, )
-    R12 = np.zeros(Nfilt, )
+    Kilosort's export path supplies spike times in chronological order. Grouping
+    clusters with a stable sort preserves that order, avoiding both a full
+    spike-vector comparison per cluster and redundant per-cluster time sorts.
+    Unordered callers retain the original sorting behavior.
+    """
+    iclust2 = np.asarray(iclust2)
+    st0 = np.asarray(st0)
+    if iclust2.size == 0:
+        return np.zeros(0, dtype=bool), np.zeros(0)
 
-    for kk in range(Nfilt):    
-        ix = iclust2==kk
-        st1 = st0[ix]
+    Nfilt = int(iclust2.max()) + 1
 
-        if (len(st1) > 10) and ((st1.max() - st1.min()) != 0):
-            is_refractory[kk], cross_refractory[kk], R12[kk] = check_CCG(
-                st1, acg_threshold=acg_threshold, ccg_threshold=ccg_threshold
-                )
+    is_refractory = np.zeros(Nfilt, dtype=bool)
+    R12 = np.zeros(Nfilt)
+
+    counts = np.bincount(iclust2, minlength=Nfilt)
+    offsets = np.concatenate(([0], np.cumsum(counts)))
+    order = np.argsort(iclust2, kind='stable')
+    assume_sorted = st0.size < 2 or np.all(st0[:-1] <= st0[1:])
+
+    for kk in range(Nfilt):
+        start, stop = offsets[kk], offsets[kk + 1]
+        if stop - start <= 10:
+            continue
+        st1 = st0[order[start:stop]]
+
+        if (st1.max() - st1.min()) != 0:
+            is_refractory[kk], _, R12[kk] = check_CCG(
+                st1, acg_threshold=acg_threshold,
+                ccg_threshold=ccg_threshold, assume_sorted=assume_sorted
+            )
 
     return is_refractory, R12
