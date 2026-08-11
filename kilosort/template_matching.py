@@ -46,12 +46,25 @@ def prepare_extract(xc, yc, U, nC, position_limit, device=torch.device('cuda')):
     
     """
     ds = (xc - xc[:, np.newaxis])**2 +  (yc - yc[:, np.newaxis])**2 
-    iCC = np.argsort(ds, 0)[:nC]
+    n_src = ds.shape[0]
+    nC = int(min(nC, n_src))
+    # Same top-nC shortcut as spikedetect.nearest_chans (argpartition + sort).
+    if nC >= n_src:
+        iCC = np.argsort(ds, 0)
+    else:
+        part = np.argpartition(ds, nC - 1, axis=0)[:nC]
+        ds_part = np.take_along_axis(ds, part, axis=0)
+        order = np.argsort(ds_part, axis=0)
+        iCC = np.take_along_axis(part, order, axis=0)
     iCC_mask = np.take_along_axis(ds, iCC, axis=0)
     iCC = torch.from_numpy(iCC).to(device)
     iCC_mask = iCC_mask < position_limit**2
     iCC_mask = torch.from_numpy(iCC_mask).to(device)
-    iU = torch.argmax((U**2).sum(1), -1)
+    # Empty-template NaNs → treat as zero so argmax stays finite.
+    Unorm = (U**2).sum(1)
+    if not torch.isfinite(Unorm).all():
+        Unorm = torch.nan_to_num(Unorm, nan=0.0, posinf=0.0, neginf=0.0)
+    iU = torch.argmax(Unorm, -1)
     Ucc = U[torch.arange(U.shape[0]),:,iCC[:,iU]]
 
     return iCC, iCC_mask, iU, Ucc

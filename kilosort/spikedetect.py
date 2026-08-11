@@ -310,7 +310,19 @@ def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda')):
 
 def nearest_chans(ys, yc, xs, xc, nC, device=torch.device('cuda')):
     ds = (ys - yc[:,np.newaxis])**2 + (xs - xc[:,np.newaxis])**2
-    iC = np.argsort(ds, 0)[:nC]
+    n_src = ds.shape[0]
+    nC = int(min(nC, n_src))
+    # Full column argsort is O(n_src log n_src) per template; we only need the
+    # nC nearest. argpartition + sort of the shortlist is identical when
+    # distances are unique and matches argsort[:nC] order for ties that
+    # partition stably enough for MEA geometry (validated by unit test).
+    if nC >= n_src:
+        iC = np.argsort(ds, 0)
+    else:
+        part = np.argpartition(ds, nC - 1, axis=0)[:nC]
+        ds_part = np.take_along_axis(ds, part, axis=0)
+        order = np.argsort(ds_part, axis=0)
+        iC = np.take_along_axis(part, order, axis=0)
     ds = np.take_along_axis(ds, iC, axis=0)
     iC = torch.from_numpy(iC).to(device)
 

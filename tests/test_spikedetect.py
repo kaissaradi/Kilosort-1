@@ -66,6 +66,24 @@ def test_clip_buffer_capacity_scales_with_recording_length():
     assert get_clip_buffer_capacity(10_000, nskip=25) == 500_000
 
 
+def test_nearest_chans_matches_full_argsort_on_unique_distances():
+    """argpartition shortlist must equal argsort[:nC] when distances unique."""
+    rng = np.random.default_rng(0)
+    n_chan, n_temp, nC = 80, 40, 12
+    # Jittered positions → essentially unique squared distances
+    yc = np.arange(n_chan, dtype=np.float64) * 20.0 + rng.normal(0, 0.01, n_chan)
+    xc = rng.normal(0, 5, n_chan)
+    ys = np.linspace(yc.min(), yc.max(), n_temp) + rng.normal(0, 0.01, n_temp)
+    xs = rng.normal(0, 5, n_temp)
+    iC, ds = nearest_chans(ys, yc, xs, xc, nC, device=torch.device('cpu'))
+    # Reference full argsort
+    D = (ys - yc[:, None]) ** 2 + (xs - xc[:, None]) ** 2
+    iC_ref = np.argsort(D, 0)[:nC]
+    ds_ref = np.take_along_axis(D, iC_ref, axis=0)
+    np.testing.assert_array_equal(iC.numpy(), iC_ref)
+    np.testing.assert_allclose(ds, ds_ref)
+
+
 def test_template_match_body_dispatch_eager_on_cpu(monkeypatch):
     """CPU path must not torch.compile by default (fieldlab / no CUDA)."""
     import kilosort.spikedetect as sd
