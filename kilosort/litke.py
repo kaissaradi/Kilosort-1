@@ -289,6 +289,80 @@ def unpack_samples(buf: np.ndarray, n_samples: int, n_elec: int,
 
 
 @njit(cache=True)
+def _unpack_even_drop_ttl_numba(buf: np.ndarray, n_samples: int, n_elec: int,
+                                out: np.ndarray) -> None:
+    """Even board: skip electrode 0, write electrodes 1..n_elec-1 → out (n, n_elec-1)."""
+    k = 0
+    n_out = n_elec - 1
+    for i in range(n_samples):
+        # First pair: electrode 0 (TTL) + electrode 1
+        b1 = np.int32(buf[k])
+        b2 = np.int32(buf[k + 1])
+        b3 = np.int32(buf[k + 2])
+        k += 3
+        # skip electrode 0; keep electrode 1 at out[:, 0]
+        out[i, 0] = np.int16((((b2 & 0xF) << 8) | b3) - 2048)
+        # Remaining pairs map electrodes 2,3,... → out columns 1,2,...
+        col = 1
+        for j in range(2, n_elec, 2):
+            b1 = np.int32(buf[k])
+            b2 = np.int32(buf[k + 1])
+            b3 = np.int32(buf[k + 2])
+            k += 3
+            out[i, col] = np.int16(((b1 << 4) | (b2 >> 4)) - 2048)
+            out[i, col + 1] = np.int16((((b2 & 0xF) << 8) | b3) - 2048)
+            col += 2
+
+
+@njit(cache=True)
+def _unpack_odd_drop_ttl_numba(buf: np.ndarray, n_samples: int, n_elec: int,
+                               out: np.ndarray) -> None:
+    """Odd board: skip 16-bit TTL prefix, write neural electrodes to out."""
+    k = 0
+    for i in range(n_samples):
+        k += 2  # skip electrode 0 (raw 16-bit TTL)
+        col = 0
+        for j in range(1, n_elec, 2):
+            b1 = np.int32(buf[k])
+            b2 = np.int32(buf[k + 1])
+            b3 = np.int32(buf[k + 2])
+            k += 3
+            out[i, col] = np.int16(((b1 << 4) | (b2 >> 4)) - 2048)
+            out[i, col + 1] = np.int16((((b2 & 0xF) << 8) | b3) - 2048)
+            col += 2
+
+
+def unpack_samples_drop_ttl(buf: np.ndarray, n_samples: int, n_elec: int,
+                            out: Optional[np.ndarray] = None) -> np.ndarray:
+    """Unpack neural channels only: shape ``(n_samples, n_elec - 1)``.
+
+    Bit-identical to ``unpack_samples(...)[:, 1:]`` without allocating the TTL
+    column. Used by :class:`LitkeRecording` when ``drop_ttl=True`` (sort path).
+    """
+    if n_elec < 2:
+        raise ValueError('drop_ttl unpack requires n_elec >= 2')
+    buf = np.ascontiguousarray(buf, dtype=np.uint8).ravel()
+    need = n_samples * bytes_per_sample(n_elec)
+    if buf.size < need:
+        raise ValueError(
+            f'buffer has {buf.size} bytes, need {need} for '
+            f'{n_samples} samples × {n_elec} electrodes'
+        )
+    n_out = n_elec - 1
+    if out is None:
+        out = np.empty((n_samples, n_out), dtype=np.int16)
+    elif out.shape != (n_samples, n_out) or out.dtype != np.int16:
+        raise ValueError(
+            f'out must be int16 with shape (n_samples, {n_out})'
+        )
+    if n_elec % 2 == 0:
+        _unpack_even_drop_ttl_numba(buf, n_samples, n_elec, out)
+    else:
+        _unpack_odd_drop_ttl_numba(buf, n_samples, n_elec, out)
+    return out
+
+
+@njit(cache=True)
 def _unpack_ttl_even_numba(buf: np.ndarray, n_samples: int, n_elec: int,
                            out: np.ndarray) -> None:
     """Electrode 0 only for even boards (first 12-bit of each sample)."""
@@ -514,8 +588,24 @@ class LitkeRecording:
     def _read_raw_samples(self, start: int, n: int) -> np.ndarray:
         """Read and unpack ``n`` samples starting at global sample ``start``.
 
-        Returns int16 array shape (n, num_electrodes) including TTL.
+        Returns int16 array shape (n, num_electrodes) including TTL when
+        ``drop_ttl=False``. With ``drop_ttl=True`` (default sort path), returns
+        shape (n, num_electrodes-1) via a TTL-skipping unpack — bit-identical
+        to full unpack then ``[:, 1:]`` without the extra channel column.
         """
+        if self.drop_ttl:
+            if n <= 0:
+                return np.zeros((0, self._n_chan), dtype=np.int16)
+            out = np.empty((n, self._n_chan), dtype=np.int16)
+            written = 0
+            for raw, take in self._iter_packed_chunks(start, n):
+                unpack_samples_drop_ttl(
+                    raw, take, self.num_electrodes,
+                    out=out[written:written + take],
+                )
+                written += take
+            return out
+
         if n <= 0:
             return np.zeros((0, self.num_electrodes), dtype=np.int16)
         out = np.empty((n, self.num_electrodes), dtype=np.int16)
@@ -554,14 +644,16 @@ class LitkeRecording:
         else:
             t_idx, c_idx = idx, slice(None)
 
-        # Resolve time → (start, n) contiguous read when possible
+        # Resolve time → (start, n) contiguous read when possible.
+        # _read_raw_samples already drops TTL when drop_ttl=True.
+        n_full = self._n_chan if self.drop_ttl else self.num_electrodes
         if isinstance(t_idx, slice):
             start, stop, step = t_idx.indices(self.n_samples)
             if step != 1:
                 # Fall back to gathering individual samples (rare).
                 times = np.arange(start, stop, step)
                 if times.size == 0:
-                    data = np.zeros((0, self.num_electrodes), dtype=np.int16)
+                    data = np.zeros((0, n_full), dtype=np.int16)
                 else:
                     # Read contiguous span then subsample (usually cheaper).
                     span = self._read_raw_samples(int(times[0]),
@@ -574,21 +666,17 @@ class LitkeRecording:
             if t < 0:
                 t += self.n_samples
             data = self._read_raw_samples(t, 1)
-            data = data[0]  # (n_elec,)
-            if self.drop_ttl:
-                data = data[1:]
+            data = data[0]  # (n_chan,)
             return data[c_idx]
         else:
             times = np.asarray(t_idx, dtype=np.int64).ravel()
             if times.size == 0:
-                data = np.zeros((0, self.num_electrodes), dtype=np.int16)
+                data = np.zeros((0, n_full), dtype=np.int16)
             else:
                 t0, t1 = int(times.min()), int(times.max())
                 span = self._read_raw_samples(t0, t1 - t0 + 1)
                 data = span[times - t0]
 
-        if self.drop_ttl:
-            data = data[:, 1:]
         return data[:, c_idx]
 
     # -- TTL / stim trigger channel (electrode 0) ----------------------------

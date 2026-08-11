@@ -78,6 +78,25 @@ def test_pack_unpack_odd_identity():
     np.testing.assert_array_equal(out, ref)
 
 
+def test_unpack_drop_ttl_matches_full_slice_even():
+    rng = np.random.default_rng(0)
+    data = rng.integers(-2000, 2000, size=(32, 8), dtype=np.int16)
+    packed = litke.pack_samples(data)
+    full = litke.unpack_samples(packed, 32, 8)
+    drop = litke.unpack_samples_drop_ttl(packed, 32, 8)
+    np.testing.assert_array_equal(drop, full[:, 1:])
+
+
+def test_unpack_drop_ttl_matches_full_slice_odd():
+    rng = np.random.default_rng(1)
+    data = rng.integers(-2000, 2000, size=(20, 7), dtype=np.int16)
+    # Odd pack uses raw 16-bit for ch0; keep in int16 range
+    packed = litke.pack_samples(data)
+    full = litke.unpack_samples(packed, 20, 7)
+    drop = litke.unpack_samples_drop_ttl(packed, 20, 7)
+    np.testing.assert_array_equal(drop, full[:, 1:])
+
+
 def test_unpack_ttl_matches_full_unpack_even():
     """TTL-only path must be bit-identical to full unpack[:, 0] (even)."""
     rng = np.random.default_rng(42)
@@ -105,16 +124,22 @@ def test_unpack_ttl_matches_full_unpack_odd():
 
 
 def test_get_ttl_identity_vs_full_decode(tmp_path):
-    """Recording.get_ttl must match drop_ttl=False stream[:, 0]."""
+    """Recording.get_ttl must match electrode 0 of a full (drop_ttl=False) decode.
+
+    With drop_ttl=True, ``_read_raw_samples`` no longer includes TTL — compare
+    against an explicit full-stream open instead.
+    """
     rng = np.random.default_rng(44)
     n_samples, n_elec = 120, 8
     data = rng.integers(-400, 400, size=(n_samples, n_elec), dtype=np.int16)
     path = _write_litke_file(tmp_path / 'ttl_id.bin', data)
     with litke.LitkeRecording(path, drop_ttl=True) as rec:
         got = rec.get_ttl()
-        full = rec._read_raw_samples(0, n_samples)
-        np.testing.assert_array_equal(got, full[:, 0])
-        np.testing.assert_array_equal(rec.get_ttl(10, 25), full[10:35, 0])
+        got_slice = rec.get_ttl(10, 25)
+    with litke.LitkeRecording(path, drop_ttl=False) as rec_full:
+        full = rec_full._read_raw_samples(0, n_samples)
+    np.testing.assert_array_equal(got, full[:, 0])
+    np.testing.assert_array_equal(got_slice, full[10:35, 0])
 
 
 def test_litke_recording_roundtrip(tmp_path):
