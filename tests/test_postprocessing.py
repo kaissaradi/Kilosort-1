@@ -1,8 +1,10 @@
 """Unit tests for kilosort.postprocessing (CPU-safe)."""
 import numpy as np
 import pytest
+import torch
 
-from kilosort.postprocessing import remove_duplicates
+from kilosort.clustering_qr import get_data_cpu, xy_templates
+from kilosort.postprocessing import make_pc_features, remove_duplicates
 
 
 def reference_remove_duplicates(spike_times, spike_clusters, dt=15):
@@ -91,3 +93,174 @@ def test_remove_duplicates_gapped_cluster_ids():
     out_t, out_c, keep = remove_duplicates(spike_times, spike_clusters, dt=15)
     np.testing.assert_array_equal(keep, np.array([True, True, True, True]))
     np.testing.assert_array_equal(out_c, spike_clusters)
+
+
+# ---------------------------------------------------------------------------
+# make_pc_features: group-by path vs historical per-cluster mask loop
+# ---------------------------------------------------------------------------
+
+
+def reference_make_pc_features(ops, spike_templates, spike_clusters, tF):
+    """Independent historical loop using `spike_clusters == i` masks.
+
+    Same get_data_cpu + mean-norm channel ranking as production; only the
+    cluster iteration / template unique gather differs from the optimized path.
+    Mutates tF in-place (clone before calling).
+    """
+    xy, iC = xy_templates(ops)
+    n_templates = iC.shape[1]
+    n_clusters = np.unique(spike_clusters).size
+    n_chans = ops['nearest_chans']
+    feature_ind = np.zeros((n_clusters, n_chans), dtype=np.uint32)
+
+    for i in np.unique(spike_clusters):
+        iunq = np.unique(spike_templates[spike_clusters == i]).astype(int)
+        ix = torch.from_numpy(np.zeros(n_templates, bool))
+        ix[iunq] = True
+        Xd, igood, ichan = get_data_cpu(
+            ops, xy, iC, spike_templates, tF, None, None,
+            dmin=ops['dmin'], dminx=ops['dminx'], ix=ix, merge_dim=False,
+        )
+        spike_mean = Xd.mean(0)
+        chan_norm = torch.linalg.norm(spike_mean, dim=1)
+        _, ind = torch.sort(chan_norm, descending=True)
+        tF[igood, :] = Xd[:, ind[:n_chans], :]
+        feature_ind[i, :] = ichan[ind[:n_chans]].cpu().numpy()
+
+    tF = torch.permute(tF, (0, 2, 1))
+    return tF, feature_ind
+
+
+def _synthetic_ops_pc_features(
+    n_channels=40, n_templates=12, nearest_chans=8, seed=0,
+):
+    """Minimal ops dict for xy_templates / make_pc_features (CPU, no MEA)."""
+    rng = np.random.default_rng(seed)
+    xc = np.zeros(n_channels, dtype=np.float64)
+    yc = np.arange(n_channels, dtype=np.float64) * 20.0
+
+    # iCC: nearest_chans unique neighbors per channel (by |y| distance)
+    iCC = np.empty((nearest_chans, n_channels), dtype=np.int64)
+    for c in range(n_channels):
+        iCC[:, c] = np.argsort(np.abs(yc - yc[c]))[:nearest_chans]
+
+    # One best channel per template, spread along the probe
+    iU = np.linspace(0, n_channels - 1, n_templates).round().astype(np.int64)
+    # Ensure uniqueness when n_templates <= n_channels
+    if n_templates <= n_channels:
+        # stable unique-ify while keeping spread
+        seen = set()
+        for k in range(n_templates):
+            v = int(iU[k])
+            while v in seen:
+                v = (v + 1) % n_channels
+            seen.add(v)
+            iU[k] = v
+
+    return {
+        'xc': xc,
+        'yc': yc,
+        'iCC': torch.from_numpy(iCC),
+        'iU': torch.from_numpy(iU),
+        'nearest_chans': nearest_chans,
+        'dmin': 20.0,
+        'dminx': 32.0,
+        # not read by make_pc_features but keeps ops realistic
+        '_rng_seed': seed,
+        '_unused': rng,
+    }
+
+
+def _synthetic_spikes_pc_features(
+    n_templates, nearest_chans, n_pcs, n_spikes, n_clusters, seed=1,
+    multi_template_clusters=True,
+):
+    """Dense cluster labels 0..K-1 with optional multi-template merges."""
+    rng = np.random.default_rng(seed)
+    spike_templates = rng.integers(0, n_templates, size=n_spikes).astype(np.int64)
+
+    if multi_template_clusters:
+        # Map templates -> clusters so some clusters own several templates
+        template_to_cluster = np.zeros(n_templates, dtype=np.int64)
+        # First n_clusters templates get identity; rest fold into existing
+        for t in range(n_templates):
+            template_to_cluster[t] = t if t < n_clusters else (t % n_clusters)
+        spike_clusters = template_to_cluster[spike_templates].astype(np.int32)
+    else:
+        # 1:1 when n_templates == n_clusters; else mod
+        spike_clusters = (spike_templates % n_clusters).astype(np.int32)
+
+    # Ensure every cluster appears at least once
+    for c in range(n_clusters):
+        if not np.any(spike_clusters == c):
+            spike_clusters[c % n_spikes] = c
+            spike_templates[c % n_spikes] = c % n_templates
+
+    tF = torch.from_numpy(
+        rng.standard_normal((n_spikes, nearest_chans, n_pcs)).astype(np.float32)
+    )
+    return spike_templates, spike_clusters, tF
+
+
+def test_make_pc_features_identity_vs_historical_mask_loop():
+    n_templates, nearest_chans, n_pcs = 12, 8, 6
+    n_spikes, n_clusters = 800, 7
+    ops = _synthetic_ops_pc_features(
+        n_channels=40, n_templates=n_templates, nearest_chans=nearest_chans, seed=11,
+    )
+    spike_templates, spike_clusters, tF = _synthetic_spikes_pc_features(
+        n_templates, nearest_chans, n_pcs, n_spikes, n_clusters, seed=12,
+        multi_template_clusters=True,
+    )
+
+    # make_pc_features mutates tF in-place — independent clones for each path
+    got_tF, got_ind = make_pc_features(
+        ops, spike_templates, spike_clusters, tF.clone()
+    )
+    ref_tF, ref_ind = reference_make_pc_features(
+        ops, spike_templates, spike_clusters, tF.clone()
+    )
+
+    assert got_tF.shape == (n_spikes, n_pcs, nearest_chans)
+    assert got_ind.shape == (n_clusters, nearest_chans)
+    assert torch.equal(got_tF, ref_tF)
+    np.testing.assert_array_equal(got_ind, ref_ind)
+
+
+def test_make_pc_features_identity_one_to_one_clusters():
+    n_templates = n_clusters = 10
+    nearest_chans, n_pcs, n_spikes = 6, 3, 400
+    ops = _synthetic_ops_pc_features(
+        n_channels=32, n_templates=n_templates, nearest_chans=nearest_chans, seed=21,
+    )
+    spike_templates, spike_clusters, tF = _synthetic_spikes_pc_features(
+        n_templates, nearest_chans, n_pcs, n_spikes, n_clusters, seed=22,
+        multi_template_clusters=False,
+    )
+
+    got_tF, got_ind = make_pc_features(
+        ops, spike_templates, spike_clusters, tF.clone()
+    )
+    ref_tF, ref_ind = reference_make_pc_features(
+        ops, spike_templates, spike_clusters, tF.clone()
+    )
+
+    assert torch.equal(got_tF, ref_tF)
+    np.testing.assert_array_equal(got_ind, ref_ind)
+
+
+def test_make_pc_features_permutes_dims_for_phy():
+    n_templates, nearest_chans, n_pcs, n_spikes = 4, 5, 3, 50
+    ops = _synthetic_ops_pc_features(
+        n_channels=20, n_templates=n_templates, nearest_chans=nearest_chans, seed=31,
+    )
+    spike_templates, spike_clusters, tF = _synthetic_spikes_pc_features(
+        n_templates, nearest_chans, n_pcs, n_spikes, n_clusters=4, seed=32,
+        multi_template_clusters=False,
+    )
+    out, ind = make_pc_features(
+        ops, spike_templates, spike_clusters, tF.clone()
+    )
+    assert out.shape == (n_spikes, n_pcs, nearest_chans)
+    assert ind.dtype == np.uint32
+    assert ind.shape == (4, nearest_chans)
