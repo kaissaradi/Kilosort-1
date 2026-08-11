@@ -105,11 +105,16 @@ def neigh_mat(Xd, nskip=1, n_neigh=10, max_sub=25000, device=None):
         _, kn = index.search(Xd, n_neigh)     # actual search
 
     # create sparse matrix version of kn with ones where the neighbors are
-    # M is n_samples by n_nodes, adjacency matrix
-    dexp = np.ones(kn.shape, np.float32)    
-    rows = np.tile(np.arange(n_samples)[:, np.newaxis], (1, n_neigh)).flatten()
-    M   = csr_matrix((dexp.flatten(), (rows, kn.flatten())),  # (data, (row,col))
-                     (kn.shape[0], n_nodes))                  # (shape)
+    # M is n_samples by n_nodes, adjacency matrix.
+    # Avoid materializing a full ones(kn.shape) slab + 2D tile: one repeat +
+    # ravel matches the old CSR contents exactly.
+    nnz = kn.size
+    M = csr_matrix(
+        (np.ones(nnz, np.float32),
+         (np.repeat(np.arange(n_samples, dtype=np.int64), n_neigh),
+          kn.ravel())),
+        shape=(n_samples, n_nodes),
+    )
 
     # self connections are set to 0
     skip_idx = np.arange(0, n_samples, nskip)
