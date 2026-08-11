@@ -1593,21 +1593,60 @@ pytest tests/ -q --deselect tests/test_full_pipeline.py \
     <li><code>litke.unpack_ttl</code> / <code>_read_ttl_samples</code>: electrode-0 decode without
       materializing full (n, n_elec) slabs. Identity vs full unpack and real bin2py oracle col0.</li>
     <li><code>mean_cluster_templates</code>: fill occupied labels first; empty NaN slab once.</li>
-    <li>Full data000 e2e (893 s, no tmax) running to
-      <code>…/sorted/20251204A/data000/kilosort4_litke_full_data000/</code> (non-golden).</li>
+  </ul>
+
+  <h3>Cycle 10 — Full data000 e2e SUCCESS + continuous audit landings</h3>
+  <p>
+    Full Litke sort (no tmax) on fieldlab CPU finished green. Results (non-golden):
+    <code>…/sorted/20251204A/data000/kilosort4_litke_full_data000/</code>
+  </p>
+  <table>
+    <thead><tr><th>Metric</th><th>Value</th></tr></thead>
+    <tbody>
+      <tr><td>Recording</td><td>17.86M samples × 519 ch · 893 s · 20 kHz · array 1551</td></tr>
+      <tr><td>Wall clock (script)</td><td>13896 s (~3.86 h)</td></tr>
+      <tr><td>ops runtime total</td><td>13610 s</td></tr>
+      <tr><td>Spikes (detect → after dupe drop)</td><td>7.95M → 7.76M</td></tr>
+      <tr><td>Units / good</td><td>148 / 101 (KSLabel)</td></tr>
+      <tr><td>TTL onsets</td><td>120 saved</td></tr>
+      <tr><td>Params</td><td>Th 8/6 · dmin 30 · max_channel_distance 10 · max_peels 100 · nblocks 0 · CPU</td></tr>
+    </tbody>
+  </table>
+  <p><strong>Runtime by step (ops)</strong> — peel dominates:</p>
+  <table>
+    <thead><tr><th>Step</th><th>Seconds</th><th>% of ops total</th></tr></thead>
+    <tbody>
+      <tr><td>st0 universal detect</td><td>6296</td><td>46.3%</td></tr>
+      <tr><td>st learned extract</td><td>4173</td><td>30.7%</td></tr>
+      <tr><td>clu final cluster</td><td>2522</td><td>18.5%</td></tr>
+      <tr><td>clu0 first cluster</td><td>529</td><td>3.9%</td></tr>
+      <tr><td>postproc</td><td>49</td><td>0.4%</td></tr>
+      <tr><td>preproc</td><td>26</td><td>0.2%</td></tr>
+      <tr><td>merge</td><td>9</td><td>0.1%</td></tr>
+      <tr><td>drift</td><td>~0</td><td>(nblocks=0)</td></tr>
+    </tbody>
+  </table>
+  <p>
+    Note: this e2e process started mid-session; many cycle-10 commits landed
+    <em>during</em> the run and will apply on the next full sort.
+  </p>
+  <ul>
+    <li>hp FFT cache · peel U@W precompute · extract unit cache · in-place peel</li>
+    <li>CPU eager template_match · scratch As/Amaxs reuse · Litke drop_ttl unpack</li>
+    <li>merge dense ns · NaN/empty guards · neigh_mat CSR · free st0 before extract</li>
   </ul>
 
   <h3>Plausible next (ordered)</h3>
   <ol>
-    <li><strong>Finish full data000 e2e</strong> — record units/spikes/runtime table; profile if needed.</li>
-    <li><strong>Run --runslow once</strong> — NP mini full pipeline overnight; close integration audit gap.</li>
-    <li><strong>Hunt cycle-5-class latent bugs</strong> + small identity-locked CPU wins.</li>
-    <li><strong>Swarm speed</strong> only if profile shows it — assume_sorted / check_split reuse.</li>
+    <li><strong>Profile st0/st peel on next full run</strong> with cycle-10 code — confirm wall drop.</li>
+    <li><strong>Sparse whitening apply</strong> (allclose) — preprocess tax every batch.</li>
+    <li><strong>Deferred residual via index_add_</strong> if identity-proven — peel still ~77% combined.</li>
+    <li><strong>Run --runslow once</strong> — NP mini full pipeline overnight.</li>
+    <li><strong>MEA auto x_centers</strong> for 2D probes if clustering memory spikes.</li>
   </ol>
   <p class="note">
-    Already done: cycle-5–8 correctness + Litke + oracle + short e2e + pad/NaN;
-    <strong>cycle-9 TTL-only unpack</strong> (memory/speed for stim export). Continuous goal:
-    never stop iterating verified fixes. Peel dominates wall time. Push when green.
+    Continuous goal: never stop iterating verified fixes. Peel (st0+st) is still
+    ~77% of wall. Push when green. 126+ unit tests on fast gate.
   </p>
 </section>
 
@@ -1621,7 +1660,7 @@ pytest tests/ -q --deselect tests/test_full_pipeline.py \
   </p>
   <p class="mono" style="font-size:0.8rem;color:var(--muted)">
     File: docs/MEA_FIELD_TEST_CONTEXT.html · Branch: mea-optimizations · Host: fieldlab ·
-    Cycles 1–9 · TTL unpack + full e2e · 2026-08-11
+    Cycles 1–10 · full data000 SUCCESS · 2026-08-11
   </p>
 </section>
 
