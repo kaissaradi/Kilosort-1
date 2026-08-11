@@ -279,9 +279,9 @@
       <div><strong>Branch</strong> · mea-optimizations</div>
       <div><strong>Fork</strong> · kaissaradi/Kilosort-1</div>
       <div><strong>Survey date</strong> · 2026-08-10</div>
-      <div><strong>Updated</strong> · 2026-08-10 · cycle 5 bugfix + handoff</div>
-      <div><strong>HEAD</strong> · b53de47 code · ahead origin (see §15)</div>
-      <div><strong>Status</strong> · Living brief · cycles 1–5 · e2e/Litke IO still pending</div>
+      <div><strong>Updated</strong> · 2026-08-10 · cycle 6 native Litke IO</div>
+      <div><strong>HEAD</strong> · see §15 / <code>git rev-parse --short HEAD</code></div>
+      <div><strong>Status</strong> · Living brief · cycles 1–6 · Litke file_object live · e2e still pending</div>
     </div>
   </div>
   <div class="accent-bar"></div>
@@ -1007,7 +1007,7 @@ nproc; free -h; nvidia-smi || true</code></pre>
 
 <!-- 15 CPU OPTIMIZATION LOG -->
 <section id="cpu-log">
-  <h2>15 · CPU optimization log (living · cycles 1–5)</h2>
+  <h2>15 · CPU optimization log (living · cycles 1–6)</h2>
   <p class="lede">
     Fieldlab is the gate for pure-CPU correctness. Prefer accuracy-preserving
     fixes with identity tests. Full multi-GB MEA e2e is a non-goal as a CI gate
@@ -1016,10 +1016,10 @@ nproc; free -h; nvidia-smi || true</code></pre>
   </p>
 
   <div class="callout ok">
-    <div class="tag">Snapshot · 2026-08-10 · cycle 5 handoff</div>
-    Branch <code>mea-optimizations</code> · HEAD <code>b53de47</code>
-    (bugfix + micro-opts) · prior test-only <code>089db86</code>
-    (<code>make_pc_features</code>) · <code>get_data_cpu</code> <code>64eace1</code> ·
+    <div class="tag">Snapshot · 2026-08-10 · cycle 6 native Litke IO</div>
+    Branch <code>mea-optimizations</code> · native
+    <code>kilosort/litke.py</code> (<code>LitkeRecording</code> file_object) ·
+    no bin2py / Cython / convert required for streaming ·
     <strong>local ahead of origin</strong> · <strong>do not push</strong> unless
     user asks. Tip: <code>git rev-parse --short HEAD</code>.
   </div>
@@ -1028,8 +1028,34 @@ nproc; free -h; nvidia-smi || true</code></pre>
     <div class="tag">Fast suite gate (latest verified)</div>
     <code>pytest tests/ -q --deselect tests/test_full_pipeline.py
     --deselect tests/test_spikedetect.py::test_wpca_wtemp</code>
-    → <strong>75 passed, 2 deselected</strong>
-    (was 66 after get_data_cpu; was 60 post–cycle&nbsp;4).
+    → include <code>tests/test_litke.py</code> (8 identity/smoke) ·
+    re-run and record pass count after commit.
+  </div>
+
+  <div class="callout ok">
+    <div class="tag">Cycle 6 · Litke without convert</div>
+    <ul>
+      <li><code>kilosort/litke.py</code> — pure-Python Vision header parse + Numba
+        pack/unpack matching bin2py bit layout (even 520 / odd 513 electrodes).</li>
+      <li><code>LitkeRecording(path, drop_ttl=True)</code> is a Kilosort
+        <code>file_object</code>: shape <code>(n_samples, n_chan)</code>, dtype int16,
+        multi-file folders joined like <code>PyBinFileReader</code>.</li>
+      <li>Default <code>drop_ttl=True</code> matches lab converter (TTL ch0 dropped →
+        519 or 512 channels for probe maps).</li>
+      <li>Field proof: <code>…/raw/20251204A/data000</code> → shape
+        <code>(17860000, 519)</code>, array_id 1551, fs 20&nbsp;kHz, ~0.04&nbsp;s for 20k
+        samples (~500k samp/s) on fieldlab CPU — C/CUDA not needed.</li>
+      <li>Wire-up:
+        <pre style="margin:0.4rem 0 0">from kilosort.litke import LitkeRecording
+from kilosort.io import BinaryRWFile
+rec = LitkeRecording('/path/to/data000')  # folder or single .bin
+bfile = BinaryRWFile(filename=str(rec.paths[0]), n_chan_bin=rec.n_chan,
+                     fs=int(rec.fs), file_object=rec, device='cpu')
+# or run_kilosort(..., file_object=rec, settings={..., 'n_chan_bin': rec.n_chan, 'fs': rec.fs})</pre>
+      </li>
+      <li><strong>Non-goal / not done:</strong> full e2e sort on data000; probe mat auto-load;
+        writing Litke; replacing MEA-fieldlab offline convert for archival .dat.</li>
+    </ul>
   </div>
 
   <h3>Results at a glance</h3>
@@ -1486,10 +1512,10 @@ git status -sb    # expect mea-optimizations, clean or report-only delta
 python -c "import kilosort; print(kilosort.__file__)"
 
 # Pure CPU units (no wpca SIGILL path)
-pytest tests/test_ccg.py tests/test_spikedetect.py tests/test_postprocessing.py \
-       tests/test_swarmsplitter.py tests/test_preprocessing.py \
-       tests/test_utils.py tests/test_template_matching.py \
-       tests/test_get_data_cpu.py \
+pytest tests/test_litke.py tests/test_ccg.py tests/test_spikedetect.py \
+       tests/test_postprocessing.py tests/test_swarmsplitter.py \
+       tests/test_preprocessing.py tests/test_utils.py \
+       tests/test_template_matching.py tests/test_get_data_cpu.py \
        -k "not wpca_wtemp" -q
 
 # Default fast gate
@@ -1511,33 +1537,22 @@ pytest tests/ -q --deselect tests/test_full_pipeline.py \
     <tbody>
       <tr>
         <td>Full pipeline on real data <strong>20251204A</strong> (shortest run)</td>
-        <td><strong>Not started</strong></td>
+        <td><strong>Not started</strong> (IO unblocked)</td>
         <td>
-          Correct exp id is <code>20251204A</code> (not “20261204A”).
-          Raw sizes on fieldlab:
-          <code>data000</code> <strong>13&nbsp;G</strong> (8 files, <strong>shortest</strong>) ·
-          <code>data002</code> 24&nbsp;G ·
-          <code>data003</code> 49&nbsp;G (28 files) ·
-          <code>data001</code> 105&nbsp;G.
-          User may guess <code>data003</code>; agents should prefer <code>data000</code>
-          for shortest unless the user insists on <code>data003</code>.
-          No converted <code>chunk*.bin</code> on fieldlab for a full re-sort—only sorted
-          result dirs + raw Litke bins. Host is 15&nbsp;GiB RAM / 4-core / no GPU: full multi-GB
-          e2e is heavy. Plan a fixture from 1–few Litke bins + <code>tmax</code>, or convert
-          a short slice of <code>data000</code>.
+          Correct exp id is <code>20251204A</code>. Prefer <code>data000</code>
+          (13&nbsp;G, 8 files, shortest; 519 ch, 20&nbsp;kHz, array_id 1551).
+          Use <code>LitkeRecording</code> + <code>tmax</code> for a short CPU smoke;
+          do not clobber <code>data/sorted/</code> goldens. Host 15&nbsp;GiB / 4c / no GPU.
         </td>
       </tr>
       <tr>
-        <td>IO: read non-transposed Litke raw without remapping every time</td>
-        <td><strong>Not started</strong></td>
+        <td>IO: stream Litke raw without offline convert</td>
+        <td><strong>Done (cycle 6)</strong></td>
         <td>
-          Current contract: converter does
-          <code>samples.T.astype(int16)</code> → <code>(ntime, nchan)</code> for Kilosort
-          <code>BinaryRWFile</code>. Lab tools:
-          <code>MEA-fieldlab/…/convert_join_litke_datasets_for_yass.py</code>,
-          <code>bin2py.PyBinFileReader(..., is_row_major=True)</code>.
-          A native Litke <code>BinaryFile</code> subclass (or layout flag) is requested but
-          not implemented.
+          <code>kilosort.litke.LitkeRecording</code> as <code>file_object</code>
+          (TTL dropped by default → 519/512 ch int16, time×chan). Tests:
+          <code>tests/test_litke.py</code>. Lab bin2py still valid for archival convert;
+          not required for sorting on fieldlab. No Cython install needed.
         </td>
       </tr>
     </tbody>
@@ -1557,16 +1572,18 @@ pytest tests/ -q --deselect tests/test_full_pipeline.py \
 
   <h3>Plausible next (ordered)</h3>
   <ol>
-    <li><strong>Short fixture / synthetic GT</strong> — 1 batch × 512-ch planted spikes (~60&nbsp;MB) or convert first file of <code>data000</code> + <code>tmax</code>; smoke CPU <code>run_kilosort</code> to a non-golden results path. Prefer tiny synthetic for CI; real slice for field proof.</li>
+    <li><strong>Short CPU e2e via LitkeRecording</strong> — <code>data000</code> +
+      <code>tmax</code> (e.g. 2–10&nbsp;s) + 30&nbsp;µm 519 probe + production Th 8/6;
+      write results under a <em>non-golden</em> path. Prove pipeline eats native Litke.</li>
     <li><strong>Single-batch trailing pad</strong> — when <code>n_batches==1</code>, right edge of padded batch stays zeros (IO); accuracy for short clips.</li>
     <li><strong>NaN guards</strong> — <code>yweighted</code> / <code>compute_spike_positions</code> when all weights mask to 0 (finite fallback; bit-identical on normal spikes).</li>
     <li><strong>Swarm speed</strong> — pass <code>assume_sorted=True</code> for chronological meta; reuse <code>ix1</code>/<code>ix2</code> in <code>check_split</code>.</li>
-    <li><strong>Litke BinaryFile</strong> — unblock bin2py (Cython or pure unpack) only after a short converted fixture proves the pipeline; match lab converter layout.</li>
     <li><strong>template_match identity test</strong> — eager path on synthetic batch (do not rewrite max/gather).</li>
   </ol>
   <p class="note">
     Already done: <code>get_data_cpu</code> scatter, group-by merge/PC, labels_in, clip/spike caps,
-    cycle-5 IO/whitening/empty-tree/CCG/peel/device-kNN. Profile before more clustering micro-opts.
+    cycle-5 IO/whitening/empty-tree/CCG/peel/device-kNN, <strong>cycle-6 native Litke
+    <code>file_object</code></strong>. No C/CUDA unpack — Numba is enough (~500k samp/s).
   </p>
 </section>
 
@@ -1579,7 +1596,7 @@ pytest tests/ -q --deselect tests/test_full_pipeline.py \
   </p>
   <p class="mono" style="font-size:0.8rem;color:var(--muted)">
     File: docs/MEA_FIELD_TEST_CONTEXT.html · Branch: mea-optimizations · Host: fieldlab ·
-    Code HEAD: b53de47 · Cycles 1–5 · e2e/Litke IO not started · 2026-08-10
+    Cycles 1–6 · Litke native IO · e2e still pending · 2026-08-10
   </p>
 </section>
 
