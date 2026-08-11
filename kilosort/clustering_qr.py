@@ -569,8 +569,16 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
     nearest_center, _, _ = get_nearest_centers(xy, xcent, ycent)
     # Membership set: `ii not in nearest_center` on a torch tensor is a full
     # linear scan every empty lattice point (common on sparse MEA grids).
+    # Also precompute boolean ix masks once so each occupied center does not
+    # re-scan nearest_center (O(n_templates) per lattice point).
     occupied_centers = set(nearest_center.unique().tolist())
     total_centers = len(occupied_centers)
+    n_templates = int(nearest_center.numel())
+    center_ix = {}
+    for lab, idxs in group_indices_by_label(nearest_center.cpu().numpy()).items():
+        ix = torch.zeros(n_templates, dtype=torch.bool)
+        ix[idxs] = True
+        center_ix[lab] = ix
 
     clu = np.zeros(nsp, 'int32')
     # Collect per-center templates then cat once — avoids O(n_centers)
@@ -595,8 +603,8 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                     continue
                 else:
                     t += 1
-                ix = (nearest_center == ii)
-                ntemp = ix.sum()
+                ix = center_ix[ii]
+                ntemp = int(ix.sum())
 
                 v = False
                 if t % 10 == 0:

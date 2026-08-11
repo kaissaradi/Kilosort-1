@@ -260,33 +260,54 @@ def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda'),
     niter = 40
     nb = (NT-1)//niter+1
 
-    W = ops['wTEMP'].unsqueeze(1)
+    # Cache unsqueezed templates across batches (wTEMP is fixed for the pass).
+    if scratch is not None and scratch.get('W') is not None:
+        W = scratch['W']
+    else:
+        W = ops['wTEMP'].unsqueeze(1)
+        if scratch is not None:
+            scratch['W'] = W
     B = conv1d(X.unsqueeze(1), W, padding=nt//2)
     # Reuse (Nfilt, NT) peak buffers across batches when sizes match — saves
-    # ~3×Nfilt×NT alloc/zero on every batch of universal detect (dominant stage).
+    # ~3×Nfilt×NT alloc on every batch of universal detect (dominant stage).
     # imaxs is signed template index encoding; int32 covers n_templates and
     # peak-pool indices on MEA scales and halves the int64 slab (~0.6 GiB at
     # 2600×60k vs float32 As/Amaxs peers).
+    #
+    # Do NOT zero_() on reuse: the niter loop writes every column of As /
+    # Amaxs / imaxs exactly once (chunks tile [0, NT)). zero_ was pure
+    # bandwidth on the hottest path (~3×Nfilt×NT writes per batch).
     if (scratch is not None
+            and scratch.get('As') is not None
             and scratch['As'].shape == (Nfilt, NT)
             and scratch['As'].device == device
             and scratch['imaxs'].dtype == torch.int32):
-        As = scratch['As'].zero_()
-        Amaxs = scratch['Amaxs'].zero_()
-        imaxs = scratch['imaxs'].zero_()
+        As = scratch['As']
+        Amaxs = scratch['Amaxs']
+        imaxs = scratch['imaxs']
     else:
-        As    = torch.zeros((Nfilt, NT), device=device)
-        Amaxs = torch.zeros((Nfilt, NT), device=device)
-        imaxs = torch.zeros((Nfilt, NT), dtype=torch.int32, device=device)
+        As    = torch.empty((Nfilt, NT), device=device)
+        Amaxs = torch.empty((Nfilt, NT), device=device)
+        imaxs = torch.empty((Nfilt, NT), dtype=torch.int32, device=device)
         if scratch is not None:
             scratch['As'] = As
             scratch['Amaxs'] = Amaxs
             scratch['imaxs'] = imaxs
     # iC2 is (nC2, Nfilt); flattening it lets the neighbour max below use
     # index_select, which reaches the same elements on a faster path than
-    # advanced indexing.
-    iC2_flat = iC2.reshape(-1)
-    nC2 = iC2.shape[0]
+    # advanced indexing. Cache flat view on scratch when iC2 is stable.
+    if (scratch is not None
+            and scratch.get('iC2_flat') is not None
+            and scratch.get('iC2_id') is id(iC2)):
+        iC2_flat = scratch['iC2_flat']
+        nC2 = scratch['nC2']
+    else:
+        iC2_flat = iC2.reshape(-1)
+        nC2 = iC2.shape[0]
+        if scratch is not None:
+            scratch['iC2_flat'] = iC2_flat
+            scratch['nC2'] = nC2
+            scratch['iC2_id'] = id(iC2)
 
     # NOTE on the body: do not replace its max/gather pair with a max/min pair.
     # That rewrite is 1.46x faster on that statement but resolves exact

@@ -85,7 +85,14 @@ def find_merges(crat, cc, cneg):
         cneg[y]   = cneg[y]   + cneg[x]
         cneg[:,y] = cneg[:,y] + cneg[:,x]
 
-        crat[y] = cc[y]/cneg[y]
+        # divide-where: zero cneg after prior merges must not inject NaN into
+        # the remaining tree (matches initial crat build in merge_reduce).
+        crat_y = np.divide(
+            cc[y], cneg[y],
+            out=np.zeros_like(cc[y], dtype=np.float64),
+            where=cneg[y] != 0,
+        )
+        crat[y] = crat_y
         crat[:,y] = crat[y]
         crat[y,y] = -1
         crat[x] = -1

@@ -83,11 +83,9 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None,
     nt = ops['nt']
     
     tiwave = torch.arange(-(nt//2), nt//2+1, device=device) 
-    ctc = prepare_matching(ops, U)
     # U is fixed for the whole extract pass: scale, time-domain waveforms, and
-    # ctc are batch-invariant. Precompute once (run_matching used to redo this
-    # every batch — pure overhead across hundreds of MEA batches).
-    match_cache = _matching_unit_cache(ops, U)
+    # ctc are batch-invariant. Build both in one pass over U.
+    ctc, match_cache = prepare_matching(ops, U, return_cache=True)
     spike_capacity = get_spike_buffer_capacity(bfile.n_batches)
     # Learned extract often finds a similar spike count to universal detect;
     # size the buffer from that hint so we avoid a mid-pass 2× realloc of tF.
@@ -198,7 +196,13 @@ def postprocess_templates(Wall, ops, clu, st, tF, device=torch.device('cuda')):
     return Wall3
 
 
-def prepare_matching(ops, U):
+def prepare_matching(ops, U, return_cache=False):
+    """Build scaled cross-template filter bank (and optional unit_cache).
+
+    When ``return_cache=True``, also returns the batch-invariant peel tensors
+    (s / Us / U_time / W) so extract can avoid a second pass over U for
+    ``_matching_unit_cache``.
+    """
     nt = ops['nt']
     W = ops['wPCA'].contiguous()
     WtW = conv1d(W.reshape(-1, 1,nt), W.reshape(-1, 1 ,nt), padding = nt)
@@ -219,7 +223,13 @@ def prepare_matching(ops, U):
     s = nm.clamp_min(1e-30).rsqrt()
     ctc = ctc * s.view(-1, 1, 1)
 
-    return ctc
+    if not return_cache:
+        return ctc
+
+    Us = U * s.view(-1, 1, 1)
+    # (n_units, n_chan, nt); peel permutes selected rows to (C, n_sel, nt)
+    U_time = torch.einsum('ijk, jl -> ikl', U, W)
+    return ctc, {'s': s, 'Us': Us, 'U_time': U_time, 'W': W}
 
 
 def _matching_unit_cache(ops, U):
@@ -227,8 +237,13 @@ def _matching_unit_cache(ops, U):
 
     U is fixed for the whole extract pass, so s / Us / U_time only need to be
     built once. Returning a small dict keeps run_matching's call surface stable
-    for tests that invoke it directly.
+    for tests that invoke it directly. Prefer ``prepare_matching(...,
+    return_cache=True)`` when ctc is also needed (single pass over U).
     """
+    # Non-finite empty-template rows must match prepare_matching so B / peel
+    # stay finite when tests / callers skip prepare_matching's nan scrub.
+    if not torch.isfinite(U).all():
+        U = torch.nan_to_num(U, nan=0.0, posinf=0.0, neginf=0.0)
     W = ops['wPCA'].contiguous()
     nm = (U ** 2).sum(-1).sum(-1)
     s = nm.clamp_min(1e-30).rsqrt()
@@ -276,18 +291,20 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=None):
     # Spike times / amps / residual features stay bit-identical to clone path.
     Xres = X
 
+    Th2 = Th * Th
     for t in range(max_peels):
         # Reduce first, then apply relu/square on the (NT,) result.
+        # In-place square avoids a full (NT,) temporary per peel.
         Cfmax, imax = torch.max(B, 0)
         Cfmax = torch.relu(Cfmax)
-        Cfmax = Cfmax * Cfmax
+        Cfmax.mul_(Cfmax)
         Cfmax[:nt] = 0
         Cfmax[-nt:] = 0
 
         Cmax = max_pool1d(Cfmax.view(1, 1, -1), (2*nt+1), stride=1, padding=(nt))
         cmax = Cmax[0, 0]
 
-        cnd1 = cmax > Th**2
+        cnd1 = cmax > Th2
         cnd2 = torch.abs(cmax - Cfmax) < 1e-9
         xs = torch.nonzero(cnd1 & cnd2)
 

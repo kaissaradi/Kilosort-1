@@ -314,6 +314,14 @@ def test_prepare_matching_fused_equals_two_step():
     ctc_nan = prepare_matching(ops, U2)
     assert torch.isfinite(ctc_nan).all()
 
+    # return_cache path: same ctc + cache matching _matching_unit_cache
+    ctc2, cache = prepare_matching(ops, U, return_cache=True)
+    assert torch.equal(ctc2, ctc_got)
+    cache_ref = _matching_unit_cache(ops, U)
+    assert torch.equal(cache['s'], cache_ref['s'])
+    assert torch.equal(cache['Us'], cache_ref['Us'])
+    assert torch.equal(cache['U_time'], cache_ref['U_time'])
+
 
 def test_run_matching_precomputed_U_time_matches_inline_einsum():
     """U_time index path must match historical per-hit einsum subtract.

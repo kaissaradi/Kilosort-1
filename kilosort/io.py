@@ -833,7 +833,10 @@ class BinaryRWFile:
         `_read_padded_raw`.
         """
         nsamp = data.shape[-1]
-        X = torch.zeros((self.n_chan_bin, self.NT + 2*self.nt), device=self.device)
+        # empty: every branch fully writes X (copy + edge-replicate pads).
+        # zeros was pure bandwidth (~n_chan × (NT+2nt) per batch) on the
+        # detect/extract hot path.
+        X = torch.empty((self.n_chan_bin, self.NT + 2*self.nt), device=self.device)
 
         with warnings.catch_warnings():
             # Don't need this, we know about the warning and it doesn't cause
@@ -847,9 +850,9 @@ class BinaryRWFile:
                 bstart = self.imin - self.nt
                 if self.n_batches == 1:
                     # Single batch is also the last. The first-batch path only
-                    # left-pads; without this, X[:, nt+nsamp:] stays zeros and
-                    # edge filters see a hard zero boundary. Match last-batch
-                    # right edge-replicate. Multi-batch path unchanged.
+                    # left-pads; without this, X[:, nt+nsamp:] is unwritten and
+                    # edge filters see garbage. Match last-batch right
+                    # edge-replicate. Multi-batch path unchanged.
                     end = self.nt + nsamp
                     if end > 0 and end < X.shape[1]:
                         X[:, end:] = X[:, end - 1 : end]

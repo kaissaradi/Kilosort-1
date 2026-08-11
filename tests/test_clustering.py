@@ -92,6 +92,38 @@ def test_maketree_empty_and_single_label():
     assert mc == [[0]]
 
 
+def test_find_merges_zero_cneg_stays_finite():
+    """Incremental crat update must not inject NaN when cneg row is zero."""
+    from kilosort.hierarchical import find_merges
+
+    nc = 4
+    # Positive off-diagonal so merges progress; zero one cneg column entirely
+    # after a contrived setup that forces divide-by-zero on a merged row.
+    cc = np.array(
+        [
+            [1.0, 0.5, 0.1, 0.0],
+            [0.5, 1.0, 0.2, 0.0],
+            [0.1, 0.2, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+    cneg = np.array(
+        [
+            [1.0, 0.5, 0.1, 0.0],
+            [0.5, 1.0, 0.2, 0.0],
+            [0.1, 0.2, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0],  # zero row/col — divide would NaN
+        ],
+        dtype=np.float64,
+    )
+    crat = np.divide(cc, cneg, out=np.zeros_like(cc), where=cneg != 0)
+    crat = crat - np.diag(np.diag(crat)) - np.eye(nc)
+    xtree, tstat = find_merges(crat.copy(), cc.copy(), cneg.copy())
+    assert xtree.shape == (nc - 1, 3)
+    assert np.isfinite(tstat).all()
+
+
 def test_mstats_zero_adjacency_finite():
     """Empty neighbor graph must not yield NaN ki/kj (0/0)."""
     M = csr_matrix((5, 3), dtype=np.float32)

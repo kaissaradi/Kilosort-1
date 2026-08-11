@@ -84,6 +84,59 @@ def test_nearest_chans_matches_full_argsort_on_unique_distances():
     np.testing.assert_allclose(ds, ds_ref)
 
 
+def test_template_match_scratch_no_zero_matches_fresh_buffers():
+    """Reused empty scratch must match a fresh empty alloc (full overwrite).
+
+    The detect hot path no longer zero_()s As/Amaxs/imaxs between batches;
+    chunks tile [0, NT) so prior garbage cannot leak into peak selection.
+    """
+    from kilosort.spikedetect import template_match
+
+    torch.manual_seed(42)
+    device = torch.device('cpu')
+    n_chan, NT, nt, n_temp, nC, nC2, nsize = 16, 800, 21, 4, 5, 6, 3
+    Nfilt = 20
+    X = torch.randn(n_chan, NT)
+    # Fake ops
+    wTEMP = torch.randn(n_temp, nt)
+    wTEMP = wTEMP / (wTEMP.norm(dim=1, keepdim=True) + 1e-6)
+    ops = {
+        'nt': nt,
+        'settings': {'nt0min': 10, 'n_templates': n_temp},
+        'wTEMP': wTEMP,
+        'Th_universal': 2.0,
+    }
+    iC = torch.randint(0, n_chan, (nC, Nfilt))
+    iC2 = torch.randint(0, Nfilt, (nC2, Nfilt))
+    weigh = torch.randn(nsize, nC, Nfilt)
+    weigh = weigh / (weigh.norm(dim=1, keepdim=True) + 1e-6)
+
+    # Poison scratch with NaNs then run — must still match clean path
+    scratch = {
+        'As': torch.full((Nfilt, NT), float('nan')),
+        'Amaxs': torch.full((Nfilt, NT), float('nan')),
+        'imaxs': torch.full((Nfilt, NT), -999, dtype=torch.int32),
+    }
+    xy1, im1, amp1, ad1 = template_match(
+        X, ops, iC, iC2, weigh, device=device, scratch=scratch
+    )
+    xy2, im2, amp2, ad2 = template_match(
+        X, ops, iC, iC2, weigh, device=device, scratch=None
+    )
+    assert torch.equal(xy1, xy2)
+    assert torch.equal(im1, im2)
+    assert torch.equal(amp1, amp2)
+    assert torch.equal(ad1, ad2)
+    # Second call reuses the same scratch buffers without zeroing
+    xy3, im3, amp3, ad3 = template_match(
+        X, ops, iC, iC2, weigh, device=device, scratch=scratch
+    )
+    assert torch.equal(xy1, xy3)
+    assert torch.equal(im1, im3)
+    assert torch.equal(amp1, amp3)
+    assert torch.equal(ad1, ad3)
+
+
 def test_template_match_body_dispatch_eager_on_cpu(monkeypatch):
     """CPU path must not torch.compile by default (fieldlab / no CUDA)."""
     import kilosort.spikedetect as sd
