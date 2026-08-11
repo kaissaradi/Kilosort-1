@@ -43,7 +43,10 @@ def merge_reduce(cc, cneg, iclust):
     cc = cc + cc.T
     cneg = cneg + cneg.T
 
-    crat = cc/cneg #(cc + cc.T)/ (cneg + cneg.T)
+    # Prefer divide-where so zero cneg never injects NaN into the merge tree
+    # (stock `cc/cneg` did; empty graphs already short-circuit via m==0).
+    crat = np.divide(cc, cneg, out=np.zeros_like(cc, dtype=np.float64),
+                     where=cneg != 0)
     crat = crat -np.diag(np.diag(crat)) - np.eye(crat.shape[0])
 
     xtree, tstat = find_merges(crat, cc, cneg)
