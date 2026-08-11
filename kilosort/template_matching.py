@@ -6,7 +6,7 @@ from torch.nn.functional import conv1d, max_pool2d, max_pool1d
 from tqdm import tqdm
 
 from kilosort import CCG
-from kilosort.utils import log_performance
+from kilosort.utils import get_spike_buffer_capacity, log_performance
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +43,8 @@ def prepare_extract(xc, yc, U, nC, position_limit, device=torch.device('cuda')):
     """
     ds = (xc - xc[:, np.newaxis])**2 +  (yc - yc[:, np.newaxis])**2 
     iCC = np.argsort(ds, 0)[:nC]
+    iCC_mask = np.take_along_axis(ds, iCC, axis=0)
     iCC = torch.from_numpy(iCC).to(device)
-    iCC_mask = np.sort(ds, 0)[:nC]
     iCC_mask = iCC_mask < position_limit**2
     iCC_mask = torch.from_numpy(iCC_mask).to(device)
     iU = torch.argmax((U**2).sum(1), -1)
@@ -66,8 +66,9 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
     
     tiwave = torch.arange(-(nt//2), nt//2+1, device=device) 
     ctc = prepare_matching(ops, U)
-    st = np.zeros((10**6, 3), 'float64')
-    tF  = torch.zeros((10**6, nC , ops['settings']['n_pcs']))
+    spike_capacity = get_spike_buffer_capacity(bfile.n_batches)
+    st = np.zeros((spike_capacity, 3), 'float64')
+    tF = torch.zeros((spike_capacity, nC, ops['settings']['n_pcs']))
     k = 0
     prog = tqdm(
         np.arange(bfile.n_batches, dtype=np.int64),

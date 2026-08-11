@@ -33,6 +33,11 @@ PROBE_URLS = {
 }
 
 
+def get_spike_buffer_capacity(n_batches):
+    """Return an initial spike-buffer size without overallocating short runs."""
+    return min(10**6, max(10**4, 10**4 * n_batches))
+
+
 def template_path(basename='wTEMP.npz'):
     """ currently only one set of example templates to use"""
     return cache_template_path(basename)

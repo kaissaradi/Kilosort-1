@@ -11,7 +11,7 @@ from sklearn.cluster import KMeans
 from sklearn.decomposition import TruncatedSVD
 from tqdm import tqdm
 
-from kilosort.utils import template_path, log_performance
+from kilosort.utils import get_spike_buffer_capacity, template_path, log_performance
 
 
 def my_max2d(X, dt):
@@ -255,8 +255,8 @@ def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda')):
 def nearest_chans(ys, yc, xs, xc, nC, device=torch.device('cuda')):
     ds = (ys - yc[:,np.newaxis])**2 + (xs - xc[:,np.newaxis])**2
     iC = np.argsort(ds, 0)[:nC]
+    ds = np.take_along_axis(ds, iC, axis=0)
     iC = torch.from_numpy(iC).to(device)
-    ds = np.sort(ds, 0)[:nC]
 
     return iC, ds
 
@@ -316,8 +316,9 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
     weigh = torch.permute(weigh, (2, 0, 1)).contiguous()
     weigh = weigh / (weigh**2).sum(1).unsqueeze(1)**.5
 
-    st = np.zeros((10**6, 6), 'float64')
-    tF = np.zeros((10**6, nC , ops['settings']['n_pcs']), 'float32')
+    spike_capacity = get_spike_buffer_capacity(bfile.n_batches)
+    st = np.zeros((spike_capacity, 6), 'float64')
+    tF = np.zeros((spike_capacity, nC, ops['settings']['n_pcs']), 'float32')
 
     k = 0
     nt = ops['nt']
