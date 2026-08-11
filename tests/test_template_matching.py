@@ -6,6 +6,53 @@ from torch.nn.functional import conv1d
 from kilosort.template_matching import merging_function, roll_features
 
 
+def test_roll_features_large_dt_no_index_error():
+    """|dt| can reach ~2*nt from WtW lag; edge fill must not IndexError."""
+    nt, n_pcs, n_chan = 11, 3, 4
+    n_spikes = 5
+    # Fake PCA basis (orthogonal enough for a round-trip smoke).
+    wPCA = torch.randn(n_pcs, nt)
+    wPCA = wPCA / torch.linalg.norm(wPCA, dim=1, keepdim=True)
+    tF = torch.randn(n_spikes, n_chan, n_pcs)
+    Wall = torch.randn(2, n_chan, n_pcs)
+    spike_idx = np.array([0, 2, 4], dtype=np.int64)
+    for dt in (0, 1, 3, nt - 1, nt, nt + 5, -(nt), -(nt + 3)):
+        tF2 = tF.clone()
+        Wall2 = Wall.clone()
+        roll_features(wPCA, tF2, Wall2, spike_idx, clust_idx=0, dt=dt)
+        assert torch.isfinite(tF2).all()
+        assert torch.isfinite(Wall2).all()
+
+
+def test_roll_features_small_dt_matches_unclamped_fill():
+    """For |dt| < T the clamped fill equals the historical edge assignment."""
+    nt, n_pcs, n_chan = 11, 3, 4
+    wPCA = torch.eye(n_pcs, nt)[:n_pcs]  # partial identity-like
+    # denser random but fixed seed
+    rng = torch.Generator().manual_seed(0)
+    wPCA = torch.randn(n_pcs, nt, generator=rng)
+    tF = torch.randn(6, n_chan, n_pcs, generator=rng)
+    Wall = torch.randn(1, n_chan, n_pcs, generator=rng)
+    spike_idx = np.arange(6, dtype=np.int64)
+    dt = 3  # < nt
+    # Historical path
+    W = wPCA.cpu()
+    feats = torch.roll(tF[spike_idx] @ W, shifts=dt, dims=2)
+    temps = torch.roll(Wall[0:1] @ wPCA, shifts=dt, dims=2)
+    feats[:, :, :dt] = feats[:, :, dt].unsqueeze(-1)
+    temps[:, :, :dt] = temps[:, :, dt].unsqueeze(-1)
+    exp_tF = tF.clone()
+    exp_Wall = Wall.clone()
+    exp_tF[spike_idx] = feats @ W.T
+    exp_Wall[0] = temps @ wPCA.T
+
+    got_tF = tF.clone()
+    got_Wall = Wall.clone()
+    roll_features(wPCA, got_tF, got_Wall, spike_idx, 0, dt)
+    assert torch.equal(got_tF, exp_tF)
+    assert torch.equal(got_Wall, exp_Wall)
+
+
 def reference_merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg',
                                check_dt=True, device=torch.device('cpu')):
     """Historical mask-based merge (pre index-map / renorm-cache).

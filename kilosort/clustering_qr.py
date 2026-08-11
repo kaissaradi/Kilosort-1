@@ -327,13 +327,19 @@ def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'), verbose=
         # v2 is the un-explained variance so far for each spike
         v2 = torch.relu(vtot - vexp0)
 
-        # We sample ntry new candidate centroids based on how much un-explained variance they have
-        # more unexplained variance makes it more likely to be selected
-        # Only one of these candidates will be added this iteration. 
-        if subsample:
-            isamp = rev_idx[torch.multinomial(v2[idx], ntry)]
-        else:
-            isamp = torch.multinomial(v2, ntry)
+        # Sample up to ntry candidate centroids weighted by residual variance.
+        # multinomial(..., replacement=False) requires enough positive mass and
+        # enough positive-weight rows; late iters on low-rank MEA patches often
+        # have n_pos < ntry (or sum==0) and used to raise RuntimeError.
+        weights = v2[idx] if subsample else v2
+        if float(weights.sum()) <= 0:
+            break
+        n_pos = int((weights > 0).sum().item())
+        if n_pos <= 0:
+            break
+        n_draw = min(ntry, n_pos)
+        draws = torch.multinomial(weights, n_draw, replacement=False)
+        isamp = rev_idx[draws] if subsample else draws
 
         try:
             # The new centroids to be tested, sampled from the spikes in Xg.

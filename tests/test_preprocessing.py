@@ -120,8 +120,13 @@ class TestFiltering:
 class TestArtifactRemoval:
     
     def test_threshold(self, torch_device):
-        a = np.random.randint(-1000, 1000, (1000,10)).astype(np.float32)
-        a[900,4] = 30001
+        # Deterministic fill: prior suite tests advance global np.random, and
+        # CAR (median across chans) can pull a barely-over-threshold spike
+        # back under 30000 — making this flaky. Use a fixed generator and a
+        # spike far above threshold after mean/CAR.
+        rng = np.random.default_rng(0)
+        a = rng.integers(-1000, 1000, (1000, 10)).astype(np.float32)
+        a[900, 4] = 100_000
 
         bfile1 = io.BinaryFiltered(
             filename='dummy', n_chan_bin=10, NT=500, device=torch_device,

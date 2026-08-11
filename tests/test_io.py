@@ -321,6 +321,19 @@ def test_short_last_batch_does_not_crash(tmp_path):
         assert X.shape == (n_chan, NT + 2 * nt)
 
 
+def test_empty_file_has_zero_batches(tmp_path):
+    """Zero-sample file must not call _get_batch_edges(-1) / go negative."""
+    path = tmp_path / 'empty.bin'
+    path.write_bytes(b'')
+    bfile = io.BinaryRWFile(
+        path, n_chan_bin=4, fs=1000, NT=100, nt=10, device=torch.device('cpu'),
+        dtype='int16',
+    )
+    assert bfile.n_batches_raw == 0
+    assert bfile.n_batches == 0
+    assert bfile.n_samples == 0
+
+
 def test_single_batch_right_edge_replicate(tmp_path):
     """When n_batches==1, right pad must edge-replicate (not stay zeros).
 

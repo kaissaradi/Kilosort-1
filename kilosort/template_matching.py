@@ -405,13 +405,20 @@ def roll_features(wPCA, tF, Wall, spike_idx, clust_idx, dt):
     feats = torch.roll(tF[spike_idx] @ W, shifts=dt, dims=2)
     temps = torch.roll(Wall[clust_idx:clust_idx+1] @ wPCA, shifts=dt, dims=2)
 
-    # For values that "rolled over the edge," set equal to next closest bin
-    if dt > 0:
-        feats[:,:,:dt] = feats[:,:,dt].unsqueeze(-1)
-        temps[:,:,:dt] = temps[:,:,dt].unsqueeze(-1)
-    elif dt < 0:
-        feats[:,:,dt:] = feats[:,:,dt-1].unsqueeze(-1)
-        temps[:,:,dt:] = temps[:,:,dt-1].unsqueeze(-1)
+    # For values that "rolled over the edge," set equal to next closest bin.
+    # Lag from WtW can be |dt| >= T (feature length nt); clamp so edge fill
+    # never indexes out of range (merge path used to IndexError).
+    T = feats.shape[-1]
+    if dt > 0 and T > 0:
+        d = min(int(dt), T - 1)
+        if d > 0:
+            feats[:, :, :d] = feats[:, :, d].unsqueeze(-1)
+            temps[:, :, :d] = temps[:, :, d].unsqueeze(-1)
+    elif dt < 0 and T > 0:
+        d = max(int(dt), 1 - T)
+        if d < 0:
+            feats[:, :, d:] = feats[:, :, d - 1].unsqueeze(-1)
+            temps[:, :, d:] = temps[:, :, d - 1].unsqueeze(-1)
 
     # Project back to PC space and update tF
     tF[spike_idx] = feats @ W.T

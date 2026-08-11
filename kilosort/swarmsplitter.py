@@ -76,8 +76,12 @@ def bimod_score(xproj):
     xm1  = np.max(xbin[:imin+175])
     xm2  = np.max(xbin[imin+175:])
 
-    score = 1 - np.maximum(xmin/xm1, xmin/xm2)
-    return score
+    # Empty half of the projection (or all mass outside [-2, 2]) used to make
+    # xmin/xm1 → inf/nan and poison split criterion. Treat as non-bimodal.
+    if xm1 <= 0 or xm2 <= 0:
+        return 0.0
+    score = 1 - np.maximum(xmin / xm1, xmin / xm2)
+    return float(score)
 
 def check_CCG(st1, st2=None, nbins = 500, tbin  = 1/1000, assume_sorted=False):
     # ACG path: reuse the same array. compute_CCG rebinds sorted views and does

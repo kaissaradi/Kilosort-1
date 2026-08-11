@@ -127,11 +127,20 @@ def make_pc_features(ops, spike_templates, spike_clusters, tF):
     # One stable group-by over spikes: avoids per-cluster full scans of
     # `spike_clusters == i` and a second `np.unique` over the whole vector.
     groups = group_indices_by_label(spike_clusters)
-    n_clusters = len(groups)
     n_chans = ops['nearest_chans']
-    feature_ind = np.zeros((n_clusters, n_chans), dtype=np.uint32)
+    # Size feature_ind by max label + 1 so gapped ids (0,2,5) do not IndexError.
+    # Contiguous 0..K-1 (normal export path) → shape (K, n_chans) as before.
+    if groups:
+        max_label = max(groups.keys())
+        n_rows = max_label + 1 if max_label >= 0 else len(groups)
+    else:
+        n_rows = 0
+    feature_ind = np.zeros((n_rows, n_chans), dtype=np.uint32)
 
     for i, idxs in groups.items():
+        if i < 0 or i >= n_rows:
+            # Negative / out-of-range labels: skip rather than crash Phy export.
+            continue
         # Get templates associated with cluster (often just 1)
         iunq = np.unique(spike_templates[idxs]).astype(int)
         # Boolean mask over templates (not spikes) for get_data_cpu

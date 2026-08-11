@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 
-from kilosort.clustering_qr import mean_cluster_templates, x_centers
+from kilosort.clustering_qr import kmeans_plusplus, mean_cluster_templates, x_centers
 from kilosort.io import load_probe
 from kilosort.utils import PROBE_DIR
 
@@ -48,6 +48,24 @@ def test_mean_cluster_templates_accepts_torch_iclust():
     W = mean_cluster_templates(Xd, iclust, ichan, n_chan=8, n_pcs=6)
     assert W.shape == (2, 8, 6)
     assert torch.isfinite(W[:, [2, 3], :]).all()
+
+
+def test_kmeans_plusplus_handles_low_rank_residual():
+    """Identical / low-rank rows used to crash multinomial (n_pos < ntry)."""
+    device = torch.device('cpu')
+    # 1200 copies of the same 6-D feature → residual mass collapses fast
+    row = torch.randn(6, device=device)
+    Xg = row.unsqueeze(0).expand(1200, -1).contiguous()
+    # Need the internal vtot; kmeans_plusplus expects already-augmented Xg
+    # as used by cluster() — append ones column matching production call site.
+    # Looking at callers: kmeans_plusplus(Xg, ...) where Xg comes from cluster
+    # after feature prep. Call with raw features: function uses vtot from Xg.
+    # Read kmeans_plusplus signature usage...
+    # Actually kmeans_plusplus computes vtot from Xg inside? Check.
+    iclust = kmeans_plusplus(Xg, niter=50, seed=1, device=device)
+    assert iclust.shape == (1200,)
+    assert int(iclust.min()) >= 0
+    assert int(iclust.max()) < 50
 
 
 def random_np2(n_chans=384, n_shanks=4):

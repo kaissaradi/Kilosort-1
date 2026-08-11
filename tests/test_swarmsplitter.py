@@ -1,6 +1,6 @@
 import numpy as np
 
-from kilosort.swarmsplitter import check_CCG, labels_in, new_clusters
+from kilosort.swarmsplitter import bimod_score, check_CCG, labels_in, new_clusters
 
 
 def test_labels_in_matches_numpy_isin():
@@ -164,3 +164,15 @@ def test_check_CCG_assume_sorted_matches_unsorted_path():
     a = check_CCG(st1, st2, assume_sorted=True)
     b = check_CCG(st1[::-1].copy(), st2[::-1].copy(), assume_sorted=False)
     assert a == b
+
+
+def test_bimod_score_finite_on_empty_and_normal():
+    # All mass outside hist range / flat → no crash, finite non-bimodal score.
+    s0 = bimod_score(np.zeros(50))
+    assert np.isfinite(s0)
+    # Clear bimodal projection: two peaks around ±1
+    left = np.random.default_rng(0).normal(-1.0, 0.15, size=400)
+    right = np.random.default_rng(1).normal(1.0, 0.15, size=400)
+    s1 = bimod_score(np.concatenate([left, right]))
+    assert np.isfinite(s1)
+    assert s1 > s0
