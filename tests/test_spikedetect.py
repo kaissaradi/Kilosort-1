@@ -66,6 +66,22 @@ def test_clip_buffer_capacity_scales_with_recording_length():
     assert get_clip_buffer_capacity(10_000, nskip=25) == 500_000
 
 
+def test_clip_norm_drops_zero_energy_rows():
+    """All-zero clips must not NaN-normalize; only positive-energy rows kept."""
+    # Unit-test the norm filter logic in isolation (same as extract_wPCA path).
+    clips = np.array([
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0],
+        [0.0, 2.0, 0.0],
+    ], dtype=np.float32)
+    norms = (clips ** 2).sum(1, keepdims=True) ** .5
+    good = norms[:, 0] > 0
+    assert good.tolist() == [True, False, True]
+    kept = clips[good] / norms[good]
+    assert np.isfinite(kept).all()
+    np.testing.assert_allclose(np.linalg.norm(kept, axis=1), [1.0, 1.0], atol=1e-6)
+
+
 def test_extract_wpca_grows_when_first_batch_exceeds_capacity(monkeypatch):
     """Shipped extract path must not break when peak count > initial capacity.
 

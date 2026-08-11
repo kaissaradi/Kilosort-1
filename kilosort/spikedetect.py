@@ -102,7 +102,16 @@ def extract_wPCA_wTEMP(ops, bfile, nt=61, twav_min=20, Th_single_ch=6, nskip=25,
         raise RuntimeError(
             'extract_wPCA_wTEMP found no isolated peak clips; cannot fit wPCA/wTEMP'
         )
-    clips /= (clips**2).sum(1, keepdims=True)**.5
+    # Zero-energy clips (rare flat segments) used to make 0/0 → NaN and poison
+    # TruncatedSVD / KMeans. Drop them; if none remain, fail clearly.
+    norms = (clips**2).sum(1, keepdims=True) ** .5
+    good = norms[:, 0] > 0
+    if not np.any(good):
+        raise RuntimeError(
+            'extract_wPCA_wTEMP: all isolated peak clips had zero energy'
+        )
+    clips = clips[good]
+    clips /= norms[good]
 
     model = TruncatedSVD(n_components=ops['settings']['n_pcs']).fit(clips)
     wPCA = torch.from_numpy(model.components_).to(device).float()

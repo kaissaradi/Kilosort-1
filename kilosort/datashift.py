@@ -26,12 +26,20 @@ def bin_spikes(ops, st):
 
     Nbatches = ops['Nbatches']
     
+    # Empty spike table (no detections): return zero fingerprints.
+    if st is None or len(st) == 0:
+        F = np.zeros((Nbatches, dmax, 20), dtype=np.float64)
+        ysamp = dmin + dd * np.arange(dmax) - dd / 2
+        return F, ysamp
+
     batch_id = st[:, 4].astype(np.int64, copy=False)
 
     # Depth / amplitude bin indices for every spike (same formulas as the
     # historical per-batch loop).
     dep = st[:, 1] - dmin
-    amp = np.log10(np.minimum(99, st[:, 2])) - np.log10(ops['Th_universal'])
+    # Guard non-positive amps (log10 domain); stock used minimum(99, amp) only.
+    amp_raw = np.maximum(st[:, 2], 1e-12)
+    amp = np.log10(np.minimum(99, amp_raw)) - np.log10(ops['Th_universal'])
     amp = amp / (np.log10(100) - np.log10(ops['Th_universal']))
     rows = (dep / dd).astype(np.int64)
     cols = (1e-5 + amp * 20).astype(np.int64)
