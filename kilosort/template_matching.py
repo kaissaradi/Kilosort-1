@@ -397,8 +397,14 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
                 _, is_ccg, _ = CCG.check_CCG(st0, st1, acg_threshold=acg_threshold,
                                              ccg_threshold=ccg_threshold)        
             else:
-                dmu = 2 * (mu[kk] - mu[jj]) / (mu[kk] + mu[jj])
-                is_ccg = dmu.abs() < 0.2
+                # Zero-energy templates (empty Wall rows) → 0/0; treat as not
+                # mergeable on amplitude criterion (same as non-match).
+                denom = mu[kk] + mu[jj]
+                if float(denom.abs().min()) <= 0:
+                    is_ccg = False
+                else:
+                    dmu = 2 * (mu[kk] - mu[jj]) / denom
+                    is_ccg = dmu.abs() < 0.2
 
             if is_ccg:
                 is_merged[jj] = 1

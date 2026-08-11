@@ -206,6 +206,26 @@ def _synthetic_merge_case(seed=0, n_spikes=400, n_units=8):
     return ops, Wall, clu, st, tF, device
 
 
+def test_merging_function_zero_energy_templates_no_nan_dmu():
+    """Template-mode merge with zero Wall rows must not NaN dmu comparisons."""
+    ops, Wall, clu, st, tF, device = _synthetic_merge_case(
+        seed=9, n_spikes=200, n_units=5
+    )
+    Wall = Wall.clone()
+    Wall[4] = 0  # zero-energy template
+    # Ensure some spikes still map to other units only
+    clu = clu % 4
+    st = st.copy()
+    st[:, 1] = clu
+    got = merging_function(
+        ops, Wall, clu.copy(), st.copy(), tF.clone(),
+        r_thresh=0.4, mode='template', check_dt=False, device=device
+    )
+    Ww_g, clu_g, _, _, _ = got
+    assert torch.isfinite(Ww_g).all()
+    assert np.isfinite(clu_g).all()
+
+
 def test_merging_function_handles_empty_wall_rows():
     """Wall rows with zero spikes (label gaps) must not IndexError."""
     ops, Wall, clu, st, tF, device = _synthetic_merge_case(seed=3, n_spikes=300, n_units=6)
