@@ -98,17 +98,14 @@ class TestFiltering:
         assert fft2.shape[0] == 100000
         assert fft3.shape[0] == self.hp_filter.shape[0]
 
-        # TODO: Currently this is run as one step in io.BinaryFiltered.filter(),
-        #       so this will need to be updated if that code changes. May be
-        #       preferable to encapsulate each of those steps in a function to
-        #       make tests easier to keep up to date.
-        
-        # Apply fourier versioon of high pass filter.
-        fwav = kpp.fft_highpass(self.hp_filter, NT=self.sine_100hz.shape[1])
-        x100 = torch.real(ifft(fft(self.sine_100hz) * torch.conj(fwav)))
-        x100 = fftshift(x100, dim = -1)
-        x500 = torch.real(ifft(fft(self.sine_500hz) * torch.conj(fwav)))
-        x500 = fftshift(x500, dim = -1)
+        # rFFT shapes are Hermitian half-spectra
+        r1 = kpp.rfft_highpass(self.hp_filter, NT=1000)
+        assert r1.shape[0] == 1000 // 2 + 1
+
+        # Production rFFT path (BinaryFiltered.filter)
+        fr = kpp.rfft_highpass(self.hp_filter, NT=self.sine_100hz.shape[1])
+        x100 = kpp.apply_highpass_rfft(self.sine_100hz, fr)
+        x500 = kpp.apply_highpass_rfft(self.sine_500hz, fr)
 
         # After applying high pass filter,
         # 100hz signal should be close to 0, 500hz should be mostly unchanged,

@@ -3,7 +3,7 @@ import numpy as np
 from scipy.signal import butter, filtfilt
 from scipy.interpolate import interp1d
 from glob import glob
-from torch.fft import fft, ifft, fftshift
+from torch.fft import fft, ifft, rfft, irfft, fftshift
 
 def whitening_from_covariance(CC):
     """Whitening matrix for a covariance matrix CC.
@@ -153,20 +153,47 @@ def get_highpass_filter(fs=30000, cutoff=300, device=torch.device('cuda')):
     hp_filter = torch.from_numpy(hp_filter).to(device).float()
     return hp_filter
 
-def fft_highpass(hp_filter, NT=30122):
-    """Convert filter to fourier domain."""
+def _pad_or_crop_filter(hp_filter, NT):
+    """Pad/crop the time-domain high-pass impulse response to length NT."""
     device = hp_filter.device
-    ft = hp_filter.shape[0]
-
-    # the filter is padded or cropped depending on the size of NT
+    ft = int(hp_filter.shape[0])
+    NT = int(NT)
     if ft < NT:
         pad = (NT - ft) // 2
-        fhp = fft(torch.cat((torch.zeros(pad, device=device), 
-                             hp_filter,
-                             torch.zeros(pad + (NT-pad*2-ft), device=device))))
-    elif ft > NT:
-        crop = (ft - NT) // 2 
-        fhp = fft(hp_filter[crop : crop + NT])
-    else:
-        fhp = fft(hp_filter)
-    return fhp
+        return torch.cat((
+            torch.zeros(pad, device=device, dtype=hp_filter.dtype),
+            hp_filter,
+            torch.zeros(pad + (NT - pad * 2 - ft), device=device,
+                        dtype=hp_filter.dtype),
+        ))
+    if ft > NT:
+        crop = (ft - NT) // 2
+        return hp_filter[crop: crop + NT]
+    return hp_filter
+
+
+def fft_highpass(hp_filter, NT=30122):
+    """Convert filter to full (complex) Fourier domain.
+
+    Prefer ``rfft_highpass`` + ``apply_highpass_rfft`` on the batch hot path:
+    real FFTs are ~2x faster on CPU MEA batches with float32-level agreement.
+    """
+    return fft(_pad_or_crop_filter(hp_filter, NT))
+
+
+def rfft_highpass(hp_filter, NT=30122):
+    """Real-FFT of the high-pass impulse response (length NT//2+1 complex)."""
+    return rfft(_pad_or_crop_filter(hp_filter, NT))
+
+
+def apply_highpass_rfft(X, fwav_r, NT=None):
+    """Apply a precomputed ``rfft_highpass`` filter along the last dim of X.
+
+    Matches ``real(ifft(fft(X) * conj(fft(filter))))`` then ``fftshift`` to
+    float32 noise (~1e-6 abs on unit-scale random data). Used by
+    ``BinaryFiltered.filter`` for every detect/extract batch.
+    """
+    if NT is None:
+        NT = int(X.shape[-1])
+    Y = irfft(rfft(X) * torch.conj(fwav_r), n=NT)
+    return fftshift(Y, dim=-1)

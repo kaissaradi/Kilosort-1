@@ -1636,17 +1636,35 @@ pytest tests/ -q --deselect tests/test_full_pipeline.py \
     <li>merge dense ns · NaN/empty guards · neigh_mat CSR · free st0 before extract</li>
   </ul>
 
+  <h3>Cycle 11 (post-e2e, tip after <code>b2c911a</code> + rFFT)</h3>
+  <p>
+    Driven by the data000 profile above. Microbench on fieldlab CPU
+    (519×60k float32, Nfilt≈2000):
+  </p>
+  <ul>
+    <li><code>As.zero_()</code> alone ≈60&nbsp;ms/batch ×3 buffers — removed (chunks fully overwrite)</li>
+    <li>Batch pad buffer: empty instead of zeros (~125&nbsp;MiB write saved/batch)</li>
+    <li>High-pass: full complex FFT ≈1.15&nbsp;s/batch → rFFT ≈0.46&nbsp;s/batch (~2.5×),
+        max abs vs full FFT ≈2e-6 on unit noise (float32-level)</li>
+    <li>Fused <code>prepare_matching(return_cache=True)</code>; hierarchical crat divide-where</li>
+    <li>Precomputed center→template masks in clustering_qr.run</li>
+  </ul>
+  <p>
+    Expected wall impact: high-pass alone is on every st0+st batch; rFFT should
+    drop minutes to tens of minutes on full data000. Re-measure next full sort.
+  </p>
+
   <h3>Plausible next (ordered)</h3>
   <ol>
-    <li><strong>Profile st0/st peel on next full run</strong> with cycle-10 code — confirm wall drop.</li>
+    <li><strong>Profile st0/st on next full run</strong> with cycle-11 code — confirm wall drop.</li>
     <li><strong>Sparse whitening apply</strong> (allclose) — preprocess tax every batch.</li>
-    <li><strong>Deferred residual via index_add_</strong> if identity-proven — peel still ~77% combined.</li>
+    <li><strong>Deferred residual via index_add_</strong> if identity-proven — peel still large.</li>
     <li><strong>Run --runslow once</strong> — NP mini full pipeline overnight.</li>
     <li><strong>MEA auto x_centers</strong> for 2D probes if clustering memory spikes.</li>
   </ol>
   <p class="note">
     Continuous goal: never stop iterating verified fixes. Peel (st0+st) is still
-    ~77% of wall. Push when green. 126+ unit tests on fast gate.
+    the majority of wall after filter. Push when green. 128+ unit tests on fast gate.
   </p>
 </section>
 

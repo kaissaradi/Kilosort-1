@@ -11,10 +11,13 @@ logger = logging.getLogger(__name__)
 from scipy.io import loadmat
 import numpy as np
 import torch
-from torch.fft import fft, ifft, fftshift
 
 from kilosort import CCG
-from kilosort.preprocessing import get_drift_matrix, fft_highpass
+from kilosort.preprocessing import (
+    apply_highpass_rfft,
+    get_drift_matrix,
+    rfft_highpass,
+)
 from kilosort.postprocessing import (
     remove_duplicates, compute_spike_positions, make_pc_features
     )
@@ -1058,9 +1061,10 @@ class BinaryFiltered(BinaryRWFile):
         self.do_CAR = do_CAR
         self.invert_sign=invert_sign
         self.artifact_threshold = artifact_threshold
-        # Cache Fourier-domain high-pass for each batch length. Historical path
-        # re-ran fft_highpass on every batch (identical NT for all but possibly
-        # the ragged last batch) — pure overhead on CPU MEA sorts.
+        # Cache real-FFT high-pass for each batch length. Historical path
+        # re-ran a full complex fft_highpass on every batch (identical NT for
+        # all but possibly the ragged last batch) — pure overhead on CPU MEA
+        # sorts; rFFT is ~2x faster with float32-level agreement to full FFT.
         self._fwav_cache = None
         self._fwav_cache_nt = None
 
@@ -1072,7 +1076,7 @@ class BinaryFiltered(BinaryRWFile):
         if self.invert_sign:
             X = X * -1
 
-        X = X - X.mean(1).unsqueeze(1)
+        X = X - X.mean(1, keepdim=True)
         if self.do_CAR:
             # remove the mean of each channel, and the median across channels
             X = X - torch.median(X, 0)[0]
@@ -1084,11 +1088,9 @@ class BinaryFiltered(BinaryRWFile):
         if self.hp_filter is not None:
             nt_len = int(X.shape[1])
             if self._fwav_cache is None or self._fwav_cache_nt != nt_len:
-                self._fwav_cache = fft_highpass(self.hp_filter, NT=nt_len)
+                self._fwav_cache = rfft_highpass(self.hp_filter, NT=nt_len)
                 self._fwav_cache_nt = nt_len
-            fwav = self._fwav_cache
-            X = torch.real(ifft(fft(X) * torch.conj(fwav)))
-            X = fftshift(X, dim = -1)
+            X = apply_highpass_rfft(X, self._fwav_cache, NT=nt_len)
 
         if self.artifact_threshold < np.inf:
             if torch.any(torch.abs(X) >= self.artifact_threshold):

@@ -43,6 +43,28 @@ def test_fwav_cache_bit_identical_across_batches(torch_device):
     assert torch.equal(y1, y3)
 
 
+def test_rfft_highpass_matches_full_fft(torch_device):
+    """rFFT hot path must agree with full complex FFT at float32 noise."""
+    from torch.fft import fft, ifft, fftshift
+    from kilosort.preprocessing import (
+        apply_highpass_rfft,
+        fft_highpass,
+        get_highpass_filter,
+        rfft_highpass,
+    )
+
+    torch.manual_seed(1)
+    hp = get_highpass_filter(fs=30000, cutoff=300, device=torch_device)
+    for nt_len in (512, 30122):
+        X = torch.randn(8, nt_len, device=torch_device)
+        fw = fft_highpass(hp, NT=nt_len)
+        y_full = torch.real(ifft(fft(X) * torch.conj(fw)))
+        y_full = fftshift(y_full, dim=-1)
+        fr = rfft_highpass(hp, NT=nt_len)
+        y_r = apply_highpass_rfft(X, fr, NT=nt_len)
+        assert torch.allclose(y_full, y_r, rtol=1e-4, atol=1e-5), nt_len
+
+
 def test_probe_io():
     # Create one-column probe with 5 contacts, spaced 1um apart.
     json_probe = {
