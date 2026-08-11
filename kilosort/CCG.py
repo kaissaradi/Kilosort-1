@@ -112,11 +112,15 @@ def check_CCG(st1, st2=None, nbins = 500, tbin  = 1/1000, acg_threshold=0.2,
 def similarity(Wall, W, nt=61):
     WtW = conv1d(W.reshape(-1, 1,nt), W.reshape(-1, 1 ,nt), padding = nt) 
     WtW = torch.flip(WtW, [2,])
+    # Empty-template NaNs → 0 so norms stay finite
+    if not torch.isfinite(Wall).all():
+        Wall = torch.nan_to_num(Wall, nan=0.0, posinf=0.0, neginf=0.0)
     mu = (Wall**2).sum((1,2), keepdims=True)**.5
     Wnorm = Wall / (1e-6 + mu)
-    UtU = torch.einsum('ilk, jlm -> ijkm',  Wnorm, Wnorm)
-    similar_templates = torch.einsum('ijkm, kml -> ijl', UtU.cpu(), WtW.cpu()).numpy()
-    similar_templates = similar_templates.max(axis=-1)
+    # Fuse UtU @ WtW (same as prepare_matching) so (nU,nU,nPC,nPC) is not
+    # retained; then max over lag. Bit-close to two-step on float32.
+    similar_templates = torch.einsum('ilk, jlm, kmt -> ijt', Wnorm, Wnorm, WtW)
+    similar_templates = similar_templates.amax(dim=-1).cpu().numpy()
     return similar_templates
 
 def refract(iclust2, st0, acg_threshold=0.2, ccg_threshold=0.25):
