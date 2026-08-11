@@ -38,6 +38,17 @@ def get_spike_buffer_capacity(n_batches):
     return min(10**6, max(10**4, 10**4 * n_batches))
 
 
+def get_clip_buffer_capacity(n_batches, nskip=25):
+    """Return initial snippet-buffer size for wPCA/wTEMP extraction.
+
+    Long MEA recordings still cap at 500k clips (historical default). Short
+    runs only sample every `nskip` batches, so a full 500k×nt float32 slab is
+    wasted RAM on fieldlab-scale tests.
+    """
+    n_used = max(1, (int(n_batches) + int(nskip) - 1) // int(nskip))
+    return min(500_000, max(10_000, n_used * 5_000))
+
+
 def template_path(basename='wTEMP.npz'):
     """ currently only one set of example templates to use"""
     return cache_template_path(basename)

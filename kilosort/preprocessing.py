@@ -19,14 +19,19 @@ def whitening_from_covariance(CC):
 def whitening_local(CC, xc, yc, nrange=32, device=torch.device('cuda')):
     """Compute whitening filter for each channel based on nearest channels."""
     Nchan = CC.shape[0]
-    Wrot = torch.zeros((Nchan,Nchan), device = device)
+    Wrot = torch.zeros((Nchan, Nchan), device=device, dtype=CC.dtype)
+
+    # Precompute nearest-channel indices once. The old path re-sorted the full
+    # Nchan×Nchan distance matrix on every center channel (O(N² log N) work).
+    xc = np.asarray(xc, dtype=np.float64)
+    yc = np.asarray(yc, dtype=np.float64)
+    ds = (xc[:, None] - xc[None, :])**2 + (yc[:, None] - yc[None, :])**2
+    nearest = np.argsort(ds, axis=1)[:, :nrange]
 
     # for each channel, a local covariance matrix is extracted
     # the whitening matrix is computed for that local neighborhood
-    for j in range(CC.shape[0]):
-        ds = (xc[j] - xc)**2 + (yc[j] - yc)**2
-        isort = np.argsort(ds)
-        ix = isort[:nrange]
+    for j in range(Nchan):
+        ix = nearest[j]
 
         wrot = whitening_from_covariance(CC[np.ix_(ix, ix)])
 

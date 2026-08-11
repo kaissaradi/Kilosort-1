@@ -50,10 +50,13 @@ def bimod_score(xproj):
     score = 1 - np.maximum(xmin/xm1, xmin/xm2)
     return score
 
-def check_CCG(st1, st2=None, nbins = 500, tbin  = 1/1000):
+def check_CCG(st1, st2=None, nbins = 500, tbin  = 1/1000, assume_sorted=False):
+    # ACG path: reuse the same array. compute_CCG rebinds sorted views and does
+    # not mutate spike times in place, so a defensive copy is wasted memory.
     if st2 is None:
-        st2 = st1.copy()
-    K , T = compute_CCG(st1, st2, nbins = nbins, tbin = tbin)
+        st2 = st1
+    K , T = compute_CCG(st1, st2, nbins = nbins, tbin = tbin,
+                        assume_sorted=assume_sorted)
     # NOTE: upstream 4.1.3+ added an empty/zero guard here, but it was written
     # as `len(st2 == 0)` (len of a bool array -- always truthy for non-empty
     # st2), which makes check_CCG unconditionally return (False, False) and
@@ -151,12 +154,34 @@ def new_clusters(iclust, my_clus, xtree, tstat):
     isleaf[xtree[:,2]] = 0
 
     ind = np.nonzero(isleaf)[0]
-    iclust1 = iclust.copy()
-    for j in range(len(ind)):
-        ix = np.isin(iclust, my_clus[ind[j]])
-        iclust1[ix] = j
-        xtree[xtree[:,0] == ind[j], 0] = j
-        xtree[xtree[:,1] == ind[j], 1] = j
+    iclust_arr = np.asarray(iclust)
+    if ind.size == 0:
+        return iclust_arr.copy()
 
+    # One pass over leaf membership builds a dense remap so each spike is
+    # reassigned with a single integer gather instead of O(n_leaves) isin scans.
+    max_label = -1
+    for leaf in ind:
+        for orig in my_clus[leaf]:
+            if orig > max_label:
+                max_label = orig
+    if max_label < 0:
+        return iclust_arr.copy()
 
+    remap = np.full(max_label + 1, -1, dtype=np.int64)
+    for j, leaf in enumerate(ind):
+        for orig in my_clus[leaf]:
+            remap[orig] = j
+        xtree[xtree[:, 0] == leaf, 0] = j
+        xtree[xtree[:, 1] == leaf, 1] = j
+
+    # Preserve original labels for any spike id not present in a leaf (same as
+    # the historical isin loop, which only wrote matched membership).
+    iclust1 = iclust_arr.copy()
+    known = (iclust_arr >= 0) & (iclust_arr <= max_label)
+    if np.any(known):
+        mapped = remap[iclust_arr[known]]
+        take = mapped >= 0
+        idx = np.flatnonzero(known)
+        iclust1[idx[take]] = mapped[take]
     return iclust1

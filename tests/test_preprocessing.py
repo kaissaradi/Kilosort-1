@@ -9,6 +9,33 @@ from kilosort import datashift, io
 
 np.random.seed(123)
 
+
+def _whitening_local_reference(CC, xc, yc, nrange=32, device=torch.device('cpu')):
+    """Per-channel argsort path used before nearest-index precompute."""
+    Nchan = CC.shape[0]
+    Wrot = torch.zeros((Nchan, Nchan), device=device, dtype=CC.dtype)
+    for j in range(Nchan):
+        ds = (xc[j] - xc)**2 + (yc[j] - yc)**2
+        isort = np.argsort(ds)
+        ix = isort[:nrange]
+        wrot = kpp.whitening_from_covariance(CC[np.ix_(ix, ix)])
+        Wrot[j, ix] = wrot[0]
+    return Wrot
+
+
+def test_whitening_local_matches_per_channel_argsort():
+    rng = np.random.default_rng(7)
+    n = 12
+    xc = np.tile(np.arange(4, dtype=np.float64) * 30.0, 3)
+    yc = np.repeat(np.arange(3, dtype=np.float64) * 30.0, 4)
+    A = rng.standard_normal((n, n)).astype(np.float32)
+    CC = torch.from_numpy((A @ A.T + np.eye(n, dtype=np.float32)).astype(np.float32))
+
+    got = kpp.whitening_local(CC, xc, yc, nrange=5, device=torch.device('cpu'))
+    expected = _whitening_local_reference(CC, xc, yc, nrange=5,
+                                          device=torch.device('cpu'))
+    torch.testing.assert_close(got, expected, rtol=1e-5, atol=1e-5)
+
 class TestFiltering:
     # 2 seconds of time samples at 30Khz, 1 channel
     t = np.linspace(0, 2, 60000, False, dtype='float32')[np.newaxis,...]

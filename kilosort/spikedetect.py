@@ -11,7 +11,12 @@ from sklearn.cluster import KMeans
 from sklearn.decomposition import TruncatedSVD
 from tqdm import tqdm
 
-from kilosort.utils import get_spike_buffer_capacity, template_path, log_performance
+from kilosort.utils import (
+    get_clip_buffer_capacity,
+    get_spike_buffer_capacity,
+    template_path,
+    log_performance,
+)
 
 
 def my_max2d(X, dt):
@@ -50,7 +55,10 @@ def extract_snippets(X, nt, twav_min, Th_single_ch, loc_range=[4,5],
 def extract_wPCA_wTEMP(ops, bfile, nt=61, twav_min=20, Th_single_ch=6, nskip=25,
                        device=torch.device('cuda')):
 
-    clips = np.zeros((500000,nt), 'float32')
+    # Scale the snippet buffer with recording length so short CPU runs do not
+    # reserve a full 500k×nt float32 slab up front.
+    n_clips = get_clip_buffer_capacity(bfile.n_batches, nskip=nskip)
+    clips = np.zeros((n_clips, nt), 'float32')
     i = 0
     for j in range(0, bfile.n_batches, nskip):
         X = bfile.padded_batch_to_torch(j, ops)

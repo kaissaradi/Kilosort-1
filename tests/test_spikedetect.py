@@ -3,7 +3,7 @@ import torch
 
 from kilosort.spikedetect import extract_wPCA_wTEMP, nearest_chans
 from kilosort.template_matching import prepare_extract
-from kilosort.utils import get_spike_buffer_capacity
+from kilosort.utils import get_clip_buffer_capacity, get_spike_buffer_capacity
 
 
 def test_spike_buffer_capacity_scales_with_recording_length():
@@ -11,6 +11,16 @@ def test_spike_buffer_capacity_scales_with_recording_length():
     assert get_spike_buffer_capacity(50) == 500_000
     assert get_spike_buffer_capacity(100) == 1_000_000
     assert get_spike_buffer_capacity(1_000) == 1_000_000
+
+
+def test_clip_buffer_capacity_scales_with_recording_length():
+    # Short runs: n_used batches * 5000, floored at 10k.
+    assert get_clip_buffer_capacity(1, nskip=25) == 10_000
+    assert get_clip_buffer_capacity(25, nskip=25) == 10_000  # 1 used batch
+    assert get_clip_buffer_capacity(50, nskip=25) == 10_000  # 2 used → 10k
+    assert get_clip_buffer_capacity(100, nskip=25) == 20_000  # 4 used
+    assert get_clip_buffer_capacity(2500, nskip=25) == 500_000  # 100 used → cap
+    assert get_clip_buffer_capacity(10_000, nskip=25) == 500_000
 
 
 def test_nearest_chans_matches_independent_sorted_distances():
