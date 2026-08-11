@@ -23,9 +23,13 @@ def whitening_local(CC, xc, yc, nrange=32, device=torch.device('cuda')):
 
     # Precompute nearest-channel indices once. The old path re-sorted the full
     # Nchan×Nchan distance matrix on every center channel (O(N² log N) work).
+    # Keep full argsort (not argpartition): regular MEA grids have many
+    # equal distances, and partition tie-breaking would change which contacts
+    # land in the whitening neighborhood.
     xc = np.asarray(xc, dtype=np.float64)
     yc = np.asarray(yc, dtype=np.float64)
     ds = (xc[:, None] - xc[None, :])**2 + (yc[:, None] - yc[None, :])**2
+    nrange = int(min(nrange, Nchan))
     nearest = np.argsort(ds, axis=1)[:, :nrange]
 
     # for each channel, a local covariance matrix is extracted
