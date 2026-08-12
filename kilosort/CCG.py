@@ -119,6 +119,11 @@ def similarity(Wall, W, nt=61):
     Wnorm = Wall / (1e-6 + mu)
     # Fuse UtU @ WtW (same as prepare_matching) so (nU,nU,nPC,nPC) is not
     # retained; then max over lag. Bit-close to two-step on float32.
+    # Run the contraction on CPU. The fused einsum allocates an (nU,nU,nPC,nPC)
+    # intermediate that OOMs a 12 GB card at MEA unit counts, and Wall/W can
+    # arrive on different devices here, which raises a device-mismatch error.
+    Wnorm = Wnorm.cpu()
+    WtW = WtW.cpu()
     similar_templates = torch.einsum('ilk, jlm, kmt -> ijt', Wnorm, Wnorm, WtW)
     similar_templates = similar_templates.amax(dim=-1).cpu().numpy()
     return similar_templates
