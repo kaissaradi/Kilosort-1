@@ -658,7 +658,10 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                     xtree, tstat, my_clus = hierarchical.maketree(M, iclust, iclust0)
 
                     xtree, tstat = swarmsplitter.split(
-                        Xd.numpy(), xtree, tstat,iclust, my_clus, meta=st0
+                        Xd.numpy(), xtree, tstat,iclust, my_clus, meta=st0,
+                        split_ccg_threshold=ops['settings'].get(
+                            'split_ccg_threshold',
+                            swarmsplitter.SPLIT_CCG_THRESHOLD)
                         )
 
                     iclust = swarmsplitter.new_clusters(iclust, my_clus, xtree, tstat)

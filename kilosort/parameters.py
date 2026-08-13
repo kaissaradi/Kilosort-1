@@ -381,6 +381,18 @@ EXTRA_PARAMETERS = {
             """
     },
 
+    'split_ccg_threshold': {
+        'gui_name': 'split ccg threshold', 'type': float, 'min': 0, 'max': np.inf,
+        'exclude': [], 'default': 0.25, 'step': 'clustering',
+        'description':
+            """
+            Cross-correlogram threshold used by the swarm splitter to decide that
+            two candidate clusters are one neuron and must not be split. This is
+            separate from `ccg_threshold`, which the splitter never reads: the
+            two call different check_CCG implementations. Raise it to split less.
+            """
+    },
+
     'cluster_neighbors': {
         'gui_name': 'cluster neighbors', 'type': int, 'min': 2, 'max': np.inf,
         'exclude': [], 'default': 10, 'step': 'clustering',

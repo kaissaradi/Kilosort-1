@@ -165,7 +165,16 @@ def bimod_score(xproj):
     score = 1 - np.maximum(xmin / xm1, xmin / xm2)
     return float(score)
 
-def check_CCG(st1, st2=None, nbins = 500, tbin  = 1/1000, assume_sorted=False):
+# The cross-correlogram threshold that decides "these two are one neuron, never
+# split them". It was hardcoded at .25 here, unreachable from settings: the
+# `ccg_threshold` setting feeds kilosort.CCG, which is a different function, so
+# sweeping it moved split rate 20.3% -> 20.1% and looked like a dead knob.
+# Raising this makes the splitter more willing to call two candidates one unit.
+SPLIT_CCG_THRESHOLD = 0.25
+
+
+def check_CCG(st1, st2=None, nbins = 500, tbin  = 1/1000, assume_sorted=False,
+              split_ccg_threshold=SPLIT_CCG_THRESHOLD):
     # ACG path: reuse the same array. compute_CCG rebinds sorted views and does
     # not mutate spike times in place, so a defensive copy is wasted memory.
     if st2 is None:
@@ -184,16 +193,18 @@ def check_CCG(st1, st2=None, nbins = 500, tbin  = 1/1000, assume_sorted=False):
         return False, False
     R12, Q12, Q00 = CCG_metrics(st1, st2, K, T,  nbins = nbins, tbin = tbin)
     is_refractory    = R12<.1  and (Q12<.2  or Q00<.25)
-    cross_refractory = R12<.25 and (Q12<.05 or Q00<.25)
+    cross_refractory = R12<split_ccg_threshold and (Q12<.05 or Q00<.25)
     return is_refractory, cross_refractory
 
-def refractoriness(st1, st2, assume_sorted=False):
+def refractoriness(st1, st2, assume_sorted=False,
+                   split_ccg_threshold=SPLIT_CCG_THRESHOLD):
     # compute goodness of st1, st2, and both
     # Production clustering passes time-ordered spike times (global detect order
     # + increasing igood), and boolean masks preserve that order — so callers
     # can set assume_sorted=True to skip two O(n log n) sorts per CCG check.
 
-    is_refractory = check_CCG(st1, st2, assume_sorted=assume_sorted)[1]
+    is_refractory = check_CCG(st1, st2, assume_sorted=assume_sorted,
+                              split_ccg_threshold=split_ccg_threshold)[1]
     if is_refractory:
         criterion = 1 # never split
         #print('this is refractory')
@@ -209,7 +220,7 @@ def refractoriness(st1, st2, assume_sorted=False):
     return criterion
 
 def split(Xd, xtree, tstat, iclust, my_clus, verbose = False, meta = None,
-          meta_sorted=True):
+          meta_sorted=True, split_ccg_threshold=SPLIT_CCG_THRESHOLD):
     xtree = np.array(xtree)
     iclust = np.asarray(iclust)
 
@@ -248,7 +259,8 @@ def split(Xd, xtree, tstat, iclust, my_clus, verbose = False, meta = None,
             if meta is not None and criterion == 0:
                 # second mutation is based on meta_data
                 criterion = refractoriness(
-                    meta[ix1], meta[ix2], assume_sorted=meta_sorted
+                    meta[ix1], meta[ix2], assume_sorted=meta_sorted,
+                    split_ccg_threshold=split_ccg_threshold
                 )
 
             if criterion == 0:
