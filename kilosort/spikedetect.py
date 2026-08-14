@@ -7,6 +7,7 @@ logger = logging.getLogger(__name__)
 from torch.nn.functional import max_pool2d, avg_pool2d, conv1d, max_pool1d
 import numpy as np
 import torch
+from scipy.spatial import cKDTree
 from sklearn.cluster import KMeans
 from sklearn.decomposition import TruncatedSVD
 from tqdm import tqdm
@@ -154,20 +155,60 @@ def get_waves(ops, device=torch.device('cuda')):
     wPCA = torch.from_numpy(dd['wPCA']).to(device)
     return wPCA, wTEMP
 
+def nearest_neighbour_pitch(xc, yc):
+    """Median distance from each contact to its closest neighbour.
+
+    Per-axis coordinate differences describe a rectangular lattice and nothing
+    else. On the Litke 519 hex lattice, and on the 512 array whose rows are
+    offset by half a column, the x coordinates step 30 um while no contact is
+    actually within 60 um of another -- so an axis-wise estimate reports half
+    the real spacing. This measures the spacing directly instead, which is the
+    same number on a rectangular array and the right one on the others.
+
+    A KD-tree rather than a full pairwise matrix: the latter is fine for a few
+    hundred contacts but allocates N^2 floats, which is not something to leave
+    in a library that also runs on probes with thousands of them.
+    """
+    p = np.column_stack([np.asarray(xc, dtype=np.float64),
+                         np.asarray(yc, dtype=np.float64)])
+    if len(p) < 2:
+        return 1.0
+    # k=2: the first neighbour of a point is itself, at distance 0.
+    d, _ = cKDTree(p).query(p, k=2)
+    pitch = float(np.median(d[:, 1]))
+    return pitch if pitch > 0 else 1.0
+
+
 def template_centers(ops):
     shank_idx = ops['kcoords']
     xc = ops['xc']
     yc = ops['yc']
+    # dmin auto-derivation is stock: median spacing of the unique y coordinates.
+    #
+    # A 1.5x-nearest-neighbour rule was tried here and REJECTED. It reproduced
+    # both hand-tuned values exactly (519 @ 30 um -> 45, 512 @ 60 um -> 90), but
+    # that was two points fitting a two-parameter story, not evidence. The first
+    # out-of-sample test contradicted it: on data002 -- same array and same 30 um
+    # pitch as chunk1 -- dmin=90 beat 45 on every axis (recall 0.9021 -> 0.9240,
+    # 52 -> 57 of 63 units, 290s -> 158s), while on chunk1 it lost (0.9907 ->
+    # 0.9711). Two recordings on one array want different values, so the optimum
+    # is not a function of pitch alone and must not be derived as if it were.
     dmin = ops['settings']['dmin']
     if dmin is None:
-        # Try to determine a good value automatically based on contact positions.
         y_uniq = np.unique(yc)
-        if y_uniq.size == 1:
-            dmin = 1
-        else:
-            dmin = np.median(np.diff(np.unique(y_uniq)))
+        dmin = 1 if y_uniq.size == 1 else np.median(np.diff(y_uniq))
     ops['dmin'] = dmin
-    ops['dminx'] = dminx = ops['settings']['dminx']
+
+    # dminx, unlike dmin, has no stock auto path at all -- it sits at a fixed
+    # default chosen for one probe, and passing None to request the same
+    # treatment dmin gets raises TypeError below. That is a real bug on any
+    # non-default array, so None now resolves rather than crashing. Measured
+    # spacing, not the 1.5x rule above: per-axis coordinate differences report
+    # half the true spacing on a hex lattice or an offset grid.
+    dminx = ops['settings']['dminx']
+    if dminx is None:
+        dminx = nearest_neighbour_pitch(xc, yc)
+    ops['dminx'] = dminx
 
     # Iteratively determine template placement for each shank separately.
     yup = np.array([])
