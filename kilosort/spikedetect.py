@@ -236,10 +236,23 @@ def template_centers(ops):
         # downstream of this.
         #
         # The xup line below already does the robust thing -- round the count
-        # and use linspace. Set KS4_YUP_FIX=1 to select it. Off by default only
-        # until the A/B lands -- it changes template placement on every probe,
-        # so it must be scored on the whole ledger before it becomes default.
-        if os.environ.get('KS4_YUP_FIX', '') not in ('', '0'):
+        # and use linspace, so this just makes y match x.
+        #
+        # DEFAULT ON since 2026-08-18, after a three-window ledger
+        # (scripts/confirm_yupfix.sh -> logs/yupconf_{mqW5,ratW5,ratW10}.json)
+        # scored it at dmin 90 against a like-for-like fixed dmin 45 control on
+        # two animals and two preps. Fewer missed GT spikes on 3/3 windows,
+        # zero cells lost on 3/3, and total splits 17 -> 8:
+        #
+        #   window   missed d45y -> d90y   lost   split    clean
+        #   mqW5      0.0085 -> 0.0073     0->0   1->1     84->84
+        #   ratW5     0.0073 -> 0.0062     0->0   8->3     63->63
+        #   ratW10    0.0056 -> 0.0048     0->0   8->4     69->68
+        #
+        # Every cell the unfixed dmin 90 lost sat on y=+450, the top row, and
+        # every one came back. Set KS4_YUP_FIX=0 to restore the stock arange
+        # for a bug-for-bug comparison against upstream.
+        if os.environ.get('KS4_YUP_FIX', '1') != '0':
             ny = np.round((ymax - ymin) / (dmin/2)) + 1
             yup = np.concatenate([yup, np.linspace(ymin, ymax, int(ny))])
         else:
