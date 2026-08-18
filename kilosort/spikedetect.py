@@ -250,9 +250,32 @@ def template_centers(ops):
         #   ratW10    0.0056 -> 0.0048     0->0   8->4     69->68
         #
         # Every cell the unfixed dmin 90 lost sat on y=+450, the top row, and
-        # every one came back. Set KS4_YUP_FIX=0 to restore the stock arange
-        # for a bug-for-bug comparison against upstream.
-        if os.environ.get('KS4_YUP_FIX', '1') != '0':
+        # every one came back.
+        #
+        # DEFAULT REVERTED TO OFF the same day, on a pre-registered criterion.
+        # All three confirmation windows are Litke 512 arrays, y -450..450, span
+        # 900 -- which divides evenly by dmin/2 at both 45 and 90, so there the
+        # fix only APPENDS the dropped endpoint and disturbs nothing else. The
+        # hybrid bench (20251204A, 519 channels, y -390..390, span 780) does not
+        # divide evenly: at dmin 90 the stock grid ends at 375 and the fix
+        # instead spreads 18 points at 45.88 um, RE-PITCHING every template
+        # position on the array. Injected-unit recall under 200 ADC then went
+        # 0.627 -> 0.600 at dmin 90 -- unit 16 at 114 ADC, sitting at y -165..-75
+        # (deep interior, not an edge cell), lost real coverage 0.987 -> 0.729
+        # summed over every contributing cluster.
+        #
+        # It is not a one-way cost: on the SAME array at dmin 45 the fix helped
+        # in both bands (under 200 ADC 0.742 -> 0.756, 200+ 0.961 -> 1.000),
+        # rescuing unit 7 (0.646 -> 0.999) and unit 19 (0.741 -> 0.922). Quiet
+        # units near threshold are simply unstable to any grid re-pitch. But
+        # that is the point: on a span that does not divide evenly this is not
+        # purely an edge fix, and a blanket default across untested geometries
+        # is not earned by three windows of one geometry.
+        #
+        # So: KS4_YUP_FIX=1 to enable. Recommended on arrays whose y-span
+        # divides evenly by dmin/2 (all Litke 512), where it is confirmed to be
+        # free. Measure before enabling it anywhere else.
+        if os.environ.get('KS4_YUP_FIX', '') not in ('', '0'):
             ny = np.round((ymax - ymin) / (dmin/2)) + 1
             yup = np.concatenate([yup, np.linspace(ymin, ymax, int(ny))])
         else:
