@@ -272,12 +272,29 @@ def template_centers(ops):
         # purely an edge fix, and a blanket default across untested geometries
         # is not earned by three windows of one geometry.
         #
-        # So: KS4_YUP_FIX=1 to enable. Recommended on arrays whose y-span
-        # divides evenly by dmin/2 (all Litke 512), where it is confirmed to be
-        # free. Measure before enabling it anywhere else.
-        if os.environ.get('KS4_YUP_FIX', '') not in ('', '0'):
+        # Two remedies, because they are NOT the same thing on every probe:
+        #
+        #   KS4_YUP_FIX=1         append-only. Keep the stock arange spacing
+        #                         everywhere and add the dropped endpoint. On a
+        #                         span that divides evenly by dmin/2 this is
+        #                         IDENTICAL to linspace (Litke 512 dmin 90:
+        #                         both give 21 points at 45 um, -450..450). On
+        #                         a span that does not, it leaves every interior
+        #                         position exactly where stock put it and only
+        #                         closes the top gap, so it cannot re-pitch.
+        #   KS4_YUP_FIX=linspace  the re-pitching variant described above.
+        #                         Kept only to reproduce the measurements.
+        #
+        # Measure before enabling either on an untested geometry.
+        _fix = os.environ.get('KS4_YUP_FIX', '')
+        if _fix == 'linspace':
             ny = np.round((ymax - ymin) / (dmin/2)) + 1
             yup = np.concatenate([yup, np.linspace(ymin, ymax, int(ny))])
+        elif _fix not in ('', '0'):
+            ygrid = np.arange(ymin, ymax + .00001, dmin/2)
+            if ygrid.size == 0 or ymax - ygrid[-1] > 1e-3:
+                ygrid = np.append(ygrid, ymax)
+            yup = np.concatenate([yup, ygrid])
         else:
             yup = np.concatenate([yup, np.arange(ymin, ymax+.00001, dmin/2)])
         nx = np.round((xmax - xmin) / (dminx/2)) + 1
