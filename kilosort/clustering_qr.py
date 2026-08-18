@@ -1,4 +1,5 @@
 import gc
+import os
 import logging
 
 import numpy as np
@@ -519,6 +520,39 @@ def x_centers(ops):
 def y_centers(ops):
     ycup = ops['ycup']
     dmin = ops['dmin']
+
+    if os.environ.get('KS4_YCENTER_FIX', '') not in ('', '0'):
+        # Symmetric tiling of the ACTUAL span. See the bug note below: the stock
+        # grid anchors its first centre but not its last, which orphans the top
+        # electrode row on some geometries. Tile the span into the whole number
+        # of intervals closest to the requested 2*dmin spacing and take the
+        # midpoints -- no centre is ever off-array, both edge rows are treated
+        # alike, and the spacing stays within ~10% of 2*dmin.
+        ymin, ymax = float(ycup.min()), float(ycup.max())
+        span = ymax - ymin
+        if span <= 0:
+            return np.array([ymin])
+        n = max(1, int(round(span / (2*dmin))))
+        edges = np.linspace(ymin, ymax, n+1)
+        return 0.5*(edges[:-1] + edges[1:])
+
+    # BUG (measured 2026-08-18, ks4-validation): the first centre is pinned
+    # dmin-1 above the bottom of the array so the bottom tile straddles the edge
+    # correctly, but nothing anchors the LAST centre. It lands ~dmin-1 um off
+    # the array, and when the span is close to a whole number of 2*dmin tiles
+    # the top electrode row spills into a tile containing nothing but itself.
+    # On the 512-ch 30x60 um array (y -450..450) at dmin 90 the groups hold
+    # [3,3,3,3,3,1] electrode rows: row y=+450 is clustered alone against a
+    # centre 89 um off-array. Cells there are destroyed -- a six-arm dmin sweep
+    # on ratW10 lost 7 cells in total and ALL 7 sat on y=+450, 4 of the 8 cells
+    # on that row at dmin 90, while dmin 60 (which tiles 900 um exactly and
+    # orphans nothing) lost none. Varying dminx does not rescue them; only dmin
+    # does, which is what identifies the y grid as the cause.
+    #
+    # Note the stock TODO below does NOT fix this: subtracting dmin/2 shifts
+    # every centre but still leaves the last one unanchored and the top row
+    # alone. Set KS4_YCENTER_FIX=1 for the symmetric tiling above.
+    #
     # TODO: May want to add the -dmin/2 in the future to center these, but
     #       this changes the results for testing so we need to wait until we can
     #       check it with simulations.
