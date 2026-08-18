@@ -553,6 +553,19 @@ def y_centers(ops):
     # every centre but still leaves the last one unanchored and the top row
     # alone. Set KS4_YCENTER_FIX=1 for the symmetric tiling above.
     #
+    # BUT THE FIX DOES NOT RESCUE THE LOST CELLS, so the orphaned group is NOT
+    # the cause of the loss. A/B on ratW10 with KS4_YCENTER_FIX=1: at dmin 90
+    # the same four cells die (ids 67, 57, 51, 63, all on y=+450), and at dmin
+    # 75 the same one. Byte-different sorts, identical casualties. Giving row
+    # +450 a proper four-row group changes nothing, which points upstream of
+    # clustering entirely -- `spikedetect.template_centers` steps the universal
+    # template grid `yup` by dmin/2, so dmin halves template density in y before
+    # clustering runs, and an edge row has candidate templates on one side only.
+    # The grid fix is kept because it is correct on its own terms and because
+    # dmin 60 measured better with it (0.9755 vs 0.9698 spikes-in-good-units,
+    # 71 vs 69 clean, both 0 lost), but it must not be described as fixing the
+    # edge-cell loss.
+    #
     # TODO: May want to add the -dmin/2 in the future to center these, but
     #       this changes the results for testing so we need to wait until we can
     #       check it with simulations.
