@@ -218,7 +218,32 @@ def template_centers(ops):
         yc_i = yc[shank_idx == i]
         xmin, xmax, ymin, ymax = xc_i.min(), xc_i.max(), yc_i.min(), yc_i.max()
 
-        yup = np.concatenate([yup, np.arange(ymin, ymax+.00001, dmin/2)])
+        # BUG (measured 2026-08-18, ks4-validation): the +.00001 endpoint guard
+        # is smaller than float32 resolution at these coordinates, so on a
+        # float32 probe `ymax + .00001 == ymax` and np.arange drops the final
+        # point. np.spacing(float32(450)) is 3.05e-5. The TOP electrode row then
+        # gets no universal template position at all, while the bottom row
+        # always gets one because it is the arange START -- and the nearest
+        # template to a top-row cell ends up dmin/2 away (45 um at dmin 90).
+        #
+        #   float64, dmin 90 -> 21 positions, max 450.0  (top row covered)
+        #   float32, dmin 90 -> 20 positions, max 405.0  (top row bare)
+        #
+        # This destroys cells on that row, worse as dmin grows. A six-arm dmin
+        # sweep on ratW10 lost 7 cells and ALL 7 sat on y=+450: 4 of the 8 cells
+        # there at dmin 90, 1 at dmin 75, none at dmin 45 or 60. Changing dminx
+        # does not help and neither does the clustering grid, both of which are
+        # downstream of this.
+        #
+        # The xup line below already does the robust thing -- round the count
+        # and use linspace. Set KS4_YUP_FIX=1 to select it. Off by default only
+        # until the A/B lands -- it changes template placement on every probe,
+        # so it must be scored on the whole ledger before it becomes default.
+        if os.environ.get('KS4_YUP_FIX', '') not in ('', '0'):
+            ny = np.round((ymax - ymin) / (dmin/2)) + 1
+            yup = np.concatenate([yup, np.linspace(ymin, ymax, int(ny))])
+        else:
+            yup = np.concatenate([yup, np.arange(ymin, ymax+.00001, dmin/2)])
         nx = np.round((xmax - xmin) / (dminx/2)) + 1
         xup = np.concatenate([xup, np.linspace(xmin, xmax, int(nx))])
 
