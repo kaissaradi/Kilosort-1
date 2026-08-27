@@ -393,6 +393,23 @@ EXTRA_PARAMETERS = {
             """
     },
 
+    'max_merge_sweeps': {
+        'gui_name': 'max merge sweeps', 'type': int, 'min': 1, 'max': np.inf,
+        'exclude': [], 'default': 10, 'step': 'postprocessing',
+        'description':
+            """
+            How many times the duplicate-merge stage may re-sort by the updated
+            spike counts and sweep the cluster list again. The stage stops early
+            when it reaches a unit with zero spikes, which on a stale ordering
+            happens in the MIDDLE of the list and abandons every unit below it
+            unexamined -- one pass on 20260818B made 86 merges and left 130 that
+            its own criteria said to make. Sweeping to a fixpoint fixes that.
+            Set to 1 to reproduce the old single-pass behaviour bug-for-bug;
+            reaching the limit is not an error, it just leaves the remaining
+            merges unmade.
+            """
+    },
+
     'cluster_neighbors': {
         'gui_name': 'cluster neighbors', 'type': int, 'min': 2, 'max': np.inf,
         'exclude': [], 'default': 10, 'step': 'clustering',
