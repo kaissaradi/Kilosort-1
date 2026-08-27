@@ -256,3 +256,126 @@ def test_empty_trains_do_not_compute_garbage():
     for a, b in ((st1, np.array([])), (np.array([]), st1),
                  (np.ones(50), np.ones(50))):
         assert [bool(v) for v in swarmsplitter.check_CCG(a, b)] == [False, False]
+
+
+# ---------------------------------------------------------------------------
+# merging_function sweeps to a fixpoint
+#
+# `isort` ranks units by spike count once, before any merge. Absorbing a unit
+# zeroes its count but leaves it at its original rank, so the old
+# `if ns[kk] == 0: break` fired in the MIDDLE of the ordering and terminated
+# the whole stage, abandoning every lower-ranked unit unexamined.
+# ---------------------------------------------------------------------------
+
+def _merge_case(dirs, counts, nt=61, npc=1, fs=20000.0, seed=0):
+    """Minimal ops/Wall/clu/st/tF for merging_function in 'mu' mode.
+
+    One PC, one unit-norm basis vector, so the template correlation the merge
+    computes reduces to the cosine between the per-channel vectors in `dirs`
+    and the merge decision is fully determined by geometry.
+    """
+    import torch
+    dirs = np.asarray(dirs, dtype=np.float64)
+    NN, nchan = dirs.shape
+    Wall = torch.zeros(NN, nchan, npc, dtype=torch.float32)
+    for i, d in enumerate(dirs):
+        Wall[i, :, 0] = torch.tensor(d, dtype=torch.float32)
+    wPCA = torch.zeros(npc, nt, dtype=torch.float32)
+    wPCA[0, nt // 2] = 1.0
+    ops = {'fs': fs, 'nt': nt, 'wPCA': wPCA,
+           'settings': {'acg_threshold': 0.2, 'ccg_threshold': 0.2}}
+    rng = np.random.default_rng(seed)
+    clu, times = [], []
+    for i, n in enumerate(counts):
+        times.append(np.sort(rng.integers(0, int(600 * fs), n)))
+        clu.append(np.full(n, i))
+    clu = np.concatenate(clu)
+    times = np.concatenate(times)
+    order = np.argsort(times)
+    clu, times = clu[order], times[order]
+    st = np.zeros((times.size, 6), dtype=np.int64)
+    st[:, 0] = times
+    tF = torch.zeros(times.size, nchan, npc, dtype=torch.float32)
+    return ops, Wall, clu, st, tF
+
+
+# Two independent mergeable pairs. A and B are the two highest-count units, so
+# B is absorbed first and then sits at rank 1 with ns == 0 -- exactly where the
+# stale-ordering exit fires, before C and D are ever looked at.
+_TWO_PAIRS = np.array([[1., 0., 0., 0.],   # A
+                       [1., 0., 0., 0.],   # B  (merges with A)
+                       [0., 0., 1., 0.],   # C
+                       [0., 0., 1., 0.]])  # D  (merges with C)
+_TWO_PAIRS_COUNTS = [500, 400, 300, 200]
+
+
+def _run_merge(max_sweeps):
+    import torch
+    from kilosort.template_matching import merging_function
+    ops, Wall, clu, st, tF = _merge_case(_TWO_PAIRS, _TWO_PAIRS_COUNTS)
+    Ww, clu2, _, _, _ = merging_function(
+        ops, Wall, clu, st, tF, mode='mu', check_dt=False,
+        device=torch.device('cpu'), max_sweeps=max_sweeps)
+    return Ww.shape[0], clu2
+
+
+def test_one_pass_abandons_units_below_the_first_absorbed_rank():
+    """Locks the defect in, so a future refactor cannot quietly restore it."""
+    n_units, _ = _run_merge(max_sweeps=1)
+    assert n_units == 3, 'single pass should miss the C/D merge entirely'
+
+
+def test_sweeping_to_fixpoint_finds_the_abandoned_merge():
+    n_units, clu2 = _run_merge(max_sweeps=10)
+    assert n_units == 2
+    # Both pairs collapsed: two surviving labels, each holding two units' spikes.
+    assert len(np.unique(clu2)) == 2
+
+
+def test_extra_sweeps_are_idempotent_once_no_merge_remains():
+    """A fixpoint is a fixpoint: more budget must not keep eating units."""
+    assert _run_merge(max_sweeps=10)[0] == _run_merge(max_sweeps=50)[0]
+
+
+def test_max_sweeps_comes_from_settings_and_defaults_to_more_than_one():
+    import torch
+    from kilosort.template_matching import merging_function
+    ops, Wall, clu, st, tF = _merge_case(_TWO_PAIRS, _TWO_PAIRS_COUNTS)
+    ops['settings']['max_merge_sweeps'] = 1
+    Ww, _, _, _, _ = merging_function(ops, Wall, clu, st, tF, mode='mu',
+                                      check_dt=False,
+                                      device=torch.device('cpu'))
+    assert Ww.shape[0] == 3, 'settings must be able to restore one-pass'
+    # and the default, with nothing set, must sweep
+    ops2, Wall2, clu2_, st2, tF2 = _merge_case(_TWO_PAIRS, _TWO_PAIRS_COUNTS)
+    Ww2, _, _, _, _ = merging_function(ops2, Wall2, clu2_, st2, tF2, mode='mu',
+                                       check_dt=False,
+                                       device=torch.device('cpu'))
+    assert Ww2.shape[0] == 2
+
+
+def test_missing_settings_key_does_not_crash_the_merge():
+    """ops dicts written before this change carry no max_merge_sweeps key.
+    They must fall back to the default, not raise."""
+    import torch
+    from kilosort.template_matching import merging_function
+    ops, Wall, clu, st, tF = _merge_case(_TWO_PAIRS, _TWO_PAIRS_COUNTS)
+    assert 'max_merge_sweeps' not in ops['settings']
+    Ww, _, _, _, _ = merging_function(ops, Wall, clu, st, tF, mode='mu',
+                                      check_dt=False,
+                                      device=torch.device('cpu'))
+    assert Ww.shape[0] == 2
+
+
+def test_nothing_mergeable_terminates_in_one_sweep():
+    """Orthogonal templates: the fixpoint loop must not spin or merge anything."""
+    import torch
+    from kilosort.template_matching import merging_function
+    dirs = np.eye(4)
+    ops, Wall, clu, st, tF = _merge_case(dirs, [500, 400, 300, 200])
+    Ww, clu2, _, _, _ = merging_function(ops, Wall, clu, st, tF, mode='mu',
+                                         check_dt=False,
+                                         device=torch.device('cpu'),
+                                         max_sweeps=10)
+    assert Ww.shape[0] == 4
+    assert len(np.unique(clu2)) == 4

@@ -385,7 +385,7 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=None):
 
 
 def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=True,
-                     device=torch.device('cuda')):
+                     device=torch.device('cuda'), max_sweeps=None):
     clu2 = clu.copy()
 
     Ww = Wall.to(device)
@@ -446,16 +446,60 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
     if mode == 'ccg':
         st_sec = st[:, 0] / ops['fs']
 
+    # Merging is swept to a FIXPOINT, because one pass exits early.
+    #
+    # `isort` ranks units by spike count and is computed ONCE, before any merge.
+    # Absorbing a unit sets `ns[jj] = 0`, but `isort` still lists jj at its
+    # original rank. The old loop read
+    #
+    #     kk = int(isort[t])
+    #     if ns[kk] == 0:
+    #         break
+    #
+    # so the first time `t` stepped onto a unit that had already been absorbed,
+    # the whole stage terminated -- abandoning every unit ranked below it,
+    # unexamined. The zero-count test was meant to skip the empty tail; on a
+    # stale ordering it fires in the middle of the list instead. The earlier a
+    # high-count unit is absorbed, the more of the list is thrown away.
+    #
+    # Measured on 20260818B (981 clusters in, 895 out, one pass, 28.8 s): the
+    # FINISHED sort still contained 130 pairs that this function's own criteria
+    # say to merge -- template similarity >= r_thresh and cross-refractory by
+    # check_CCG. Six of them are duplicate cells that visibly break the RF
+    # mosaics of the hand-typed types. The single pass made 86 merges and left
+    # 130 behind; it was never a threshold problem, it was termination.
+    #
+    # So: treat the zero-count hit as the end of a SWEEP, not the end of the
+    # stage. Re-sort by the updated counts, restart at t=0, and repeat until a
+    # sweep completes with no merge. `is_merged` persists across sweeps, so
+    # absorbed units are never revisited and each sweep is cheaper than the
+    # last. `max_sweeps` bounds the cost; reaching it is not an error, it just
+    # leaves the remaining merges unmade, exactly as before. max_merge_sweeps=1
+    # reproduces the old single-pass behaviour bug-for-bug.
+    if max_sweeps is None:
+        try:
+            max_sweeps = int(ops['settings'].get('max_merge_sweeps', 10))
+        except (KeyError, TypeError, AttributeError):
+            max_sweeps = 10
+    max_sweeps = max(1, int(max_sweeps))
+
     t = 0
     nmerge = 0
-    while t<NN:
-        #if t%100==0:
-            #print(t, nmerge)
+    sweep_merges = 0
+    sweeps_done = 0
+    while True:
+        # Sweep boundary: ran off the end, or reached the zero-count tail
+        # (merged-away / empty Wall rows sort last under descending ns).
+        if t >= NN or ns[int(isort[t])] == 0:
+            sweeps_done += 1
+            if sweep_merges == 0 or sweeps_done >= max_sweeps:
+                break
+            sweep_merges = 0
+            isort = np.argsort(ns)[::-1]
+            t = 0
+            continue
 
         kk = int(isort[t])
-        # Empty Wall rows / unused labels sit at the end of isort (count 0).
-        if ns[kk] == 0:
-            break
 
         if (mode == 'ccg') and is_ref[kk]==0:
             t += 1
@@ -542,6 +586,7 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
             t +=1    
         else:                
             nmerge+=1
+            sweep_merges += 1
     
     imap = np.cumsum((~is_merged).astype('int32')) - 1
     if imap.size > 0:
