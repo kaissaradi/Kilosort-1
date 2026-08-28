@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 from numba import njit
 import math
@@ -158,6 +160,15 @@ def bimod_score(xproj):
     xm1  = np.max(xbin[:imin+175])
     xm2  = np.max(xbin[imin+175:])
 
+    # The valley is only ever looked for in bins 175:225, i.e. xproj in about
+    # [-0.25, +0.25] of a fixed [-2, 2] axis. A minority second cell pulls the
+    # true valley off centre, and mass outside [-2, 2] is not binned at all --
+    # either way the score describes the wrong place. Record both so the audit
+    # can say whether that is happening rather than assuming it is not.
+    _LAST_BIMOD['imin'] = int(imin)
+    _LAST_BIMOD['edge'] = int(imin == 0 or imin == 49)
+    _LAST_BIMOD['outside'] = float(np.mean((xproj < -2.0) | (xproj > 2.0)))
+
     # Empty half of the projection (or all mass outside [-2, 2]) used to make
     # xmin/xm1 → inf/nan and poison split criterion. Treat as non-bimodal.
     if xm1 <= 0 or xm2 <= 0:
@@ -171,6 +182,102 @@ def bimod_score(xproj):
 # sweeping it moved split rate 20.3% -> 20.1% and looked like a dead knob.
 # Raising this makes the splitter more willing to call two candidates one unit.
 SPLIT_CCG_THRESHOLD = 0.25
+
+
+# Per-decision audit of the splitter, off unless KS4_SPLIT_STATS names a file.
+#
+# The splitter is the only stage whose job is to notice that one cluster holds
+# two neurons, and it is demonstrably letting ~45 units per sort through. Which
+# of its three gates does the letting through is not something the sorted output
+# can answer -- a unit that was never split looks identical to one that was
+# never a candidate. So record every decision: the gate that fired, the score it
+# fired on, and the sizes involved.
+_LAST_CCG = {}
+_LAST_BIMOD = {}
+_STATS_PATH = os.environ.get('KS4_SPLIT_STATS')
+
+
+def _rvi(st, refrac=0.0015):
+    """Sub-refractory ISI count and its chance expectation for one train.
+
+    Same convention as the GT-free contamination metric: a train whose observed
+    count sits well above the rate-matched expectation holds more than one
+    neuron. Returned raw so the audit, not this function, decides the bar.
+    """
+    st = np.asarray(st)
+    n = int(st.size)
+    if n < 50:
+        return n, 0, 0.0
+    st = np.sort(st)
+    T = float(st[-1] - st[0])
+    if T <= 0:
+        return n, 0, 0.0
+    obs = int(np.count_nonzero(np.diff(st) < refrac))
+    return n, obs, (n - 1) * (n / T) * refrac
+
+
+def write_init_stats(meta, iclust, iclust_init):
+    """Does the partition the sorter THREW AWAY separate what its leaves fuse?
+
+    cluster() seeds 200 k-means++ centres and then collapses them to ~13 labels
+    in the alternating-assignment loop. The pre-collapse labels are returned and
+    dropped on the floor at the call site. If a refractorily impossible leaf
+    breaks into refractorily clean pieces under those labels, the information
+    needed to separate two neurons was computed and discarded, and the fix is
+    architectural. If it does not, the features themselves cannot tell the two
+    cells apart and no amount of re-partitioning will help.
+    """
+    if not _STATS_PATH:
+        return
+    path = _STATS_PATH + '.init'
+    new = not os.path.exists(path)
+    with open(path, 'a') as f:
+        if new:
+            f.write('leaf\tn\tobs\texp\tsub\tsub_n\tsub_obs\tsub_exp\n')
+        for c in np.unique(iclust):
+            m = iclust == c
+            n, obs, exp = _rvi(meta[m])
+            if n < 300:
+                continue
+            sub = iclust_init[m]
+            for j in np.unique(sub):
+                sn, so, se = _rvi(meta[m][sub == j])
+                f.write('%d\t%d\t%d\t%.6g\t%d\t%d\t%d\t%.6g\n'
+                        % (c, n, obs, exp, int(j), sn, so, se))
+
+
+def _write_leaf_stats(meta, iclust):
+    """Is the partition already impure BEFORE any tree merge is accepted?
+
+    hierarchical.maketree only ever agglomerates and split() only ever prunes
+    merges, so cluster()'s labels are the finest partition the sorter will ever
+    hold. If those leaves already carry sub-refractory ISIs, no downstream gate
+    can help and the defect is upstream of everything measured so far.
+    """
+    rows = []
+    for c in np.unique(iclust):
+        rows.append((int(c),) + _rvi(meta[iclust == c]))
+    path = _STATS_PATH + '.leaves'
+    new = not os.path.exists(path)
+    with open(path, 'a') as f:
+        if new:
+            f.write('leaf\tn\tobs\texp\n')
+        for r in rows:
+            f.write('%d\t%d\t%d\t%.6g\n' % r)
+
+
+def _write_stats(rows):
+    if not rows:
+        return
+    new = not os.path.exists(_STATS_PATH)
+    with open(_STATS_PATH, 'a') as f:
+        if new:
+            f.write('kk\tn1\tn2\tmod\tlocalmod\tgate\tscore\t'
+                    'R12\tQ12\tQ00\timin\tedge\toutside\t'
+                    'o1\te1\to2\te2\tuo\tue\tsplit\n')
+        for r in rows:
+            f.write('\t'.join('%.6g' % x if isinstance(x, float) else str(x)
+                               for x in r) + '\n')
 
 
 def check_CCG(st1, st2=None, nbins = 500, tbin  = 1/1000, assume_sorted=False,
@@ -194,6 +301,11 @@ def check_CCG(st1, st2=None, nbins = 500, tbin  = 1/1000, assume_sorted=False,
     R12, Q12, Q00 = CCG_metrics(st1, st2, K, T,  nbins = nbins, tbin = tbin)
     is_refractory    = R12<.1  and (Q12<.2  or Q00<.25)
     cross_refractory = R12<split_ccg_threshold and (Q12<.05 or Q00<.25)
+    # The veto's own numbers, for KS4_SPLIT_STATS. R12 is a ratio, so a pair
+    # with few spikes can land under the threshold on noise alone; the audit
+    # cannot tell that from a real refractory dip without seeing the counts.
+    _LAST_CCG['R12'], _LAST_CCG['Q12'], _LAST_CCG['Q00'] = R12, Q12, Q00
+    _LAST_CCG['n1'], _LAST_CCG['n2'] = int(st1.size), int(st2.size)
     return is_refractory, cross_refractory
 
 def refractoriness(st1, st2, assume_sorted=False,
@@ -241,11 +353,19 @@ def split(Xd, xtree, tstat, iclust, my_clus, verbose = False, meta = None,
     # Parent→edge lists for O(visited) clean_tree (was O(n_edges) scan/prune).
     parent_edges = _parent_edge_lists(xtree)
 
+    stats = [] if _STATS_PATH else None
+    if stats is not None and meta is not None:
+        _write_leaf_stats(np.asarray(meta), iclust)
+
     for kk in range(nc-2,-1,-1):
         if not valid_merge[kk]:
             continue
 
         score = np.nan
+        gate = 'mod'
+        ix1 = ix2 = None
+        _LAST_CCG.clear()
+        _LAST_BIMOD.clear()
         # first mutation is global modularity — reject before membership gathers
         if tstat[kk, 0] < 0.2:
             criterion = -1
@@ -262,6 +382,8 @@ def split(Xd, xtree, tstat, iclust, my_clus, verbose = False, meta = None,
                     meta[ix1], meta[ix2], assume_sorted=meta_sorted,
                     split_ccg_threshold=split_ccg_threshold
                 )
+                if criterion == 1:
+                    gate = 'ccg'
 
             if criterion == 0:
                 xproj, score = check_split(
@@ -269,6 +391,32 @@ def split(Xd, xtree, tstat, iclust, my_clus, verbose = False, meta = None,
                 )
                 # third mutation is bimodality
                 criterion = 2 * (score < .6) - 1
+                gate = 'bimod'
+
+        if stats is not None:
+            n1 = int(ix1.sum()) if ix1 is not None else -1
+            n2 = int(ix2.sum()) if ix2 is not None else -1
+            # Would a refractory counter-veto have anything to fire on? Record
+            # the union's violation count against each half's, for every node,
+            # split or not -- that is the evidence a "geometrically unimodal but
+            # refractorily impossible" rule would need, and it is not currently
+            # consulted anywhere in the pipeline.
+            uo = ue = o1 = e1 = o2 = e2 = -1.0
+            if meta is not None and ix1 is not None:
+                _, o1, e1 = _rvi(meta[ix1])
+                _, o2, e2 = _rvi(meta[ix2])
+                _, uo, ue = _rvi(meta[ix1 | ix2])
+            stats.append((kk, n1, n2, float(tstat[kk, 0]), float(tstat[kk, -1]),
+                          gate, float(score),
+                          float(_LAST_CCG.get('R12', np.nan)),
+                          float(_LAST_CCG.get('Q12', np.nan)),
+                          float(_LAST_CCG.get('Q00', np.nan)),
+                          int(_LAST_BIMOD.get('imin', -1)),
+                          int(_LAST_BIMOD.get('edge', -1)),
+                          float(_LAST_BIMOD.get('outside', np.nan)),
+                          int(o1), float(e1), int(o2), float(e2),
+                          int(uo), float(ue),
+                          int(criterion != 1)))
 
             if criterion == 0:
                 # fourth mutation is local modularity (not reachable)
@@ -284,6 +432,9 @@ def split(Xd, xtree, tstat, iclust, my_clus, verbose = False, meta = None,
             valid_merge[kk] = 0
             clean_tree(valid_merge, xtree, xtree[kk, 0], parent_edges)
             clean_tree(valid_merge, xtree, xtree[kk, 1], parent_edges)
+
+    if stats is not None:
+        _write_stats(stats)
 
     tstat = tstat[valid_merge]
     xtree = xtree[valid_merge]

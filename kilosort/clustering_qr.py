@@ -687,7 +687,7 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                         st0 = None
 
                     # find new clusters
-                    iclust, iclust0, M, _ = cluster(
+                    iclust, iclust0, M, iclust_init = cluster(
                         Xd, nskip=nskip, n_neigh=n_neigh, max_sub=max_sub,
                         lam=1, seed=seed, device=device, verbose=v
                         )
@@ -701,6 +701,13 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                             torch.cuda.empty_cache()
                         if v:
                             log_performance(logger, header='clustering_qr after gc')
+
+                    if st0 is not None and os.environ.get('KS4_SPLIT_STATS'):
+                        swarmsplitter.write_init_stats(
+                            st0, iclust,
+                            iclust_init.cpu().numpy()
+                            if hasattr(iclust_init, 'cpu') else
+                            np.asarray(iclust_init))
 
                     xtree, tstat, my_clus = hierarchical.maketree(M, iclust, iclust0)
 
