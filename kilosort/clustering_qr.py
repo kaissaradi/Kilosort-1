@@ -195,6 +195,9 @@ def Mstats(M, device=torch.device('cuda')):
 # needs a GPU->CPU sync (~50 us), so it is amortized rather than run every
 # iteration; the loop typically converges long before the 200-iter budget.
 CHECK_EVERY = 5
+# Rounds of alternating assignment before the tree gets the labels; see the
+# call site in run(). 200 is stock (run to the fixed point).
+CLUSTER_ITERS = int(os.environ.get('KS4_CLUSTER_ITERS', 200))
 
 
 def _counts_into(buf, idx_flat, ones, pen_row, pen_col, scale):
@@ -214,9 +217,17 @@ def _counts_into(buf, idx_flat, ones, pen_row, pen_col, scale):
     return buf
 
 
+# Iterations at which the alternating-assignment loop's partition is captured
+# for KS4_CLUSTER_TRACE. The loop starts at `nclust` k-means++ seeds and
+# collapses; the final labels are 12.6% refractorily impossible and nothing
+# downstream can subdivide them, so the question is whether the collapse ever
+# passes through a partition that is finer AND cleaner on its way down.
+_SNAP_ITERS = (0, 1, 2, 3, 5, 7, 10, 15, 25, 50, 100)
+
+
 def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
             nclust=200, seed=1, niter=200, lam=0, device=torch.device('cuda'),
-            verbose=False):
+            verbose=False, snapshots=None):
     # Numerically exact rewrite of the alternating-assignment loop:
     # scatter_add_ into two preallocated float64 buffers replaces the per-call
     # COO build/coalesce/densify (float64 matches the promotion stock gets
@@ -283,12 +294,17 @@ def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
                      ki if use_lam else None, kN, scale)
         iclust = torch.argmax(bufN, 1)
 
+        if snapshots is not None and t in _SNAP_ITERS:
+            snapshots.append(
+                (t, torch.unique(iclust, return_inverse=True)[1].cpu().numpy())
+            )
+
         if can_exit and (t + 1) % CHECK_EVERY == 0:
             if prev is not None and torch.equal(prev, iclust):
                 break
             prev = iclust.clone()
 
-    if verbose:
+    if verbose and niter > 0:
         logger.debug(f'isub: {isub.nbytes / (2**20):.2f} MB, shape: {isub.shape}')
         log_performance(logger, header='clustering_qr.cluster, after isub loop')
 
@@ -687,9 +703,27 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                         st0 = None
 
                     # find new clusters
+                    snaps = [] if (st0 is not None and
+                                   os.environ.get('KS4_CLUSTER_TRACE')) else None
+                    # How many rounds of alternating assignment the tree's
+                    # leaves are taken from. Diagnostic only -- do NOT lower it.
+                    #
+                    # The loop is where the contamination is born: traced on
+                    # d007, the partition goes from 80 leaves per centre at 6.5%
+                    # refractorily impossible after one round to 19 leaves at
+                    # 12.6% at convergence, and at the k-means++ seeds it is
+                    # 2.7%. But truncating it was REFUTED: the leaves get
+                    # cleaner and the OUTPUT gets dirtier (contaminated spike
+                    # mass 8.95% -> 10.73% on d007 at niter=1), and niter=0
+                    # shatters the sort outright (recall 0.909, 2x wall, 4x GPU,
+                    # two ground-truth cells lost). The defect is real here and
+                    # the repair is not; it is the refractory merge veto in
+                    # swarmsplitter. The knob stays only so the measurement can
+                    # be reproduced.
                     iclust, iclust0, M, iclust_init = cluster(
                         Xd, nskip=nskip, n_neigh=n_neigh, max_sub=max_sub,
-                        lam=1, seed=seed, device=device, verbose=v
+                        lam=1, seed=seed, device=device, verbose=v,
+                        niter=CLUSTER_ITERS, snapshots=snaps
                         )
 
                     if clear_cache:
@@ -701,6 +735,9 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                             torch.cuda.empty_cache()
                         if v:
                             log_performance(logger, header='clustering_qr after gc')
+
+                    if snaps is not None:
+                        swarmsplitter.write_trace_stats(st0, snaps, iclust)
 
                     if st0 is not None and os.environ.get('KS4_SPLIT_STATS'):
                         swarmsplitter.write_init_stats(
@@ -715,10 +752,16 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                         Xd.numpy(), xtree, tstat,iclust, my_clus, meta=st0,
                         split_ccg_threshold=ops['settings'].get(
                             'split_ccg_threshold',
-                            swarmsplitter.SPLIT_CCG_THRESHOLD)
+                            swarmsplitter.SPLIT_CCG_THRESHOLD),
+                        refrac_veto=bool(ops['settings'].get(
+                            'refractory_merge_veto',
+                            swarmsplitter.REFRAC_VETO))
                         )
 
                     iclust = swarmsplitter.new_clusters(iclust, my_clus, xtree, tstat)
+
+                    if st0 is not None and os.environ.get('KS4_SPLIT_STATS'):
+                        swarmsplitter.write_post_stats(st0, iclust)
 
                 if v:
                     log_performance(logger, header='clustering_qr.run, after iclust')

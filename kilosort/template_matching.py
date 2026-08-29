@@ -481,9 +481,16 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
             max_sweeps = int(ops['settings'].get('max_merge_sweeps', 10))
         except (KeyError, TypeError, AttributeError):
             max_sweeps = 10
+    # max_merge_sweeps=0 is floored to 1, so it has never turned merging OFF --
+    # it is the single-pass arm, not a no-merge arm. That matters: the A/B that
+    # "cleared" this stage of creating contaminated units compared 10 sweeps
+    # against 1, and the first sweep already makes the merges between the
+    # highest-count units, which is where a fusion would do the most damage. A
+    # negative value is the arm that test never had.
+    no_merge = int(max_sweeps) < 0
     max_sweeps = max(1, int(max_sweeps))
 
-    t = 0
+    t = 0 if not no_merge else NN
     nmerge = 0
     sweep_merges = 0
     sweeps_done = 0
@@ -492,7 +499,7 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
         # (merged-away / empty Wall rows sort last under descending ns).
         if t >= NN or ns[int(isort[t])] == 0:
             sweeps_done += 1
-            if sweep_merges == 0 or sweeps_done >= max_sweeps:
+            if no_merge or sweep_merges == 0 or sweeps_done >= max_sweeps:
                 break
             sweep_merges = 0
             isort = np.argsort(ns)[::-1]

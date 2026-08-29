@@ -394,7 +394,7 @@ EXTRA_PARAMETERS = {
     },
 
     'max_merge_sweeps': {
-        'gui_name': 'max merge sweeps', 'type': int, 'min': 1, 'max': np.inf,
+        'gui_name': 'max merge sweeps', 'type': int, 'min': -1, 'max': np.inf,
         'exclude': [], 'default': 10, 'step': 'postprocessing',
         'description':
             """
@@ -406,7 +406,35 @@ EXTRA_PARAMETERS = {
             its own criteria said to make. Sweeping to a fixpoint fixes that.
             Set to 1 to reproduce the old single-pass behaviour bug-for-bug;
             reaching the limit is not an error, it just leaves the remaining
-            merges unmade.
+            merges unmade. 0 is floored to 1 and is therefore the single-pass
+            arm, not a no-merge arm; -1 is the one that actually makes no merges
+            at all, for isolating what this stage contributes.
+            """
+    },
+
+    'refractory_merge_veto': {
+        'gui_name': 'refractory merge veto', 'type': bool, 'min': None,
+        'max': None, 'exclude': [], 'default': True, 'step': 'clustering',
+        'description':
+            """
+            Refuse a hierarchical merge whose two halves, combined, could not be
+            one neuron -- more sub-refractory ISIs than chance allows, with the
+            spike count to make that significant.
+
+            The other gates ask whether the two halves belong together (global
+            modularity, a cross-correlogram refractory dip, bimodality of the
+            projection). None of them asks whether the RESULT is a single cell,
+            and 25% of the merges the splitter kept produced a union that was
+            refractorily impossible. Because maketree only agglomerates and the
+            splitter only prunes merges, such a fusion is permanent: no later
+            stage in the sorter can subdivide it.
+
+            The veto only ever turns a keep-merged into a split, so it can add
+            fragments but never fuse anything. Measured on four ground-truth
+            benches at five seeds each: contaminated spike mass down 16% (d007,
+            d005), 20% (d501) and 6% (data002), improving on 10 of 10 seeds,
+            with recall bit-identical on 10 of 12 seed pairs and one seed
+            improved. Set False to reproduce the previous behaviour.
             """
     },
 

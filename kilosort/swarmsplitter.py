@@ -4,6 +4,7 @@ import numpy as np
 from numba import njit
 import math
 from scipy.ndimage import gaussian_filter1d
+from scipy.stats import poisson
 from kilosort.CCG import compute_CCG, CCG_metrics
 
 
@@ -197,6 +198,37 @@ _LAST_BIMOD = {}
 _STATS_PATH = os.environ.get('KS4_SPLIT_STATS')
 
 
+# Veto a merge whose union cannot be one neuron, whatever the other gates say.
+#
+# The clustering stage hands over MORE contaminated spike mass than its own tree
+# leaves carry -- 10.2% -> 13.0% on d007, 10.4% -> 11.8% on d005 -- so its
+# accepted merges are building contaminated units out of cleaner pieces. And
+# they are visible: 25% of the merges split() keeps produce a union with
+# sub-refractory ISIs far above chance, nearly all of them waved through by the
+# CCG gate. That gate asks whether the two halves fire together; it never asks
+# whether the result could be a single cell.
+#
+# On by default; the `refractory_merge_veto` setting carries the measurements.
+# The bar is the same one the GT-free contamination metric uses, so a unit this
+# vetoes is a unit that metric would have counted.
+REFRAC_VETO = True
+
+
+def _impossible(obs, exp, ratio=0.35, alpha=0.01):
+    """Is this violation count too high to be one neuron, with power to say so?
+
+    Two conditions, not one: the count has to be a real fraction of what
+    independence would produce (a handful of violations on a huge train is a
+    clean cell), and it has to be unlikely under Poisson at that rate (a
+    handful on a small train is noise). Either alone misfires -- the raw
+    violation percentage is diluted by unit size, which is how an earlier ISI
+    test produced five false over-splits.
+    """
+    if exp <= 0:
+        return False
+    return obs >= ratio * exp and poisson.sf(obs - 1, exp) < alpha
+
+
 def _rvi(st, refrac=0.0015):
     """Sub-refractory ISI count and its chance expectation for one train.
 
@@ -214,6 +246,42 @@ def _rvi(st, refrac=0.0015):
         return n, 0, 0.0
     obs = int(np.count_nonzero(np.diff(st) < refrac))
     return n, obs, (n - 1) * (n / T) * refrac
+
+
+_TRACE_PATH = os.environ.get('KS4_CLUSTER_TRACE')
+_TRACE_CENTER = [0]
+
+
+def write_trace_stats(meta, snapshots, iclust_final):
+    """Is there a partition on the way down that is finer AND cleaner?
+
+    cluster() collapses 200 k-means++ seeds to ~13 labels, and those labels are
+    already 12.6% refractorily impossible -- a fusion nothing downstream can
+    undo, because maketree only agglomerates and split() only prunes merges.
+    So the collapse is the suspect. Record the partition at a ladder of
+    iterations, plus the fixed point as t=-1, with per-leaf refractory counts,
+    and let the analysis say whether an intermediate granularity exists at all.
+
+    Leaves are written whole, including tiny ones: a leaf below the 300-spike
+    floor cannot be judged clean or dirty, and dropping it here would hide how
+    much of the spike mass the finer partitions shatter -- which is the cost
+    side of the trade and the thing that killed the init-label probe.
+    """
+    if not _TRACE_PATH:
+        return
+    _TRACE_CENTER[0] += 1
+    c = _TRACE_CENTER[0]
+    meta = np.asarray(meta)
+    new = not os.path.exists(_TRACE_PATH)
+    with open(_TRACE_PATH, 'a') as f:
+        if new:
+            f.write('center\tt\tnclust\tleaf\tn\tobs\texp\n')
+        for t, lab in list(snapshots) + [(-1, np.asarray(iclust_final))]:
+            u = np.unique(lab)
+            for j in u:
+                n, obs, exp = _rvi(meta[lab == j])
+                f.write('%d\t%d\t%d\t%d\t%d\t%d\t%.6g\n'
+                        % (c, t, u.size, int(j), n, obs, exp))
 
 
 def write_init_stats(meta, iclust, iclust_init):
@@ -244,6 +312,28 @@ def write_init_stats(meta, iclust, iclust_init):
                 sn, so, se = _rvi(meta[m][sub == j])
                 f.write('%d\t%d\t%d\t%.6g\t%d\t%d\t%d\t%.6g\n'
                         % (c, n, obs, exp, int(j), sn, so, se))
+
+
+def write_post_stats(meta, iclust):
+    """The units the CLUSTERING stage hands over, before template matching.
+
+    The leaves get cleaner when the collapse is cut short, but the final output
+    gets dirtier -- so the contamination in the output is not simply inherited
+    from the partition. Something between the two redistributes it. Scoring the
+    labels at this exact point splits the pipeline in half: contamination
+    already here is the clustering stage's, contamination only in
+    spike_clusters.npy is template matching assigning two neurons' spikes to one
+    template.
+    """
+    if not _STATS_PATH:
+        return
+    path = _STATS_PATH + '.post'
+    new = not os.path.exists(path)
+    with open(path, 'a') as f:
+        if new:
+            f.write('unit\tn\tobs\texp\n')
+        for c in np.unique(iclust):
+            f.write('%d\t%d\t%d\t%.6g\n' % ((int(c),) + _rvi(meta[iclust == c])))
 
 
 def _write_leaf_stats(meta, iclust):
@@ -332,7 +422,8 @@ def refractoriness(st1, st2, assume_sorted=False,
     return criterion
 
 def split(Xd, xtree, tstat, iclust, my_clus, verbose = False, meta = None,
-          meta_sorted=True, split_ccg_threshold=SPLIT_CCG_THRESHOLD):
+          meta_sorted=True, split_ccg_threshold=SPLIT_CCG_THRESHOLD,
+          refrac_veto=REFRAC_VETO):
     xtree = np.array(xtree)
     iclust = np.asarray(iclust)
 
@@ -393,6 +484,16 @@ def split(Xd, xtree, tstat, iclust, my_clus, verbose = False, meta = None,
                 criterion = 2 * (score < .6) - 1
                 gate = 'bimod'
 
+        # Whatever the gates concluded, a union that cannot be one neuron is
+        # not one unit. This runs after them and only ever turns a KEEP-MERGED
+        # into a split, so it can add fragments but never fuse anything.
+        if (refrac_veto and criterion == 1 and meta is not None
+                and ix1 is not None):
+            _, _uo, _ue = _rvi(meta[ix1 | ix2])
+            if _impossible(_uo, _ue):
+                criterion = -1
+                gate = 'refrac'
+
         if stats is not None:
             n1 = int(ix1.sum()) if ix1 is not None else -1
             n2 = int(ix2.sum()) if ix2 is not None else -1
@@ -418,13 +519,13 @@ def split(Xd, xtree, tstat, iclust, my_clus, verbose = False, meta = None,
                           int(uo), float(ue),
                           int(criterion != 1)))
 
-            if criterion == 0:
-                # fourth mutation is local modularity (not reachable)
-                score = tstat[kk, -1]
-                criterion = score > .15
+        if criterion == 0:
+            # fourth mutation is local modularity (not reachable)
+            score = tstat[kk, -1]
+            criterion = score > .15
 
-            if verbose:
-                n1, n2 = int(ix1.sum()), int(ix2.sum())
+        if verbose:
+            n1, n2 = int(ix1.sum()), int(ix2.sum())
                 # print('%3.0d, %6.0d, %6.0d, %6.0d, %2.2f,%4.2f, %2.2f'%(kk, n1, n2,n1+n2,
                 # tstat[kk,0], tstat[kk,-1], score))
 

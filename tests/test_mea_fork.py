@@ -379,3 +379,88 @@ def test_nothing_mergeable_terminates_in_one_sweep():
                                          max_sweeps=10)
     assert Ww.shape[0] == 4
     assert len(np.unique(clu2)) == 4
+
+
+# ---------------------------------------------------------------------------
+# Refractory merge veto: refuse a merge whose union cannot be one neuron.
+#
+# The splitter's other gates all ask whether the two halves belong together;
+# none asks whether the RESULT is a single cell. Because maketree only
+# agglomerates and split() only prunes merges, a fusion made here is permanent,
+# so a regression in this gate cannot be caught by any later stage.
+
+def test_veto_needs_both_a_ratio_and_significance():
+    """Either test alone misfires, in opposite directions.
+
+    A handful of violations on a huge train is a clean cell, which the ratio
+    catches; a handful on a tiny train is noise, which the Poisson tail catches.
+    An earlier ISI test used the raw violation percentage alone and produced
+    five false over-splits.
+
+    The pair is deliberately conservative, and matches the GT-free contamination
+    metric bar for bar (scripts/qa.py): a unit whose count is a high fraction of
+    chance but not significantly above it is UNDECIDED, not contaminated, and
+    this veto leaves it merged. That is why it fires on only a quarter of kept
+    merges instead of shattering the sort.
+    """
+    imp = swarmsplitter._impossible
+    assert imp(60, 20)           # far above chance, with the events to prove it
+    assert not imp(2, 100)       # far below chance: a clean cell
+    assert not imp(60, 100)      # ratio is high, significance is not: undecided
+    assert not imp(2, 2)         # at chance but far too few events to say
+    assert not imp(5, 0)         # no expectation -> no claim
+
+
+def test_veto_turns_a_kept_merge_into_a_split():
+    """Two trains that interleave freely must not be left as one unit."""
+    rng = np.random.default_rng(0)
+    # One train, refractory. The other is the same cell shifted by half a
+    # refractory period, so every gate that looks at the two halves separately
+    # sees two clean, well-separated cells -- and their union does not.
+    a = np.cumsum(rng.uniform(0.004, 0.02, 4000))
+    b = a + 0.0007
+    meta = np.concatenate([a, b])
+    iclust = np.concatenate([np.zeros(a.size, int), np.ones(b.size, int)])
+    xtree = np.array([[0, 1, 2]], dtype=np.int32)
+    # tstat[:,0] must clear the modularity gate or the node is split for an
+    # unrelated reason and the test proves nothing.
+    tstat = np.array([[1.0, 2.0, 1.0]], dtype=np.float32)
+    my_clus = [[0], [1], [0, 1]]
+    Xd = np.zeros((meta.size, 2), dtype=np.float32)
+
+    kept = swarmsplitter.split(Xd, xtree, tstat, iclust, my_clus, meta=meta,
+                               meta_sorted=False, refrac_veto=False)
+    vetoed = swarmsplitter.split(Xd, xtree, tstat, iclust, my_clus, meta=meta,
+                                 meta_sorted=False, refrac_veto=True)
+    assert kept[0].shape[0] == 0, 'without the veto this merge is kept'
+    assert vetoed[0].shape[0] == 1, 'the veto must leave the merge unmade'
+
+
+def test_veto_never_creates_a_merge():
+    """It may only turn keep-merged into split, so it cannot fuse anything."""
+    rng = np.random.default_rng(1)
+    # Two genuinely separate, refractory cells: the union is fine, so the veto
+    # has nothing to say and must not change the outcome either way.
+    a = np.cumsum(rng.uniform(0.01, 0.03, 2000))
+    b = np.cumsum(rng.uniform(0.01, 0.03, 2000)) + 0.005
+    meta = np.concatenate([a, b])
+    iclust = np.concatenate([np.zeros(a.size, int), np.ones(b.size, int)])
+    xtree = np.array([[0, 1, 2]], dtype=np.int32)
+    tstat = np.array([[1.0, 2.0, 1.0]], dtype=np.float32)
+    my_clus = [[0], [1], [0, 1]]
+    Xd = np.zeros((meta.size, 2), dtype=np.float32)
+    off = swarmsplitter.split(Xd, xtree, tstat, iclust, my_clus, meta=meta,
+                              meta_sorted=False, refrac_veto=False)
+    on = swarmsplitter.split(Xd, xtree, tstat, iclust, my_clus, meta=meta,
+                             meta_sorted=False, refrac_veto=True)
+    assert on[0].shape[0] >= off[0].shape[0]
+
+
+def test_veto_default_is_on_and_reaches_the_setting():
+    import inspect
+    assert swarmsplitter.REFRAC_VETO is True
+    p = inspect.signature(swarmsplitter.split).parameters['refrac_veto']
+    assert p.default is swarmsplitter.REFRAC_VETO
+    from kilosort.parameters import MAIN_PARAMETERS, EXTRA_PARAMETERS
+    allp = {**MAIN_PARAMETERS, **EXTRA_PARAMETERS}
+    assert allp['refractory_merge_veto']['default'] is True
