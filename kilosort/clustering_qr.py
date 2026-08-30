@@ -195,6 +195,28 @@ def Mstats(M, device=torch.device('cuda')):
 # needs a GPU->CPU sync (~50 us), so it is amortized rather than run every
 # iteration; the loop typically converges long before the 200-iter budget.
 CHECK_EVERY = 5
+
+
+def _veto_on(ops):
+    """Is the refractory merge veto on for this run, and who said so?
+
+    KS4_REFRAC_VETO exists because the arm scripts that first measured the veto
+    used it, and for a while nothing read it: the confirmation sweep set it on
+    every arm while the code took the value from the setting, so a "veto off"
+    arm and a "veto on" arm were the same run. That failure was silent, which is
+    the only reason it survived a whole sweep. The env var now wins outright and
+    says so in the log, so a stale one can never quietly agree with you again.
+    """
+    val = bool(ops['settings'].get('refractory_merge_veto',
+                                   swarmsplitter.REFRAC_VETO))
+    env = os.environ.get('KS4_REFRAC_VETO')
+    if env is not None:
+        override = env.strip().lower() not in ('0', 'false', 'no', '')
+        if override != val:
+            logger.info('refractory merge veto: %s (KS4_REFRAC_VETO=%s '
+                        'overrides the setting)', override, env)
+        val = override
+    return val
 # Rounds of alternating assignment before the tree gets the labels; see the
 # call site in run(). 200 is stock (run to the fixed point).
 CLUSTER_ITERS = int(os.environ.get('KS4_CLUSTER_ITERS', 200))
@@ -753,9 +775,13 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                         split_ccg_threshold=ops['settings'].get(
                             'split_ccg_threshold',
                             swarmsplitter.SPLIT_CCG_THRESHOLD),
-                        refrac_veto=bool(ops['settings'].get(
-                            'refractory_merge_veto',
-                            swarmsplitter.REFRAC_VETO))
+                        refrac_veto=_veto_on(ops),
+                        refrac_veto_ratio=float(ops['settings'].get(
+                            'refractory_veto_ratio',
+                            swarmsplitter.REFRAC_VETO_RATIO)),
+                        refrac_veto_alpha=float(ops['settings'].get(
+                            'refractory_veto_alpha',
+                            swarmsplitter.REFRAC_VETO_ALPHA)),
                         )
 
                     iclust = swarmsplitter.new_clusters(iclust, my_clus, xtree, tstat)

@@ -464,3 +464,56 @@ def test_veto_default_is_on_and_reaches_the_setting():
     from kilosort.parameters import MAIN_PARAMETERS, EXTRA_PARAMETERS
     allp = {**MAIN_PARAMETERS, **EXTRA_PARAMETERS}
     assert allp['refractory_merge_veto']['default'] is True
+
+
+def test_veto_bar_is_settable_and_changes_the_verdict():
+    """The bar is a measurement, not a constant, so it has to reach split().
+
+    0.35/0.01 was inherited from the metric the veto is scored on. That makes
+    the headline partly self-referential and makes the bar itself the next thing
+    to sweep -- which is only possible if both numbers thread through.
+    """
+    imp = swarmsplitter._impossible
+    # One union, 15 violations where chance gives 10: ratio 1.5, Poisson tail
+    # 0.083. It sits between the two alphas and under the strict ratio, so each
+    # knob decides it on its own.
+    assert imp(15, 10, ratio=0.35, alpha=0.10)
+    assert not imp(15, 10, ratio=0.35, alpha=0.05), 'alpha must be consulted'
+    assert not imp(15, 10, ratio=2.00, alpha=0.10), 'ratio must be consulted'
+
+    import inspect
+    p = inspect.signature(swarmsplitter.split).parameters
+    assert p['refrac_veto_ratio'].default == swarmsplitter.REFRAC_VETO_RATIO
+    assert p['refrac_veto_alpha'].default == swarmsplitter.REFRAC_VETO_ALPHA
+    from kilosort.parameters import MAIN_PARAMETERS, EXTRA_PARAMETERS
+    allp = {**MAIN_PARAMETERS, **EXTRA_PARAMETERS}
+    assert allp['refractory_veto_ratio']['default'] == 0.35
+    assert allp['refractory_veto_alpha']['default'] == 0.01
+
+
+def test_stale_env_toggle_cannot_silently_agree_with_the_setting():
+    """KS4_REFRAC_VETO must win outright, or not exist.
+
+    The confirmation sweep set it on every arm while the committed code read
+    only the setting, so a "veto off" arm ran the veto. Nothing failed and
+    nothing warned; the sweep just quietly compared a config with itself. An env
+    var that half-works is worse than either alternative, so this pins the
+    override.
+    """
+    import os
+    from kilosort import clustering_qr
+    ops = {'settings': {'refractory_merge_veto': True}}
+    old = os.environ.pop('KS4_REFRAC_VETO', None)
+    try:
+        assert clustering_qr._veto_on(ops) is True
+        os.environ['KS4_REFRAC_VETO'] = '0'
+        assert clustering_qr._veto_on(ops) is False, 'env must override the setting'
+        os.environ['KS4_REFRAC_VETO'] = '1'
+        ops['settings']['refractory_merge_veto'] = False
+        assert clustering_qr._veto_on(ops) is True
+        del os.environ['KS4_REFRAC_VETO']
+        assert clustering_qr._veto_on(ops) is False, 'setting rules when env is absent'
+    finally:
+        os.environ.pop('KS4_REFRAC_VETO', None)
+        if old is not None:
+            os.environ['KS4_REFRAC_VETO'] = old

@@ -412,6 +412,38 @@ EXTRA_PARAMETERS = {
             """
     },
 
+    'refractory_veto_ratio': {
+        'gui_name': 'refractory veto ratio', 'type': float, 'min': 0.0,
+        'max': 2.0, 'exclude': [], 'default': 0.35, 'step': 'clustering',
+        'description':
+            """
+            How many sub-refractory ISIs a union may have, as a fraction of the
+            count independent spike trains at the same rates would produce,
+            before refractory_merge_veto refuses the merge. Lower is stricter.
+
+            0.35 is inherited from the GT-free contamination metric this veto is
+            scored on, which makes that headline partly self-referential; the
+            value is worth sweeping on its own rather than assumed.
+            """
+    },
+
+    'refractory_veto_alpha': {
+        'gui_name': 'refractory veto alpha', 'type': float, 'min': 0.0,
+        'max': 1.0, 'exclude': [], 'default': 0.01, 'step': 'clustering',
+        'description':
+            """
+            Significance required before refractory_veto_ratio is acted on: the
+            Poisson survival probability of the observed violation count at the
+            chance rate must fall below this. It is what stops a handful of
+            violations on a small unit from being read as two neurons.
+
+            Ratio without alpha misfires on small units, alpha without ratio
+            misfires on large ones -- the raw violation percentage is diluted by
+            unit size, which is how an earlier ISI test produced five false
+            over-splits. Both conditions are required.
+            """
+    },
+
     'refractory_merge_veto': {
         'gui_name': 'refractory merge veto', 'type': bool, 'min': None,
         'max': None, 'exclude': [], 'default': True, 'step': 'clustering',

@@ -213,8 +213,18 @@ _STATS_PATH = os.environ.get('KS4_SPLIT_STATS')
 # vetoes is a unit that metric would have counted.
 REFRAC_VETO = True
 
+# The bar itself. Both halves matter and neither is arbitrary: RATIO is how much
+# of the chance-expected violation count a single cell is allowed to produce,
+# ALPHA is how sure we have to be that the excess is not Poisson noise. They are
+# module-level and settable so the bar can be swept rather than asserted -- the
+# shipped 0.35/0.01 was inherited from the GT-free contamination metric, which
+# makes the headline partly self-referential and makes an independent sweep of
+# these two the obvious next measurement.
+REFRAC_VETO_RATIO = 0.35
+REFRAC_VETO_ALPHA = 0.01
 
-def _impossible(obs, exp, ratio=0.35, alpha=0.01):
+
+def _impossible(obs, exp, ratio=REFRAC_VETO_RATIO, alpha=REFRAC_VETO_ALPHA):
     """Is this violation count too high to be one neuron, with power to say so?
 
     Two conditions, not one: the count has to be a real fraction of what
@@ -423,7 +433,8 @@ def refractoriness(st1, st2, assume_sorted=False,
 
 def split(Xd, xtree, tstat, iclust, my_clus, verbose = False, meta = None,
           meta_sorted=True, split_ccg_threshold=SPLIT_CCG_THRESHOLD,
-          refrac_veto=REFRAC_VETO):
+          refrac_veto=REFRAC_VETO, refrac_veto_ratio=REFRAC_VETO_RATIO,
+          refrac_veto_alpha=REFRAC_VETO_ALPHA):
     xtree = np.array(xtree)
     iclust = np.asarray(iclust)
 
@@ -490,7 +501,7 @@ def split(Xd, xtree, tstat, iclust, my_clus, verbose = False, meta = None,
         if (refrac_veto and criterion == 1 and meta is not None
                 and ix1 is not None):
             _, _uo, _ue = _rvi(meta[ix1 | ix2])
-            if _impossible(_uo, _ue):
+            if _impossible(_uo, _ue, refrac_veto_ratio, refrac_veto_alpha):
                 criterion = -1
                 gate = 'refrac'
 
