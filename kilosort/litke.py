@@ -262,7 +262,12 @@ def unpack_samples_python(buf: np.ndarray, n_samples: int,
         for i in range(n_samples):
             b1, b2 = int(buf[k]), int(buf[k + 1])
             k += 2
-            out[i, 0] = (b1 << 8) | (b2 & 0xFF)
+            # The TTL prefix is a signed raw 16-bit word.  NumPy <2 silently
+            # wrapped values above INT16_MAX on assignment; NumPy 2 raises an
+            # OverflowError instead, so perform the two's-complement conversion
+            # explicitly.  This remains bit-identical to _unpack_odd_numba.
+            word = (b1 << 8) | (b2 & 0xFF)
+            out[i, 0] = word - 0x10000 if word >= 0x8000 else word
             for j in range(1, n_elec, 2):
                 b1, b2, b3 = int(buf[k]), int(buf[k + 1]), int(buf[k + 2])
                 k += 3
