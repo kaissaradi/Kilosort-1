@@ -411,7 +411,10 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
 
     acg_threshold = ops['settings']['acg_threshold']
     ccg_threshold = ops['settings']['ccg_threshold']
+    final_merge_union_acg_veto = False
     if mode == 'ccg':
+        final_merge_union_acg_veto = bool(ops['settings'].get(
+            'final_merge_union_acg_veto', False))
         is_ref, est_contam_rate = CCG.refract(clu, st[:,0]/ops['fs'],
                                               acg_threshold=acg_threshold,
                                               ccg_threshold=ccg_threshold)
@@ -492,6 +495,7 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
 
     t = 0 if not no_merge else NN
     nmerge = 0
+    union_acg_veto_count = 0
     sweep_merges = 0
     sweeps_done = 0
     while True:
@@ -560,9 +564,30 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
                     is_ccg = dmu.abs() < 0.2
 
             if is_ccg:
-                is_merged[jj] = 1
-                dt = (imax[kk] -imax[jj]).item()
+                dt = (imax[kk] - imax[jj]).item()
                 idx = spike_idx.get(jj, np.zeros(0, dtype=np.int64))
+                if final_merge_union_acg_veto:
+                    # Check the exact union that would be committed below:
+                    # shift candidate samples in sample space first, then
+                    # convert to seconds, matching `st[idx, 0] -= dt`.
+                    st0_union = st[spike_idx[kk], 0] / ops['fs']
+                    st1_union = np.array(st[idx, 0], copy=True)
+                    if dt != 0 and check_dt and idx.size:
+                        st1_union -= dt
+                    st_union = np.sort(np.concatenate((
+                        st0_union, st1_union / ops['fs'])))
+                    is_union_ref, _, _ = CCG.check_CCG(
+                        st_union,
+                        acg_threshold=acg_threshold,
+                        ccg_threshold=ccg_threshold,
+                        assume_sorted=True,
+                    )
+                    if not is_union_ref:
+                        union_acg_veto_count += 1
+                        is_ccg = 0
+                        continue
+
+                is_merged[jj] = 1
                 if dt != 0 and check_dt and idx.size:
                     # Update tF and Wall with shifted features
                     tF, Wall = roll_features(W, tF, Ww, idx, jj, dt)
@@ -595,6 +620,13 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
             nmerge+=1
             sweep_merges += 1
     
+    if mode == 'ccg':
+        ops['final_merge_count'] = int(nmerge)
+        ops['final_merge_sweeps'] = int(sweeps_done)
+        ops['final_merge_sweep_cap_hit'] = bool(
+            not no_merge and sweep_merges > 0 and sweeps_done >= max_sweeps)
+        ops['final_merge_union_acg_veto_count'] = int(union_acg_veto_count)
+
     imap = np.cumsum((~is_merged).astype('int32')) - 1
     if imap.size > 0:
         # Otherwise, everything has been merged into a single cluster
