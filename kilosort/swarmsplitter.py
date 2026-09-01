@@ -103,9 +103,10 @@ def check_split(Xd, kk, xtree, iclust, my_clus, member_tables=None):
     w[pos, 0] = n_neg / n
     w[neg, 0] = n_pos / n
 
-    CC = Xs.T @ (Xs * w)
+    Xs_weighted = Xs * w
+    CC = Xs.T @ Xs_weighted
     CC = CC + .01 * np.eye(CC.shape[0])
-    b = np.linalg.solve(CC, labels @ (Xs * w))
+    b = np.linalg.solve(CC, labels @ Xs_weighted)
     xproj = Xs @ b
 
     score = bimod_score(xproj)

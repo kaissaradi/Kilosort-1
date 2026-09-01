@@ -367,11 +367,9 @@ def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'), verbose=
     np.random.seed(seed)
 
     ntry = 100  # number of candidate cluster centroids to test on each iteration
-    n_spikes, n_features = Xg.shape
-    # Need to store the spike features used for each cluster centroid (mu),
-    # best variance explained so far for each spike (vexp0),
-    # and the cluster assignment for each spike (iclust).
-    mu = torch.zeros((niter, n_features), device = device)
+    n_spikes = Xg.shape[0]
+    # Track the best variance explained so far for each spike and its cluster.
+    # The selected centroid matrix was previously stored but never read.
     vexp0 = torch.zeros(n_spikes, device = device)
     iclust = torch.zeros((n_spikes,), dtype = torch.int, device = device)
 
@@ -422,7 +420,6 @@ def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'), verbose=
             ix = dexp[:, imax] > 0
 
             iclust[ix] = j    # assign new cluster identity
-            mu[j] = Xc[imax]  # spike features used as centroid for cluster j
             # Update variance explained for the spikes assigned to cluster j
             vexp0[ix] = vexp[ix, imax]
 
