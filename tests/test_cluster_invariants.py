@@ -93,14 +93,6 @@ def test_split_local_modularity_fallback_is_unreachable(monkeypatch):
     assert low_result[0].shape == (1, 3)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Desired invariant: kmeans_plusplus should use local RNG generators "
-        "and leave caller NumPy/Torch global RNG state unchanged; current "
-        "implementation calls torch.manual_seed and np.random.seed."
-    ),
-)
 def test_kmeans_plusplus_should_preserve_global_rng_state():
     Xg = torch.from_numpy(
         np.random.default_rng(7).normal(size=(200, 4)).astype(np.float32)
@@ -122,6 +114,23 @@ def test_kmeans_plusplus_should_preserve_global_rng_state():
 
     assert torch.equal(torch_before, torch_after)
     assert _same_numpy_rng_state(numpy_before, numpy_after)
+
+
+def test_local_generator_reproduces_fresh_global_generator_draws():
+    weights = torch.linspace(1, 100, 100, dtype=torch.float32)
+    original_state = torch.random.get_rng_state().clone()
+    try:
+        for seed in (0, 1, 9, 2026):
+            torch.manual_seed(seed)
+            reference = torch.multinomial(weights, 20, replacement=False)
+            generator = torch.Generator(device=torch.device("cpu"))
+            generator.manual_seed(seed)
+            local = torch.multinomial(
+                weights, 20, replacement=False, generator=generator
+            )
+            torch.testing.assert_close(local, reference, rtol=0, atol=0)
+    finally:
+        torch.random.set_rng_state(original_state)
 
 
 def test_symmetric_center_tie_currently_depends_on_torch_rng():

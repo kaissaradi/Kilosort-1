@@ -363,8 +363,8 @@ def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'), verbose=
     else:
         subsample = False
 
-    torch.manual_seed(seed)
-    np.random.seed(seed)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(seed)
 
     ntry = 100  # number of candidate cluster centroids to test on each iteration
     n_spikes = Xg.shape[0]
@@ -396,7 +396,9 @@ def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'), verbose=
         if n_pos <= 0:
             break
         n_draw = min(ntry, n_pos)
-        draws = torch.multinomial(weights, n_draw, replacement=False)
+        draws = torch.multinomial(
+            weights, n_draw, replacement=False, generator=generator
+        )
         isamp = rev_idx[draws] if subsample else draws
 
         try:
