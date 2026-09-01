@@ -6,7 +6,7 @@ from kilosort import io
 
 
 def _export_inputs():
-    st = np.array([[10, 0, 1.0], [20, 1, 1.0]], dtype=np.float64)
+    st = np.array([[10, 0, 1.0], [20, 2, 1.0]], dtype=np.float64)
     clu = np.array([0, 1], dtype=np.float64)
     tF = torch.ones((2, 1, 1))
     Wall = torch.ones((2, 1, 1))
@@ -19,6 +19,7 @@ def _export_inputs():
     ops = {
         'Wrot': torch.eye(1),
         'wPCA': torch.ones((1, 1)),
+        'iU': torch.arange(3),
         'fs': 30_000,
         'nt': 1,
         'duplicate_spike_bins': 15,
@@ -46,7 +47,7 @@ def _set_nonintegral_cluster(st, clu):
 
 
 def _set_invalid_template(st, clu):
-    st[0, 1] = 2
+    st[0, 1] = 3
 
 
 def _set_invalid_cluster(st, clu):
@@ -159,6 +160,8 @@ def test_save_to_phy_normalizes_numpy_dtype_in_params(
     tmp_path, patched_export_dependencies
 ):
     st, clu, tF, Wall, probe, ops = _export_inputs()
+    assert st[1, 1] >= Wall.shape[0]
+    assert st[1, 1] < len(ops['iU'])
     result_dir = tmp_path / 'results'
 
     io.save_to_phy(

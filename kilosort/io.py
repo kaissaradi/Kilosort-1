@@ -1,5 +1,4 @@
 import json
-import copy
 from pathlib import Path
 from typing import Tuple, Union
 import os, shutil
@@ -27,7 +26,7 @@ from kilosort.utils import log_performance
 _torch_warning = ".*PyTorch does not support non-writable tensors"
 
 
-def _validate_save_to_phy_inputs(st, clu, tF, Wall):
+def _validate_save_to_phy_inputs(st, clu, tF, Wall, ops):
     """Validate the aligned spike arrays before creating any export files."""
     st = np.asarray(st)
     clu = np.asarray(clu)
@@ -40,6 +39,12 @@ def _validate_save_to_phy_inputs(st, clu, tF, Wall):
         raise ValueError("tF must be a 3D torch tensor")
     if not isinstance(Wall, torch.Tensor) or Wall.ndim < 1:
         raise ValueError("Wall must be a torch tensor with a unit dimension")
+    try:
+        n_templates = len(ops['iU'])
+    except (KeyError, TypeError):
+        raise ValueError(
+            "ops must contain the original detection-template index array iU"
+        ) from None
 
     n_spikes = st.shape[0]
     if len(clu) != n_spikes or tF.shape[0] != n_spikes:
@@ -54,11 +59,15 @@ def _validate_save_to_phy_inputs(st, clu, tF, Wall):
     if times.size > 1 and np.any(np.diff(times) < 0):
         raise ValueError("spike times must be sorted in nondecreasing order")
 
-    for name, labels in (("template", template_labels), ("cluster", clu)):
+    label_limits = (
+        ("template", template_labels, n_templates),
+        ("cluster", clu, Wall.shape[0]),
+    )
+    for name, labels, n_labels in label_limits:
         if not np.isfinite(labels).all() or not np.equal(labels, np.round(labels)).all():
             raise ValueError(f"{name} labels must be finite integers")
-        if np.any(labels < 0) or np.any(labels >= Wall.shape[0]):
-            raise ValueError(f"{name} labels must be valid indices for Wall")
+        if np.any(labels < 0) or np.any(labels >= n_labels):
+            raise ValueError(f"{name} labels must be valid indices for its namespace")
 
 
 def find_binary(data_dir: Union[str, os.PathLike]) -> Path:
@@ -355,7 +364,7 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
 
     """
 
-    _validate_save_to_phy_inputs(st, clu, tF, Wall)
+    _validate_save_to_phy_inputs(st, clu, tF, Wall, ops)
 
     if results_dir is None:
         results_dir = ops['data_dir'].joinpath('kilosort4')
@@ -518,9 +527,10 @@ def save_ops(ops, results_dir=None):
         results_dir = Path(results_dir)
     results_dir.mkdir(exist_ok=True)
 
-    # Work on an independent object: nested settings are normalized below and
-    # must not alter the caller's live run state.
-    ops = copy.deepcopy(ops)
+    # Only the mappings mutated below need copying. Tensor-bearing values can
+    # remain shared, avoiding an export-time copy of the full run state.
+    ops = ops.copy()
+    ops['settings'] = ops['settings'].copy()
     # Convert paths to strings before saving, otherwise ops can only be loaded
     # on the system that originally ran the code (causes problems for tests).
     ops['settings']['results_dir'] = str(results_dir)
