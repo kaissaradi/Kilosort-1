@@ -1,4 +1,5 @@
 import json
+import copy
 from pathlib import Path
 from typing import Tuple, Union
 import os, shutil
@@ -24,6 +25,40 @@ from kilosort.postprocessing import (
 from kilosort.utils import log_performance
 
 _torch_warning = ".*PyTorch does not support non-writable tensors"
+
+
+def _validate_save_to_phy_inputs(st, clu, tF, Wall):
+    """Validate the aligned spike arrays before creating any export files."""
+    st = np.asarray(st)
+    clu = np.asarray(clu)
+
+    if st.ndim != 2 or st.shape[1] < 2:
+        raise ValueError("st must be a 2D array with at least two columns")
+    if clu.ndim != 1:
+        raise ValueError("clu must be a 1D array")
+    if not isinstance(tF, torch.Tensor) or tF.ndim != 3:
+        raise ValueError("tF must be a 3D torch tensor")
+    if not isinstance(Wall, torch.Tensor) or Wall.ndim < 1:
+        raise ValueError("Wall must be a torch tensor with a unit dimension")
+
+    n_spikes = st.shape[0]
+    if len(clu) != n_spikes or tF.shape[0] != n_spikes:
+        raise ValueError(
+            "st, clu, and tF must contain the same number of spikes"
+        )
+
+    times = st[:, 0]
+    template_labels = st[:, 1]
+    if not np.isfinite(times).all() or not np.equal(times, np.round(times)).all():
+        raise ValueError("spike times must be finite integer sample indices")
+    if times.size > 1 and np.any(np.diff(times) < 0):
+        raise ValueError("spike times must be sorted in nondecreasing order")
+
+    for name, labels in (("template", template_labels), ("cluster", clu)):
+        if not np.isfinite(labels).all() or not np.equal(labels, np.round(labels)).all():
+            raise ValueError(f"{name} labels must be finite integers")
+        if np.any(labels < 0) or np.any(labels >= Wall.shape[0]):
+            raise ValueError(f"{name} labels must be valid indices for Wall")
 
 
 def find_binary(data_dir: Union[str, os.PathLike]) -> Path:
@@ -320,6 +355,8 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
 
     """
 
+    _validate_save_to_phy_inputs(st, clu, tF, Wall)
+
     if results_dir is None:
         results_dir = ops['data_dir'].joinpath('kilosort4')
     results_dir = Path(results_dir)
@@ -429,7 +466,7 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
                             (results_dir / f'cluster_group.tsv'))
 
     # params.py
-    dtype = "'int16'" if data_dtype is None else f"'{data_dtype}'"
+    dtype = f"'{np.dtype('int16' if data_dtype is None else data_dtype).name}'"
     params = {
         'n_channels_dat': ops['settings']['n_chan_bin'],
         'offset': 0,
@@ -481,7 +518,9 @@ def save_ops(ops, results_dir=None):
         results_dir = Path(results_dir)
     results_dir.mkdir(exist_ok=True)
 
-    ops = ops.copy()
+    # Work on an independent object: nested settings are normalized below and
+    # must not alter the caller's live run state.
+    ops = copy.deepcopy(ops)
     # Convert paths to strings before saving, otherwise ops can only be loaded
     # on the system that originally ran the code (causes problems for tests).
     ops['settings']['results_dir'] = str(results_dir)
