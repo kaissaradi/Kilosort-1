@@ -710,7 +710,7 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                     nearby_chans_empty += 1
                     continue
 
-                st0 = st[igood, 0] / ops['fs'] if mode == 'template' else None
+                st0 = st[igood, 0] / ops['fs'] if (mode == 'template' and 'fs' in ops) else None
                 if center_callback is not None:
                     center_callback(
                         center_id=int(ii),
