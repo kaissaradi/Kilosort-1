@@ -630,7 +630,8 @@ def get_nearest_centers(xy, xcent, ycent):
 
 
 def run(ops, st, tF, mode='template', device=torch.device('cuda'),
-        progress_bar=None, clear_cache=False, verbose=False):
+        progress_bar=None, clear_cache=False, verbose=False,
+        center_callback=None):
 
     if mode == 'template':
         xy, iC = xy_templates(ops)
@@ -709,6 +710,23 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                     nearby_chans_empty += 1
                     continue
 
+                st0 = st[igood, 0] / ops['fs'] if mode == 'template' else None
+                if center_callback is not None:
+                    center_callback(
+                        center_id=int(ii),
+                        Xd=Xd,
+                        igood=igood,
+                        ichan=ichan,
+                        st0=st0,
+                        metadata={
+                            'mode': mode,
+                            'xcenter': float(xcent[jj]),
+                            'ycenter': float(ycent[kk]),
+                            'n_templates': ntemp,
+                            'small_center_bypass': bool(Xd.shape[0] < 1000),
+                        },
+                    )
+
                 logger.debug(f'Center {ii} | Xd shape: {Xd.shape} | ntemp: {ntemp}')
                 if verbose and Xd.nelement() > 10**8:
                     logger.info(f'Resetting cuda memory stats for Center {ii}')
@@ -718,11 +736,6 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                 if Xd.shape[0] < 1000:
                     iclust = np.zeros(Xd.shape[0], dtype=np.int32)
                 else:
-                    if mode == 'template':
-                        st0 = st[igood,0]/ops['fs']
-                    else:
-                        st0 = None
-
                     # find new clusters
                     snaps = [] if (st0 is not None and
                                    os.environ.get('KS4_CLUSTER_TRACE')) else None
