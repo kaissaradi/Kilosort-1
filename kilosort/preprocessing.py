@@ -16,6 +16,115 @@ def whitening_from_covariance(CC):
     Wrot =(E / (D+eps)**.5) @ E.T
     return Wrot
 
+# --- robust whitening covariance (KS4_ROBUST_COV) --------------------------
+#
+# Background: get_whitening_matrix's covariance CC = X @ X.T / T is a plain
+# sample second moment over EVERY time sample, spikes included. A channel
+# that carries a lot of real spikes reads as high-variance and gets whitened
+# down harder than a dead channel, so the post-whitening noise floor ends up
+# LOWER on the busiest channels -- see the whitening-inverts-the-threshold
+# memory (measured 1.65x on one file/geometry). A prior attempt to fix this
+# (KS4_MADW, in an earlier fork iteration -- not present in this tree) rescaled
+# the finished Wrot by each channel's post-whitening MAD. That was a post-hoc
+# patch on the OUTPUT of whitening_local, not a change to how CC was formed,
+# and it was refuted on real ground truth on three separate axes (recall
+# wash, a precision "win" that was really dropped real spikes, and worse
+# refractory purity) -- see madw-whitening-fix-works (a retraction).
+#
+# This is a different, structural fix: downweight high-amplitude SAMPLES
+# before they ever enter the covariance sum, so CC itself estimates the
+# noise-only second moment instead of noise + a spike-inflated tail. It is an
+# IRLS-style Huber M-estimator of the (zero-mean) scatter matrix:
+#   1. Standardize each channel by a robust scale (median(|x|) as a
+#      zero-median MAD proxy -- valid because the data is high-pass filtered).
+#   2. Score every SAMPLE (a full array time-slice) by its RMS across
+#      standardized channels -- this catches genuinely large multichannel
+#      events (spikes) without singling out any one channel's baseline
+#      variance, which is the failure mode of a per-channel-only rescale.
+#   3. Huber-weight samples above a robust multiple of the typical score:
+#      full weight below the cutoff, weight shrinking as 1/score above it.
+#   4. Re-derive the channel scales using the new weights and repeat a few
+#      times (2-3 iterations is enough for this to stabilize; it is not a
+#      hot loop -- runs once per whitening batch, batches are subsampled by
+#      nskip already).
+#   5. Form CC as the WEIGHTED second moment, not X @ X.T unweighted.
+#
+# c_huber=3.0 and n_iters=3 are not derived from first principles -- they are
+# a standard "moderate" Huber cutoff (real cortical/retinal spikes commonly
+# exceed 3-5x the noise RMS; genuine Gaussian noise essentially never does)
+# picked to be conservative rather than fit to any bench. Flag this in any
+# report: it is a reasonable default, not a validated constant.
+#
+# Off by default. On (KS4_ROBUST_COV=1) it changes ONLY the covariance fed to
+# whitening_local -- whitening_local itself, Wrot's shape, and every
+# downstream consumer are untouched.
+
+_ROBUST_COV_C_HUBER = 3.0
+_ROBUST_COV_N_ITERS = 3
+_ROBUST_COV_EPS = 1e-8
+
+
+def _weighted_median_abs(X, w):
+    """Weighted median of |X| along the time axis, per channel.
+
+    X: (n_chan, T). w: (T,) nonnegative sample weights (broadcast across
+    channels -- weight is a property of the time sample, not the channel).
+    Returns (n_chan,). Assumes X is already ~zero-median (true for high-pass
+    filtered MEA data), so median(|X|) is used directly as the MAD rather
+    than subtracting a per-channel median first.
+    """
+    n_chan, T = X.shape
+    absX = X.abs()
+    order = torch.argsort(absX, dim=1)
+    x_sorted = torch.gather(absX, 1, order)
+    w_row = w.unsqueeze(0).expand(n_chan, -1)
+    w_sorted = torch.gather(w_row, 1, order)
+    cw = torch.cumsum(w_sorted, dim=1)
+    total = cw[:, -1:].clamp_min(_ROBUST_COV_EPS)
+    half = total / 2
+    # index of the first sorted sample whose cumulative weight reaches half
+    idx = torch.searchsorted(cw.contiguous(), half.contiguous())
+    idx = idx.clamp(max=T - 1)
+    return torch.gather(x_sorted, 1, idx).squeeze(1)
+
+
+def _robust_sample_weights(X, n_iters=_ROBUST_COV_N_ITERS, c=_ROBUST_COV_C_HUBER):
+    """IRLS Huber sample weights, in [0, 1], one per time sample of X.
+
+    X: (n_chan, T) high-pass filtered batch. Low weight marks samples whose
+    across-channel RMS (after robust per-channel standardization) is large
+    relative to the bulk of the batch -- i.e. likely spikes, not noise.
+    """
+    T = X.shape[1]
+    device = X.device
+    w = torch.ones(T, device=device, dtype=X.dtype)
+    for _ in range(max(1, n_iters)):
+        sigma_c = _weighted_median_abs(X, w) / 0.6745
+        sigma_c = sigma_c.clamp_min(_ROBUST_COV_EPS)
+        Z = X / sigma_c[:, None]
+        r = torch.sqrt((Z ** 2).mean(dim=0))  # (T,) RMS across channels
+        med_r = r.median()
+        mad_r = (r - med_r).abs().median() / 0.6745
+        mad_r = mad_r.clamp_min(_ROBUST_COV_EPS)
+        thresh = med_r + c * mad_r
+        w = (thresh / r.clamp_min(_ROBUST_COV_EPS)).clamp(max=1.0)
+    return w
+
+
+def robust_batch_covariance(X, n_iters=_ROBUST_COV_N_ITERS, c=_ROBUST_COV_C_HUBER):
+    """Huber-weighted covariance of a batch, robust to spike contamination.
+
+    X: (n_chan, T). Returns (n_chan, n_chan), normalized to match the scale
+    of the stock ``(X @ X.T) / X.shape[1]`` estimator (weights sum to T in
+    expectation for an uncontaminated batch, so dividing by sum(w) keeps the
+    two estimators on a comparable scale when there is nothing to downweight).
+    """
+    w = _robust_sample_weights(X, n_iters=n_iters, c=c)
+    Xw = X * w[None, :]
+    denom = w.sum().clamp_min(_ROBUST_COV_EPS)
+    return (Xw @ X.T) / denom
+
+
 def whitening_local(CC, xc, yc, nrange=32, device=torch.device('cuda')):
     """Compute whitening filter for each channel based on nearest channels."""
     Nchan = CC.shape[0]
@@ -103,11 +212,25 @@ def get_fwav(NT = 30122, fs = 30000, device=torch.device('cuda')):
     return fwav
 
 def get_whitening_matrix(f, xc, yc, nskip=25, nrange=32):
-    """Get the whitening matrix, use every nskip batches."""
+    """Get the whitening matrix, use every nskip batches.
+
+    KS4_ROBUST_COV=1 (opt-in, off by default): downweight high-amplitude
+    samples before they enter the covariance sum, via an IRLS Huber
+    M-estimator (see robust_batch_covariance above). This targets the
+    documented whitening-inverts-the-threshold defect -- CC computed from raw
+    spikes-included data makes busy channels read as high-variance and get
+    whitened down harder than dead channels. Off by default: reproduces stock
+    output exactly (verified byte-identical in tests/test_mea_fork.py).
+    Synthetic-only validation so far -- no real-GT confirmation, see the
+    commit message.
+    """
     n_chan = len(f.chan_map)
     # collect the covariance matrix across channels
     CC = torch.zeros((n_chan, n_chan), device=f.device)
     k = 0
+    _robust = os.environ.get('KS4_ROBUST_COV', '').strip().lower() not in (
+        '', '0', 'false', 'no',
+    )
     # Historical loop skipped the final batch (`range(0, n_batches-1, ...)`).
     # On single-batch fixtures that made the range empty and divided by k==0.
     # Use at least batch 0; when n_batches>1 keep the same upper bound as before.
@@ -120,7 +243,10 @@ def get_whitening_matrix(f, xc, yc, nskip=25, nrange=32):
         X = X[:, f.nt : -f.nt]
 
         # cumulative covariance matrix
-        CC = CC + (X @ X.T)/X.shape[1]
+        if _robust:
+            CC = CC + robust_batch_covariance(X)
+        else:
+            CC = CC + (X @ X.T)/X.shape[1]
 
         k += 1
 

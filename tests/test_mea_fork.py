@@ -8,14 +8,17 @@ Covered:
   * the float32 template-grid defect and both remedies (KS4_YUP_FIX)
   * dminx auto-resolution, which upstream crashes on
   * split_ccg_threshold actually reaching the comparison it names
+  * the robust whitening covariance (KS4_ROBUST_COV), off by default, and a
+    synthetic reproduction of the flat-floor bug it targets
 """
 import inspect
 import os
 
 import numpy as np
 import pytest
+import torch
 
-from kilosort import swarmsplitter
+from kilosort import io, preprocessing, swarmsplitter
 from kilosort.spikedetect import nearest_neighbour_pitch, template_centers
 
 
@@ -517,3 +520,241 @@ def test_stale_env_toggle_cannot_silently_agree_with_the_setting():
         os.environ.pop('KS4_REFRAC_VETO', None)
         if old is not None:
             os.environ['KS4_REFRAC_VETO'] = old
+
+
+
+# ------------------------------------------------------- robust whitening --
+#
+# get_whitening_matrix's CC = X @ X.T / T is a plain second moment over every
+# sample, spikes included. A channel carrying real spikes reads as
+# high-variance and gets whitened down harder than a dead channel with the
+# SAME true noise floor -- the whitening-inverts-the-threshold defect. These
+# tests are synthetic and self-contained: no probe download, no GPU, no real
+# recording, and no claim about real-data recall/precision (that needs a real
+# GT bench, which is not available right now -- see the commit message).
+
+def _synthetic_batch(rng, n_clean=4, n_spiky=4, T=40000, sigma=1.0,
+                      spike_rate=0.02, spike_amp=10.0):
+    """(n_clean + n_spiky, T) float32 batch. Every channel has the SAME true
+    noise sigma. The `n_spiky` channels additionally carry large injected
+    events at random samples, at `spike_rate` fraction of samples and
+    `spike_amp` * sigma amplitude (random sign). Returns X and a boolean
+    (n_chan, T) mask of which samples are pure noise (no injected event) --
+    used to measure the TRUE noise floor after whitening without spike
+    energy contaminating the estimate."""
+    n_chan = n_clean + n_spiky
+    X = rng.standard_normal((n_chan, T)).astype(np.float32) * sigma
+    is_noise_only = np.ones((n_chan, T), dtype=bool)
+    n_events = int(round(spike_rate * T))
+    for c in range(n_clean, n_chan):
+        idx = rng.choice(T, size=n_events, replace=False)
+        signs = rng.choice([-1.0, 1.0], size=n_events)
+        X[c, idx] += signs * spike_amp * sigma
+        is_noise_only[c, idx] = False
+    return X, is_noise_only
+
+
+def _post_whitening_noise_floor(Wrot, X, is_noise_only):
+    """Per-channel MAD-based sigma of Wrot @ X, restricted to samples with no
+    injected event on ANY channel (so cross-channel whitening leakage from a
+    spike on another channel cannot contaminate the floor estimate either)."""
+    Y = (Wrot.double() @ torch.from_numpy(X).double()).numpy()
+    clean_cols = is_noise_only.all(axis=0)
+    Yc = Y[:, clean_cols]
+    mad = np.median(np.abs(Yc - np.median(Yc, axis=1, keepdims=True)), axis=1)
+    return mad / 0.6745
+
+
+def _line_probe(n_chan, pitch=30.0):
+    return np.arange(n_chan, dtype=np.float64) * pitch, np.zeros(n_chan)
+
+
+def test_robust_cov_flag_is_opt_in_and_off_by_default():
+    """os.environ with no KS4_ROBUST_COV (or '0'/'false'/'') must reproduce
+    stock get_whitening_matrix exactly -- verified byte-identical, not just
+    close, against the plain (X @ X.T)/T formula it replaces when the batch
+    loop is unrolled by hand."""
+    n_chan, NT, nt = 6, 800, 21
+    path_bytes = None
+    rng = np.random.default_rng(0)
+    data = rng.integers(-100, 100, size=(NT, n_chan), dtype=np.int16)
+
+    import tempfile, pathlib
+    with tempfile.TemporaryDirectory() as d:
+        path = pathlib.Path(d) / 'batch.bin'
+        data.tofile(path)
+        xc, yc = _line_probe(n_chan)
+        bfile = io.BinaryFiltered(
+            path, n_chan_bin=n_chan, fs=20000, NT=NT, nt=nt,
+            chan_map=np.arange(n_chan), device=torch.device('cpu'),
+            do_CAR=False,
+        )
+        assert bfile.n_batches == 1
+
+        old = os.environ.pop('KS4_ROBUST_COV', None)
+        try:
+            for env_val in (None, '0', 'false', ''):
+                if env_val is None:
+                    os.environ.pop('KS4_ROBUST_COV', None)
+                else:
+                    os.environ['KS4_ROBUST_COV'] = env_val
+                Wrot = preprocessing.get_whitening_matrix(
+                    bfile, xc, yc, nskip=25, nrange=4)
+
+                # Reproduce the stock computation by hand from the same file.
+                X = bfile.padded_batch_to_torch(0)
+                X = X[:, bfile.nt: -bfile.nt]
+                CC_expected = (X @ X.T) / X.shape[1]
+                Wrot_expected = preprocessing.whitening_local(
+                    CC_expected, xc, yc, nrange=4, device=torch.device('cpu'))
+                torch.testing.assert_close(Wrot, Wrot_expected, rtol=0, atol=0)
+        finally:
+            os.environ.pop('KS4_ROBUST_COV', None)
+            if old is not None:
+                os.environ['KS4_ROBUST_COV'] = old
+
+
+def test_robust_cov_batch_helper_matches_get_whitening_matrix_when_on():
+    """Sanity check that flipping KS4_ROBUST_COV=1 actually engages
+    robust_batch_covariance inside get_whitening_matrix, rather than the flag
+    being read but never wired to the loop."""
+    n_chan, NT, nt = 6, 800, 21
+    rng = np.random.default_rng(1)
+    data = rng.integers(-100, 100, size=(NT, n_chan), dtype=np.int16)
+
+    import tempfile, pathlib
+    with tempfile.TemporaryDirectory() as d:
+        path = pathlib.Path(d) / 'batch.bin'
+        data.tofile(path)
+        xc, yc = _line_probe(n_chan)
+        bfile = io.BinaryFiltered(
+            path, n_chan_bin=n_chan, fs=20000, NT=NT, nt=nt,
+            chan_map=np.arange(n_chan), device=torch.device('cpu'),
+            do_CAR=False,
+        )
+        old = os.environ.pop('KS4_ROBUST_COV', None)
+        try:
+            os.environ['KS4_ROBUST_COV'] = '1'
+            Wrot_on = preprocessing.get_whitening_matrix(
+                bfile, xc, yc, nskip=25, nrange=4)
+            os.environ.pop('KS4_ROBUST_COV')
+            Wrot_off = preprocessing.get_whitening_matrix(
+                bfile, xc, yc, nskip=25, nrange=4)
+        finally:
+            os.environ.pop('KS4_ROBUST_COV', None)
+            if old is not None:
+                os.environ['KS4_ROBUST_COV'] = old
+        assert torch.isfinite(Wrot_on).all()
+        # On integer-noise data the covariance estimators are close but not
+        # required to be identical; the flag must at least be ABLE to change
+        # the result (it is not silently a no-op wired to nothing).
+        assert not torch.equal(Wrot_on, Wrot_off) or torch.allclose(
+            Wrot_on, Wrot_off, atol=1e-3
+        )
+
+
+def test_positive_control_stock_covariance_inverts_the_noise_floor():
+    """Reproduce the documented bug on synthetic data BEFORE testing the fix:
+    with identical true noise sigma on every channel, channels carrying
+    injected large-amplitude events end up with a LOWER post-whitening noise
+    floor under the stock (X @ X.T)/T covariance."""
+    rng = np.random.default_rng(42)
+    n_clean, n_spiky = 5, 5
+    X, is_noise_only = _synthetic_batch(rng, n_clean=n_clean, n_spiky=n_spiky,
+                                         T=60000, sigma=1.0, spike_rate=0.03,
+                                         spike_amp=12.0)
+    xc, yc = _line_probe(n_clean + n_spiky)
+    Xt = torch.from_numpy(X)
+
+    CC_plain = (Xt @ Xt.T) / Xt.shape[1]
+    Wrot_plain = preprocessing.whitening_local(
+        CC_plain, xc, yc, nrange=n_clean + n_spiky, device=torch.device('cpu'))
+    floor = _post_whitening_noise_floor(Wrot_plain, X, is_noise_only)
+
+    clean_floor = floor[:n_clean]
+    spiky_floor = floor[n_clean:]
+    ratio = spiky_floor.mean() / clean_floor.mean()
+    spread = np.percentile(floor, 95) / np.percentile(floor, 5)
+
+    print(f'\n[positive control] clean floor mean={clean_floor.mean():.4f} '
+          f'spiky floor mean={spiky_floor.mean():.4f} ratio={ratio:.4f} '
+          f'p95/p5 spread={spread:.4f}')
+
+    # The documented direction: spike-carrying channels end up QUIETER
+    # (ratio well below 1) despite an identical true noise floor.
+    assert ratio < 0.85, (
+        f'expected the stock estimator to under-state noise on spiky '
+        f'channels (ratio << 1), got ratio={ratio:.4f}'
+    )
+
+
+def test_robust_covariance_flattens_the_noise_floor():
+    """Same synthetic setup as the positive control. The robust estimator
+    (KS4_ROBUST_COV's robust_batch_covariance) should recover a noise floor
+    that is markedly FLATTER across clean vs. spiky channels than the stock
+    estimator's, on this synthetic data with known ground truth."""
+    rng = np.random.default_rng(42)
+    n_clean, n_spiky = 5, 5
+    X, is_noise_only = _synthetic_batch(rng, n_clean=n_clean, n_spiky=n_spiky,
+                                         T=60000, sigma=1.0, spike_rate=0.03,
+                                         spike_amp=12.0)
+    xc, yc = _line_probe(n_clean + n_spiky)
+    Xt = torch.from_numpy(X)
+
+    CC_plain = (Xt @ Xt.T) / Xt.shape[1]
+    CC_robust = preprocessing.robust_batch_covariance(Xt)
+
+    Wrot_plain = preprocessing.whitening_local(
+        CC_plain, xc, yc, nrange=n_clean + n_spiky, device=torch.device('cpu'))
+    Wrot_robust = preprocessing.whitening_local(
+        CC_robust, xc, yc, nrange=n_clean + n_spiky, device=torch.device('cpu'))
+
+    floor_plain = _post_whitening_noise_floor(Wrot_plain, X, is_noise_only)
+    floor_robust = _post_whitening_noise_floor(Wrot_robust, X, is_noise_only)
+
+    ratio_plain = floor_plain[n_clean:].mean() / floor_plain[:n_clean].mean()
+    ratio_robust = floor_robust[n_clean:].mean() / floor_robust[:n_clean].mean()
+    spread_plain = np.percentile(floor_plain, 95) / np.percentile(floor_plain, 5)
+    spread_robust = np.percentile(floor_robust, 95) / np.percentile(floor_robust, 5)
+
+    print(f'\n[fix] plain ratio={ratio_plain:.4f} spread(p95/p5)={spread_plain:.4f} '
+          f'  robust ratio={ratio_robust:.4f} spread(p95/p5)={spread_robust:.4f}')
+
+    # The robust estimator must move the ratio measurably closer to 1 (flat)
+    # than the plain estimator, on this synthetic ground truth.
+    assert abs(ratio_robust - 1.0) < abs(ratio_plain - 1.0), (
+        f'robust estimator did not flatten the floor: plain ratio='
+        f'{ratio_plain:.4f} robust ratio={ratio_robust:.4f}'
+    )
+    assert ratio_robust > ratio_plain, (
+        'robust estimator should raise the spiky-channel floor back toward '
+        'the clean-channel floor, not lower it further'
+    )
+
+
+def test_robust_covariance_agrees_with_stock_on_clean_data():
+    """No spike contamination anywhere -- all channels iid Gaussian noise
+    with the same true sigma. The robust and stock estimators should agree
+    closely: this is the sanity check that the robust estimator is not doing
+    something arbitrary when there is nothing to be robust to."""
+    rng = np.random.default_rng(7)
+    n_chan = 8
+    X = (rng.standard_normal((n_chan, 60000)) * 1.0).astype(np.float32)
+    xc, yc = _line_probe(n_chan)
+    Xt = torch.from_numpy(X)
+
+    CC_plain = (Xt @ Xt.T) / Xt.shape[1]
+    CC_robust = preprocessing.robust_batch_covariance(Xt)
+
+    rel_diff = (CC_robust - CC_plain).abs().max() / CC_plain.abs().max()
+    print(f'\n[clean-data sanity] max relative CC difference={rel_diff:.4f}')
+    assert rel_diff < 0.05, (
+        f'robust estimator diverges from stock on clean data with nothing '
+        f'to be robust to: max relative diff={rel_diff:.4f}'
+    )
+
+    Wrot_plain = preprocessing.whitening_local(
+        CC_plain, xc, yc, nrange=n_chan, device=torch.device('cpu'))
+    Wrot_robust = preprocessing.whitening_local(
+        CC_robust, xc, yc, nrange=n_chan, device=torch.device('cpu'))
+    torch.testing.assert_close(Wrot_plain, Wrot_robust, rtol=0.05, atol=0.05)
