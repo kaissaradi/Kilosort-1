@@ -31,13 +31,19 @@ This is not a numerically-equivalent rewrite, it is the same arithmetic:
     matter; torch.max(dim=0)'s first-index tie-break is reproduced by taking
     the minimum index among the maximal entries.
 
-That gets it bit-identical *on this GPU, this cuBLAS and this Triton* -- and
-only at some block sizes: BLOCK_M=128 matches, 64 and 32 do not. So none of it
-is trusted. `try_fill` runs the stock path and the fused path on the first
-real batch of every sort and compares all three output buffers element by
-element; the fused path is used only if they are equal, and any candidate
-config that fails is discarded. Worst case the sort is one batch slower than
-stock and logs why.
+That gets it bit-identical *on this GPU, this cuBLAS, this Triton and these
+shapes* -- and only at some block sizes. At production shapes BLOCK_M=128 with
+4 warps matches and 64 and 32 do not; at the small shapes in
+tests/test_fused_detect.py it is the other way round and the gate settles on
+(64, 2). cuBLAS picks a different kernel per shape and Triton schedules
+differently per block size, so which config agrees is not predictable and is
+not a constant of the code.
+
+So none of it is trusted. `try_fill` runs the stock path and the fused path on
+the first real batch of every sort and compares all three output buffers
+element by element; the fused path is used only for configs that come out
+exactly equal, and a sort where nothing matches logs why and runs stock
+throughout, one batch slower.
 
 Measured on 40 real batches of 20260724A (Nfilt=4048, nC=10, nk=10, ns=5,
 NT=10122), 4.92 billion elements compared, all equal:
@@ -65,8 +71,9 @@ except Exception as _e:            # pragma: no cover - depends on install
 
 # Config candidates, best-first. Only ones that pass the runtime bit-identity
 # check are eligible; the fastest survivor is used. BLOCK_M=128/warps=4 is the
-# one verified on the RTX 4000 Ada -- the others are here so a different card
-# has somewhere to fall back to before giving up on fusion altogether.
+# one verified at production shapes on the RTX 4000 Ada. The rest are not
+# padding: the unit tests' small shapes reject it and land on (64, 2), so the
+# ladder is exercised in practice, not only on hypothetical other cards.
 _CONFIGS = ((128, 4), (128, 2), (64, 2), (64, 4), (256, 4), (32, 2))
 
 # None = not yet tested this process; False = disabled; else (block_m, warps).
