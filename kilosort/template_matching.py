@@ -5,7 +5,7 @@ import torch
 from torch.nn.functional import conv1d, max_pool2d, max_pool1d
 from tqdm import tqdm
 
-from kilosort import CCG
+from kilosort import CCG, fused_peel
 from kilosort.utils import (
     get_spike_buffer_capacity,
     group_indices_by_label,
@@ -326,6 +326,10 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=None):
     Xres = X
 
     Th2 = Th * Th
+    # ctc is indexed [row, unit, t] by the stock subtract; the fused kernel
+    # wants [unit, row, t]. A permuted VIEW, not a copy -- the strides are
+    # passed to the kernel.
+    ctc_p = ctc.permute(1, 0, 2)
     for t in range(max_peels):
         # Reduce first, then apply relu/square on the (NT,) result.
         # In-place square avoids a full (NT,) temporary per peel.
@@ -370,12 +374,15 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=None):
         # n=2 splits the peel: advanced-index -= is last-write-wins on
         # overlapping trange windows, so stride is load-bearing for identity
         # (not just GPU memory). Keep stock n=2 on all devices.
+        #
+        # fused_peel replaces the two subtract statements with one kernel each
+        # (5x), but ONLY for phases it has checked are window-disjoint, and
+        # only after proving itself bit-identical on the first such phase of
+        # the sort. It falls back to exactly the stock statements otherwise --
+        # see fused_peel.py for why the disjointness check is not optional.
         n = 2
-        for j in range(n):
-            # (n_sel, C, nt) -> (C, n_sel, nt) to match historical kil layout
-            waves = U_time[iY[j::n, 0]].permute(1, 0, 2)
-            Xres[:, iX[j::n] + tiwave] -= amp[j::n] * waves
-            B[:, iX[j::n] + trange] -= amp[j::n] * ctc[:, iY[j::n, 0], :]
+        fused_peel.peel_subtract(Xres, B, iX, iY, amp, U_time, ctc, ctc_p,
+                                 tiwave, trange, nt, n)
 
     st = st[:k]
     amps = amps[:k]
