@@ -12,7 +12,9 @@ Ada (19.54 GB), Threadripper PRO 7975WX, torch 2.5.1, Triton 3.1.0.
 
 Two benchmarks are used below:
 
-* **production sort** — the full 4054-batch run, 1601.58 s total.
+* **production sort** — the full 4054-batch run, 1601.58 s total before this
+  series and 637.40 s after it; see *Production A/B, measured end to end*.
+  Every production figure quoted before that section is the **baseline** run.
 * **slice300** — a 300-batch (150 s) flat int16 slice of the same recording,
   sorted end to end with the production settings. 600 units, 481 good,
   776,125 spikes. Used for A/B byte comparison because a full sort per
@@ -531,6 +533,114 @@ rests on three matching runs, not one.
 
 ---
 
+## Production A/B, measured end to end
+
+Everything above is measured on slice300, because a full sort per variant is
+not affordable during development. This section is the one full-scale check:
+the same 42 GB production chunk, sorted before the series and again after it.
+
+**Baseline.** `4.1.8.dev73+g7f96af8d6`, 2026-09-04 20:02:42. That commit
+("Test the fork's own changes, which nothing was testing") is an ancestor of
+HEAD and predates every change in this file. **1601.58 s.**
+
+**Optimized.** HEAD = `468a778`, 2026-09-05 08:02:53, all five changes live and
+no off-switches set. **637.40 s.**
+
+Both figures are Kilosort's own `Total runtime`, which stops before the
+diagnostic plots; both runs spent a further ~82 s plotting after it
+(`run_full.py` measured 721.46 s of wall for the optimized run). Same machine,
+same `ops.npy`, same NVMe.
+
+| stage | baseline s | optimized s | | responsible |
+|---|---:|---:|---:|---|
+| preprocessing | 1.4 | 1.4 | 1.00× | — |
+| drift | 0.0 | 0.0 | — | — |
+| **spike detection (universal)** | **927.4** | **231.0** | **4.01×** | §1 + §2 |
+| clustering (templates) | 71.1 | 64.1 | 1.11× | §4 + §5 |
+| **spike detection (learned)** | **506.6** | **255.6** | **1.98×** | §3 |
+| clustering (final) | 58.1 | 47.3 | 1.23× | §4 + §5 |
+| cluster merge | 8.6 | 9.8 | 0.88× | — |
+| postprocessing | 21.5 | 21.6 | 1.00× | — |
+| **total** | **1601.6** | **637.4** | **2.51×** | 16m 04s saved |
+
+### The clustering win does not scale the way slice300 said
+
+§5's slice numbers were 2.47× and 2.38× on the two clustering passes. In
+production they are **1.11× and 1.23×**. This is recorded because the slice
+number would otherwise be misleading. §4 and §5 attack *launch overhead*, which
+dominates only while the per-centre matrices are small: slice300's were
+1002–12941 spikes, production's are far larger, so the loop sits closer to
+bandwidth-bound and there is less overhead left to remove. §5's pre-drawn noise
+buffer also grows as `200 × n_spikes` floats per centre, so its cost grows with
+exactly the thing that shrinks its benefit.
+
+The two fused kernels (§2, §3) carry the production win almost entirely: 947 s
+of the 964 s saved.
+
+### What the output looks like
+
+Compared against the original run's `premerge_backup/` — the state before the
+post-hoc merge tool rewrote the top-level arrays — over **11,050,850 spikes**,
+which is the spike count *both* runs produced:
+
+| file | result |
+|---|---|
+| `spike_times.npy` | byte-identical (88,406,800 B) |
+| `spike_clusters.npy` | byte-identical |
+| `spike_templates.npy` | byte-identical |
+| `spike_detection_templates.npy` | byte-identical |
+| `cluster_KSLabel.tsv`, `cluster_group.tsv` | byte-identical |
+| `cluster_Amplitude.tsv`, `cluster_ContamPct.tsv` | byte-identical |
+| `amplitudes.npy` | **1** value of 11,050,850 differs |
+| `spike_positions.npy` | **6** values of 22,101,700 differ |
+
+Seven float32 values out of 33.15 million, every one of them **1 ULP**
+(relative 6.4e-08 to 1.2e-07), and all seven belonging to four adjacent spikes
+(indices 2,903,739 / 2,903,741 / 2,903,749 / 2,903,750) — one small
+neighbourhood, i.e. one batch. Stage counts match exactly throughout:
+2133 → 1326 clusters, 1084 units, 893 with good refractory periods.
+
+That is the `tF` wobble footprint from the section above, not a new one: only
+`tF`-derived files moved, and no spike time or cluster assignment moved. Per
+that same section, one matching sort is not proof — so a **second optimized run
+was made on the identical config**, and it settles the attribution:
+
+| pair | `amplitudes` | `spike_positions` | max ULP | spikes involved |
+|---|---:|---:|---:|---|
+| run 1 vs baseline | 1 | 6 | 1 | 2903739 / 41 / 49 / 50 |
+| run 2 vs baseline | 2 | 4 | 3 | 2160796 / 2160801 |
+| **run 2 vs run 1** | **3** | **10** | **3** | the union of both |
+
+The two optimized runs disagree **with each other**, at *different* spikes than
+either disagrees with the baseline, and by more. Had a change in this series
+deterministically shifted a value, run 1 and run 2 would agree with each other
+and both be offset from the baseline at the same index. Instead each run wobbles
+independently, which is the signature of nondeterminism in the algorithm itself.
+`pc_features.npy` moved too (87 of 1,326,102,000 bytes), consistent with `tF`
+being the origin.
+
+`spike_times`, `spike_clusters`, `spike_templates` and
+`spike_detection_templates` are identical across **all three** pairings.
+
+Run 2 took 633.64 s against run 1's 637.40 s (0.6% apart) with identical stage
+counts, so the timing above is reproducible as well.
+
+### Provenance of the input
+
+The original `chunk12_9-11.bin` had been deleted, and was rebuilt from the raw
+Litke files by the same converter. Two independent checks that the rebuild is
+the same data:
+
+* the converter's own sidecar `.csv` is identical to the original's — same
+  source paths, same per-file sample counts;
+* `cmp -i 2076000000:0 -n 3114000000` against `slice300.bin` (data009's first
+  3M samples, which sit at that offset in the chunk) reports byte-identical
+  over 3.1 GB.
+
+42,080,520,000 bytes = 40,540,000 samples × 519 channels × int16.
+
+---
+
 ## Cumulative
 
 Whole slice300 sort across this series, all byte-identical to the stock
@@ -569,8 +679,45 @@ production sort, and detection and clustering are now roughly the same size.
   the scatter is load-bearing for identity — advanced-index `-=` is
   last-write-wins on overlapping `+/-nt` windows — so a faster scatter is
   unlikely to be byte-identical without care.
-* **Where `tF`'s run-to-run wobble comes from.** See the section above: the
-  footprint is pinned, the cause is not. Worth finding, because until it is,
-  no end-to-end byte-identity claim can rest on a single run.
+* **Where `tF`'s run-to-run wobble comes from.** The footprint is pinned and it
+  is now confirmed at production scale — two runs of *identical* code on
+  identical input disagree on 13 float32 values of 33 M, at different spikes
+  each time — but the **cause is still not identified**. Worth finding: until
+  it is, no end-to-end byte-identity claim can rest on a single run, and the
+  sorter cannot be made reproducible for a paper.
 * **`swarmsplitter.split`** is now the second-largest item in the template pass
   (1.80 s, 12.3%) and is CPU-side.
+* **Clustering at production scale.** §4 and §5 give 1.11×/1.23× there against
+  2.47×/2.38× on slice300 — the remaining clustering time is data movement, not
+  launch overhead, so a different approach would be needed to move it. Whether
+  it is worth moving at all is now questionable: clustering is 17.5% of the
+  optimized production sort, against detection+peel at 76.3%.
+* **Where the profiling harnesses live.** Everything that verifies the claims in
+  this file is in a session-local scratchpad under `/tmp`, which does not
+  survive a reboot. Not yet preserved in this repo — see below.
+
+---
+
+## How the claims here were verified
+
+The inventory, so the method survives even if the scripts do not. All of these
+live in the session scratchpad
+(`/tmp/claude-1001/-home-localadmin-…/scratchpad/`) and are **not in this
+repo**; treat this list as the spec to rebuild from if they are gone.
+
+| script | what it does |
+|---|---|
+| `run_full.py` | drives a full sort from a saved `ops.npy` + a flat `.bin`, and prints `TOTAL_WALL_SECONDS`. Both arms of the production A/B used it. |
+| `cmp_sorts.py` | raw-byte comparison of two result directories, with per-file element/byte diff counts. Skips `ops.npy` (it stores timers and peak memory, so it always differs). |
+| `make_slice.py` / `slice300.bin` | builds the 300-batch development benchmark. |
+| `profile_cluster.py` | wraps every callee of `clustering_qr.run`, CUDA-syncs around each, prints per-pass tables and input-size percentiles. This is what showed `kmeans_plusplus` was 78–87%, correcting the standing assumption. |
+| `dump_xd.py` | saves the 32 real `Xd` matrices (1002–12941 spikes) that the k-means++ identity checks run on. |
+| `probe_kpp.py` | statement-level µs breakdown inside the k-means++ loop. |
+| `kpp_census.py` | counts host-read branch outcomes over a whole sort — the 393-call census behind the guard argument. |
+| `check_kpp.py`, `check_graph_kpp.py` | identity + speed harnesses over all 32 matrices; both compare raw bit patterns and the RNG end-state, not values. |
+| `run_kpp_tests.py` | runs `tests/test_fast_kpp.py` without pytest, which **is not installed in any conda env on this machine**. |
+
+The repo's own `tests/` (`test_fast_kpp.py`, and the fused-detect/peel gate
+tests) are real pytest files and are the durable half of this; they pin the
+*gates and guards*, which is where the safety argument lives, rather than the
+kernels.
