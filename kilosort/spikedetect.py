@@ -12,6 +12,7 @@ from sklearn.cluster import KMeans
 from sklearn.decomposition import TruncatedSVD
 from tqdm import tqdm
 
+from kilosort import fused_detect
 from kilosort.utils import (
     get_clip_buffer_capacity,
     get_spike_buffer_capacity,
@@ -472,13 +473,24 @@ def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda'),
     # Storing Aa/imax/Amax from inside the compiled region was tried and is
     # slower (1.16x vs 1.25x) -- the copy_ into strided views costs more than
     # the round-trip it saves.
-    for t in range(niter):
-        lo, hi = nb*t, min(nb*(t+1), NT)
-        Aa, imax, Amax = _template_match_body_dispatch(
-            B[:, :, lo:hi], weigh, iC, iC2_flat, nC2, Nfilt)
-        As[:, lo:hi] = Aa
-        imaxs[:, lo:hi] = imax.to(torch.int32)
-        Amaxs[:, lo:hi] = Amax
+    def stock_fill():
+        for t in range(niter):
+            lo, hi = nb*t, min(nb*(t+1), NT)
+            Aa, imax, Amax = _template_match_body_dispatch(
+                B[:, :, lo:hi], weigh, iC, iC2_flat, nC2, Nfilt)
+            As[:, lo:hi] = Aa
+            imaxs[:, lo:hi] = imax.to(torch.int32)
+            Amaxs[:, lo:hi] = Amax
+
+    # Fused Triton path: same arithmetic, ~1/130 of the memory traffic, 6.9x
+    # on this loop. It fills the same three buffers in one launch pair and
+    # needs no column tiling at all. try_fill validates it against stock_fill
+    # element-by-element on the first batch of every sort and returns False
+    # for the rest of the run if it does not match exactly -- see
+    # fused_detect.py for why that check is not optional.
+    if not fused_detect.try_fill(B, weigh, iC, iC2_flat, nC2, Nfilt,
+                                 As, imaxs, Amaxs, stock_fill):
+        stock_fill()
 
     Amaxs[:,:nt] = 0
     Amaxs[:,-nt:] = 0
