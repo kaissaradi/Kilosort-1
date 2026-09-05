@@ -383,7 +383,31 @@ def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda'),
     nk = ops['settings']['n_templates']
     NT = X.shape[-1]
     Nfilt = iC.shape[1]
-    niter = 40
+    # Column tiling for the loop below. The stock rule was a flat niter=40,
+    # which is sized for the stock batch_size=60000 (NT~60122 -> ~1500-column
+    # chunks). MEA sorts run batch_size=10000, where 40 iterations means
+    # 254-column chunks: identical work split into 6x more kernel launches,
+    # each too small to fill the GPU.
+    #
+    # Tiling is arithmetically inert. The einsum's only summed index is the
+    # neighbour axis j; time-within-chunk (m) is a pure batch dimension, and
+    # every reduction after the loop (max over templates, max over nC2
+    # neighbours, max_pool1d, threshold) runs on the reassembled full-width
+    # (Nfilt, NT) buffers. So each output column comes out the same no matter
+    # which chunk it landed in -- verified per-element on (xy, imax, amp,
+    # adist) for niter in {40,20,16,13,10,8,6,5,4,3}, and end-to-end on a
+    # 300-batch sort of 20260724A (see KS4_VALIDATION_NOTES.md).
+    #
+    # Measured there (Nfilt=4048, nC=10, nk=10, NT=10122):
+    #   niter 40 -> 212.8 ms/batch (chunk  254, 2832 MiB peak)   stock
+    #   niter 10 -> 196.3 ms/batch (chunk 1013, 4621 MiB peak)   best
+    #   niter  8 -> 298.8 ms/batch (chunk 1266, 6217 MiB peak)   cliff
+    # There is a hard cliff just past ~1024 columns, so target that and no
+    # more. min(40, ...) means this can only ever REDUCE over-tiling on short
+    # batches: any NT >= 40*1024 keeps the stock tiling exactly, so the
+    # default-batch_size path is untouched.
+    TARGET_CHUNK = 1024
+    niter = min(40, max(1, -(-NT // TARGET_CHUNK)))
     nb = (NT-1)//niter+1
 
     # Cache unsqueezed templates across batches (wTEMP is fixed for the pass).
