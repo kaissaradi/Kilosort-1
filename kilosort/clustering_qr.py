@@ -12,7 +12,7 @@ from scipy.cluster.vq import kmeans
 import faiss
 from tqdm import tqdm 
 
-from kilosort import hierarchical, swarmsplitter
+from kilosort import fast_kpp, hierarchical, swarmsplitter
 from kilosort.utils import group_indices_by_label, log_performance
 
 logger = logging.getLogger(__name__)
@@ -345,7 +345,26 @@ def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
     return iclust.cpu().numpy(), isub.cpu().numpy(), M, iclust_init
 
 
-def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'), verbose=False):
+def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'),
+                    verbose=False):
+    """k-means++ seeding. 78-87% of clustering_qr.run's time lives below here.
+
+    The body is unchanged and lives in _kmeans_plusplus_stock. fast_kpp runs
+    the same loop without its two per-iteration host reads and returns None
+    whenever it cannot show it took the branches stock would have, in which
+    case the stock body runs and this is a no-op. See kilosort/fast_kpp.py.
+    """
+    def stock():
+        return _kmeans_plusplus_stock(Xg, niter, seed, device, verbose)
+
+    fast = fast_kpp.try_run(Xg, niter, seed, device, stock)
+    if fast is not None:
+        return fast
+    return stock()
+
+
+def _kmeans_plusplus_stock(Xg, niter=200, seed=1, device=torch.device('cuda'),
+                           verbose=False):
     # Xg is number of spikes by number of features.
     # We are finding cluster centroids and assigning each spike to a centroid.
     vtot = torch.norm(Xg, 2, dim=1)**2
@@ -366,7 +385,9 @@ def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'), verbose=
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    ntry = 100  # number of candidate cluster centroids to test on each iteration
+    # Number of candidate cluster centroids to test on each iteration. The
+    # fast path's guard is checked against this same number; keep them equal.
+    ntry = fast_kpp.NTRY
     n_spikes, n_features = Xg.shape
     # Need to store the spike features used for each cluster centroid (mu),
     # best variance explained so far for each spike (vexp0),

@@ -271,6 +271,159 @@ Commit `c086c00`.
 
 ---
 
+## 4. Clustering: k-means++ without the per-iteration host reads, 1.56x
+
+With detection dealt with, clustering was the largest stage left — 29.1 s of a
+70.7 s slice300 sort, 41%, and the only stage this series had not touched.
+
+### Where clustering's time goes
+
+`profile_cluster.py` wraps every function `clustering_qr.run` calls and
+synchronizes CUDA before reading the clock, so GPU work is charged to the call
+that launched it. Both passes, one slice300 sort:
+
+| function | template | | spikes | |
+|---|---:|---:|---:|---:|
+| `run()` total | 14.58 s | | 13.63 s | |
+| `cluster` | 12.36 s | 84.8% | 12.69 s | 93.1% |
+| ↳ `kmeans_plusplus` | **11.44 s** | **78.5%** | **11.80 s** | **86.6%** |
+| ↳ assign loop (rest) | 0.55 s | 3.8% | 0.57 s | 4.2% |
+| ↳ `neigh_mat` | 0.32 s | 2.2% | 0.27 s | 2.0% |
+| ↳ `Mstats` | 0.05 s | 0.3% | 0.05 s | 0.3% |
+| `swarmsplitter.split` | 1.80 s | 12.3% | 0.50 s | 3.7% |
+| `get_data_cpu` | 0.14 s | 0.9% | 0.15 s | 1.1% |
+| `hierarchical.maketree` | 0.11 s | 0.8% | 0.12 s | 0.9% |
+| `mean_cluster_templates` | 0.08 s | 0.5% | 0.08 s | 0.6% |
+| `new_clusters` | 0.01 s | 0.1% | 0.01 s | 0.1% |
+| loop body, unaccounted | 0.08 s | 0.6% | 0.07 s | 0.5% |
+
+The standing guess — "235 cluster centres in a Python loop over small tensors"
+— was pointing at the wrong loop. **The per-centre loop is 0.6% of the time.**
+One function inside it is 78–87%, and the previous session's work on `cluster`
+(`_counts_into`, the early exit) had already dealt with everything around it:
+the alternating-assignment loop is 4%.
+
+### It is not doing arithmetic
+
+`kmeans_plusplus` runs 200 iterations on tensors of at most 13k × 75 floats.
+A 1,162-spike centre takes 53.2 ms; a 3,263-spike centre takes 53.0 ms. Same
+time, 2.8× the data — the cost is per-iteration overhead. Statement-level
+timing, synchronizing after each statement (12,941 spikes, µs/iteration):
+
+| statement | µs | statement | µs |
+|---|---:|---|---:|
+| `multinomial` | 104.3 | `dexp` relu | 23.2 |
+| `vexp0[ix] = vexp[ix, imax]` | 71.2 | `dexp.sum(0)` | 19.4 |
+| `vexp` matmul | 57.0 | `mu[j] = Xc[imax]` | 17.9 |
+| `int((weights > 0).sum())` | 34.0 | `float(weights.sum())` | 17.4 |
+| `ix = dexp[:, imax] > 0` | 26.6 | `relu(vtot - vexp0)` | 15.6 |
+| | | `iclust[ix] = j` | 12.1 |
+
+Three of those block the host: the loop's two guard reads, and a third hidden
+inside `vexp0[ix] = vexp[ix, imax]`, where the boolean advanced index has to
+run `nonzero()` to size its output. Together they are ~32% of the serialized
+total, and they stall the pipeline rather than queueing behind it.
+
+### The guard is one question, and its answer is known at the end
+
+```python
+if float(weights.sum()) <= 0: break
+n_pos = int((weights > 0).sum().item())
+if n_pos <= 0: break
+n_draw = min(ntry, n_pos)
+```
+
+`weights = relu(...) >= 0`, so `sum <= 0` iff every entry is zero iff
+`n_pos == 0`, and `n_pos == 0` implies `n_pos < ntry`. All three lines are the
+single question *was `n_pos` ever below `ntry`* — only the smallest `n_pos` the
+loop saw matters.
+
+That smallest value is the last one. `vexp0` is written only through
+`vexp0[ix] = vexp[ix, imax]` with `ix = dexp[:, imax] > 0` and
+`dexp = relu(vexp - vexp0[:, None])`, so `ix` is true exactly where
+`vexp[:, imax] > vexp0`: every write raises an entry and none lowers one. (NaN
+cannot slip through — `relu(NaN)` is NaN and `NaN > 0` is false.) A
+non-decreasing `vexp0` makes `relu(vtot - vexp0)` non-increasing elementwise,
+so `n_pos` is non-increasing, so `n_pos` after the last iteration bounds every
+`n_pos` the loop passed through. **One `count_nonzero` and one host read per
+call replace two per iteration: 400 reads become 1.**
+
+If that final count is below `ntry`, the fast result is discarded and the stock
+body runs. Nothing is guessed.
+
+Census over a whole slice300 sort (`kpp_census.py`, 393 calls):
+
+| | |
+|---|---:|
+| calls that ran fewer than 200 iterations | 0 |
+| calls that ever saw `n_pos < 100` | 0 |
+| smallest `n_pos` anywhere | 877 |
+| 10th percentile of per-call minimum | 1,231 |
+| median of per-call minimum | 2,738 |
+
+The margin is 8.8×. The fallback is there for the case that is not in this
+recording, not for one that is.
+
+### The other three changes
+
+* `vexp0[ix] = vexp[ix, imax]` becomes `torch.where(ix, vexp[:, imax], vexp0)`,
+  and `iclust[ix] = j` becomes `iclust.masked_fill_(ix, j)`. Both are pure
+  selection: the same bits are chosen, without materializing an index list, so
+  neither blocks the host.
+* `2 * Xg @ Xc.T` is hoisted out of the loop. `*` and `@` share precedence and
+  associate left, so that expression is `(2 * Xg) @ Xc.T` — stock rebuilds the
+  entire scaled feature matrix on all 200 iterations. Hoisting hands cuBLAS
+  identical bytes.
+* `mu` is not built. It is written every iteration and never read:
+  `kmeans_plusplus` returns `iclust` alone, and the only code that used `mu` is
+  the commented-out block at the end of the stock function. If that block is
+  ever revived, this shortcut has to go with it.
+
+Nothing else moves — the multinomial draw, the gemm, the relu, the sum and the
+argmax are the same calls on the same values in the same order.
+
+### RNG
+
+The loop consumes the global torch generator through `torch.multinomial`, and
+either path leaves it in the same state: the fast path draws the same 200
+times, and the fallback re-seeds (stock's own `torch.manual_seed(seed)`) before
+drawing. Downstream code cannot tell which ran. The identity harness checks
+this explicitly, not just the labels.
+
+### Verification
+
+* 32 real `Xd` matrices dumped from a slice300 sort (1,002–12,941 spikes,
+  30–75 features): `iclust` identical in **all 32**, generator state identical
+  in **all 32**. 1,759.7 ms → 1,125.6 ms, **1.56×**.
+* Full sort: **23 files byte-identical** to the stock baseline (raw bytes, not
+  `np.array_equal` — see §3 for why that distinction matters). `ops.npy` is
+  timers and peak memory and is reported separately.
+* `KILOSORT_NO_FAST_KPP=1`: also 23 files byte-identical, so the switch really
+  does reproduce the baseline.
+* `tests/test_fast_kpp.py` pins the guard rather than the kernel: a normal
+  centre matches stock and leaves the same generator state; a centre whose
+  candidate pool collapses is **refused**, both before and after the gate has
+  latched; and a separate test checks that the collapsing fixture really does
+  break stock early, so the refusal tests cannot pass for the wrong reason.
+
+  That fixture took two tries. Repeating a handful of distinct rows does *not*
+  collapse the pool: a spike that is exactly its own centroid still gets `vtot`
+  from `torch.norm` and `vexp` from a gemm, and those disagree in the last
+  bits, so its residual stays positive. Rows of exact zeros are zero by both
+  routes and collapse deterministically.
+
+### Result
+
+Same-session A/B on slice300, `KILOSORT_NO_FAST_KPP=1` as the control:
+
+| | stock | fast | |
+|---|---:|---:|---|
+| cluster (temp) | 14.6 s | 10.1 s | 1.45× |
+| cluster (final) | 14.5 s | 10.3 s | 1.41× |
+| whole sort | 70.7 s | 61.7 s | 1.15× |
+
+---
+
 ## Cumulative
 
 Whole slice300 sort across this series, all byte-identical to the stock
@@ -282,9 +435,15 @@ baseline at every step:
 | + adaptive niter (§1) | 113.2 |
 | + fused detection (§2) | 67.6 |
 | + fused peel subtract (§3) | 62.6 |
+| + sync-free k-means++ (§4) | 61.7 |
+
+These rows are **not all from one sitting, and the machine drifts**: re-running
+the §3 build in the §4 session gave 70.7 s, not 62.6 s. Only same-session A/B
+numbers are comparable — for §4 that is the table just above (70.7 → 61.7 s),
+with both runs byte-identical to the same baseline.
 
 Stage shares have moved a long way: universal detection was 57.9% of the
-production sort and is now the same size as clustering, which is untouched.
+production sort, and detection and clustering are now roughly the same size.
 
 ---
 
@@ -302,5 +461,15 @@ production sort and is now the same size as clustering, which is untouched.
   the scatter is load-bearing for identity — advanced-index `-=` is
   last-write-wins on overlapping `+/-nt` windows — so a faster scatter is
   unlikely to be byte-identical without care.
-* **Clustering** (129.2 s across both passes): 235 cluster centres in a Python
-  loop over small tensors.
+* **Clustering, what is left after §4.** `kmeans_plusplus` is still ~60% of
+  clustering, and it is still launch-bound: ~20 kernel launches per iteration
+  on tensors small enough that each launch costs more than the work it does.
+  The next step is capturing the iteration body in a CUDA graph, which needs
+  the random draw pulled out of the body — measured feasible, because
+  `torch.multinomial(w, k, replacement=False)` is exactly
+  `topk(w / empty_like(w).exponential_(), k)` (verified bitwise on this
+  install), i.e. one `exponential_` over an `(n_spikes,)` tensor per iteration
+  and nothing else. Pre-drawing those 200 noise vectors leaves a body with no
+  RNG in it. Not attempted yet.
+* **`swarmsplitter.split`** is now the second-largest item in the template pass
+  (1.80 s, 12.3%) and is CPU-side.
