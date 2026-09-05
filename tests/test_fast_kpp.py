@@ -37,10 +37,11 @@ NITER = 25          # enough to exercise the loop; 200 is the production value
 
 @pytest.fixture(autouse=True)
 def reset_choice():
-    saved = fast_kpp._CHOICE
+    saved = (fast_kpp._CHOICE, fast_kpp._GRAPH_CHOICE)
     fast_kpp._CHOICE = None
+    fast_kpp._GRAPH_CHOICE = None
     yield
-    fast_kpp._CHOICE = saved
+    fast_kpp._CHOICE, fast_kpp._GRAPH_CHOICE = saved
 
 
 def blobs(n_spikes, n_features, seed, n_blobs=40):
@@ -174,3 +175,77 @@ def test_env_switch_and_ineligible_inputs_decline():
     assert not fast_kpp._eligible(Xg[:fast_kpp.NTRY - 1], NITER, dev)
     assert not fast_kpp._eligible(Xg, 0, dev)
     assert fast_kpp._eligible(Xg, NITER, dev)
+
+
+# --- CUDA graph path -------------------------------------------------------
+#
+# The graph replaces torch.multinomial with the identity it is built on and
+# pre-draws its randomness, so it needs its own checks even though the labels
+# it produces are compared against stock by the same gate.
+
+
+def test_graph_matches_the_ungraphed_loop():
+    Xg = blobs(2500, 14, seed=21)
+    ref, ref_n = fast_kpp._fast_loop(Xg, NITER, 5, dev)
+    got, got_n = fast_kpp._graph_loop(Xg, NITER, 5, dev)
+    assert torch.equal(ref, got)
+    assert int(ref_n) == int(got_n)
+
+
+def test_pre_drawn_noise_is_the_stream_multinomial_would_have_used():
+    """Load-bearing for the graph: the body cannot contain the RNG, so the
+    draws are made up front. Two things have to hold, and both have bitten:
+
+      * torch.multinomial(w, k, replacement=False) IS
+        topk(w / empty_like(w).exponential_(), k);
+      * drawing niter vectors one row at a time gives the same stream as niter
+        separate calls -- one exponential_ over the whole buffer does NOT,
+        because the generator's offset advance depends on each call's numel.
+    """
+    n, k = 900, 100
+    torch.manual_seed(31)
+    sep = [torch.empty(n, device=dev).exponential_() for _ in range(4)]
+    torch.manual_seed(31)
+    Q = fast_kpp._draw_noise(4, n, dev)
+    for j in range(4):
+        assert torch.equal(sep[j].view(torch.int32), Q[j].view(torch.int32))
+
+    torch.manual_seed(32)
+    Qbig = torch.empty(4, n, device=dev).exponential_()
+    assert not torch.equal(Qbig.view(torch.int32), Q.view(torch.int32)), \
+        'one big exponential_ must NOT match; if it does, the trap is gone'
+
+    w = torch.rand(n, device=dev)
+    state = torch.cuda.get_rng_state()
+    a = torch.multinomial(w, k, replacement=False)
+    torch.cuda.set_rng_state(state)
+    q = torch.empty_like(w).exponential_()
+    assert torch.equal(a, torch.topk(w / q, k).indices)
+
+
+def test_graph_env_switch_falls_back_to_the_eager_loop():
+    import os
+    Xg = blobs(1400, 10, seed=22)
+    ref = stock_of(Xg, NITER, 8)
+    os.environ['KILOSORT_NO_KPP_GRAPH'] = '1'
+    try:
+        got = fast_kpp.try_run(Xg, NITER, 8, dev, lambda: stock_of(Xg, NITER, 8))
+    finally:
+        del os.environ['KILOSORT_NO_KPP_GRAPH']
+    assert fast_kpp._GRAPH_CHOICE is False
+    assert got is not None and torch.equal(ref, got)
+
+
+def test_graph_choice_latches_so_stock_is_not_re_run():
+    """Both gates must clear on the first call; otherwise every later call
+    would pay for a stock loop it does not need."""
+    Xg = blobs(1300, 11, seed=23)
+    fast_kpp.try_run(Xg, NITER, 4, dev, lambda: stock_of(Xg, NITER, 4))
+    if fast_kpp._GRAPH_CHOICE is not True:
+        pytest.skip('CUDA graph path unavailable on this device')
+    assert fast_kpp._CHOICE is True
+    Xg = blobs(1700, 11, seed=24)
+    ref = stock_of(Xg, NITER, 6)
+    got = fast_kpp.try_run(Xg, NITER, 6, dev, lambda: pytest.fail(
+        'stock must not be re-run once both gates have latched'))
+    assert got is not None and torch.equal(ref, got)

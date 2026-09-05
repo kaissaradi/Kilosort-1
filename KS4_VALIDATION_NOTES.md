@@ -424,6 +424,113 @@ Same-session A/B on slice300, `KILOSORT_NO_FAST_KPP=1` as the control:
 
 ---
 
+## 5. Capturing the k-means++ body in a CUDA graph, 2.3x on top of §4
+
+§4 removed the stalls but not the launches: the loop still issues ~20 kernels
+per iteration on tensors small enough that the launch costs more than the work.
+200 iterations take 33.6 ms at 1,162 spikes and 44.3 ms at 12,941 — ~168
+µs/iteration is overhead and only ~54 µs/iteration is data. A CUDA graph
+collapses those 20 launches into one.
+
+### Getting the randomness out of the body
+
+Capturing torch's generator makes every replay draw *different* numbers from
+what eager would, so the answer changes. The way out is that the loop's only
+randomness is one call:
+
+    torch.multinomial(w, k, replacement=False)
+      ==  topk(w / torch.empty_like(w).exponential_(), k).indices
+
+verified bitwise on this install over 50 weight vectors and all 32 real Xd
+matrices. So each iteration consumes exactly one `exponential_` over an
+`(n_spikes,)` tensor and nothing else, and those `niter` vectors can be drawn
+up front — leaving a body with no RNG in it, which a graph can capture.
+
+**They must be drawn one row at a time.** The generator's offset advance
+depends on each call's numel, so `niter` calls of `n_spikes` elements is a
+different stream from one call of `niter * n_spikes`. Both were checked: row at
+a time is bit-identical to `niter` separate `empty_like().exponential_()` calls,
+and the single big call is not. `test_pre_drawn_noise_is_the_stream_
+multinomial_would_have_used` pins both directions, including asserting that the
+big call still *differs* — so the trap cannot quietly disappear.
+
+`j` also has to leave the host: it lives in a device scalar that the graph
+increments itself, which is what lets one recording serve all 200 iterations.
+
+### Three things that made this affordable
+
+* **`torch.cuda.graph()` costs 75 ms per capture, and all of it is the
+  `gc.collect()` its `__enter__` runs.** Measured on this box: gc 79 ms,
+  `empty_cache` 0.01 ms, `synchronize` 0.02 ms. Calling `capture_begin` /
+  `capture_end` by hand costs **0.18 ms**. At 393 centres per sort that is the
+  difference between +29 s and +0.07 s.
+* **Every centre needs its own graph** (each has a different `n_spikes`), and
+  that is fine at 0.18 ms. Padding to a bucket size so graphs could be reused
+  is *not* available: `dexp.sum(0)` over `(n + pad, NTRY)` is a different
+  reduction tree from `(n, NTRY)`, so the sum comes out with different bits
+  even though the padded rows are exactly zero.
+* **A graph's private memory pool is not returned when the graph is
+  destroyed.** With a fresh pool per graph, reserved memory grew ~23 MB per
+  capture and reached 9.9 GB after 400 — an OOM on a 19.5 GB card. Sharing one
+  pool handle fixes it (reserved plateaus at 790 MB and stays flat over 400
+  captures), but a shared handle whose graphs have *all* been destroyed trips
+  `it->second->use_count > 0 INTERNAL ASSERT FAILED` in the caching allocator.
+  So the previous graph is held until the next one has been captured — the
+  handle always has a live user, and only one graph's pool is alive at a time.
+
+### Verification
+
+* All 32 real Xd matrices: labels identical to the ungraphed loop, and
+  `n_pos_final` identical. 2.26–2.31× on top of §4.
+* Full sort, **three separate runs**: 23 files byte-identical to the stock
+  baseline every time (53.32 / 53.12 / 53.48 s).
+* `KILOSORT_NO_KPP_GRAPH=1` falls back to the §4 loop; `KILOSORT_NO_FAST_KPP=1`
+  still falls back to stock.
+* Both gates latch on the first call, so the stock loop is run once per
+  process, not once per centre.
+
+### Result
+
+| | stock | §4 | §5 | |
+|---|---:|---:|---:|---|
+| cluster (temp) | 14.6 s | 10.1 s | 5.9 s | 2.47× |
+| cluster (final) | 14.5 s | 10.3 s | 6.1 s | 2.38× |
+| whole sort | 70.7 s | 61.7 s | 53.3 s | 1.33× |
+
+---
+
+## Kilosort4 is not bit-reproducible run to run
+
+Found while verifying §5, and it changes how every claim in this file should be
+read. Four runs of the *same* build on the same input: three were byte-identical
+to each other and to the baseline, and **one differed**.
+
+| file | bytes differing |
+|---|---:|
+| `templates.npy` | 145 of 75,981,600 |
+| `pc_features.npy` | 96 of 93,135,000 |
+| `similar_templates.npy` | 29 of 1,440,000 |
+| `spike_positions.npy` | 9 of 6,209,000 |
+| `amplitudes.npy` | 6 of 3,104,500 |
+
+`spike_times.npy`, `spike_clusters.npy`, `spike_templates.npy` and
+`kept_spikes.npy` were identical in all four. Every file that moved derives
+from `tF` (`amplitudes = norm(tF)`, `spike_positions = f(st, tF)`, and
+`templates`/`similar_templates` from `Wall`, which is a mean of `tF` rows); no
+file that moved is a spike time or a cluster assignment. So the wobble is a
+handful of last-bit differences in the extracted PC features, and it is **not**
+introduced by anything in this series — the outlier run used the §4 code path,
+which two other runs reproduced exactly. The root cause is **not** identified
+here; only its footprint is.
+
+What this means for the method: a single matching sort is weaker evidence than
+it looks. The per-call harnesses (32 real matrices, 4.9 billion elements, the
+peel census) are the load-bearing checks; the end-to-end sort is corroboration,
+and should be **repeated** before a byte-identity claim rests on it. §5's claim
+rests on three matching runs, not one.
+
+---
+
 ## Cumulative
 
 Whole slice300 sort across this series, all byte-identical to the stock
@@ -436,6 +543,7 @@ baseline at every step:
 | + fused detection (§2) | 67.6 |
 | + fused peel subtract (§3) | 62.6 |
 | + sync-free k-means++ (§4) | 61.7 |
+| + graph-captured k-means++ (§5) | 53.3 |
 
 These rows are **not all from one sitting, and the machine drifts**: re-running
 the §3 build in the §4 session gave 70.7 s, not 62.6 s. Only same-session A/B
@@ -461,15 +569,8 @@ production sort, and detection and clustering are now roughly the same size.
   the scatter is load-bearing for identity — advanced-index `-=` is
   last-write-wins on overlapping `+/-nt` windows — so a faster scatter is
   unlikely to be byte-identical without care.
-* **Clustering, what is left after §4.** `kmeans_plusplus` is still ~60% of
-  clustering, and it is still launch-bound: ~20 kernel launches per iteration
-  on tensors small enough that each launch costs more than the work it does.
-  The next step is capturing the iteration body in a CUDA graph, which needs
-  the random draw pulled out of the body — measured feasible, because
-  `torch.multinomial(w, k, replacement=False)` is exactly
-  `topk(w / empty_like(w).exponential_(), k)` (verified bitwise on this
-  install), i.e. one `exponential_` over an `(n_spikes,)` tensor per iteration
-  and nothing else. Pre-drawing those 200 noise vectors leaves a body with no
-  RNG in it. Not attempted yet.
+* **Where `tF`'s run-to-run wobble comes from.** See the section above: the
+  footprint is pinned, the cause is not. Worth finding, because until it is,
+  no end-to-end byte-identity claim can rest on a single run.
 * **`swarmsplitter.split`** is now the second-largest item in the template pass
   (1.80 s, 12.3%) and is CPU-side.

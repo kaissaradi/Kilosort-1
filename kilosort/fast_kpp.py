@@ -147,6 +147,149 @@ def _fast_loop(Xg, niter, seed, device):
     return iclust, n_pos_final
 
 
+# ---------------------------------------------------------------------------
+# CUDA graph path
+#
+# _fast_loop still issues ~20 kernel launches per iteration on tensors small
+# enough that the launch costs more than the work: 200 iterations take 33.6 ms
+# at 1,162 spikes and 44.3 ms at 12,941, so ~168 us/iteration is overhead and
+# only ~54 us/iteration is data. A CUDA graph collapses those 20 launches into
+# one. Two obstacles, both measured rather than assumed:
+#
+# RNG. Capturing torch's generator makes every replay draw different numbers
+# from what eager would, which changes the answer. But
+# torch.multinomial(w, k, replacement=False) is exactly
+# topk(w / empty_like(w).exponential_(), k) -- verified bitwise on this install
+# over 50 weight vectors and all 32 real matrices -- i.e. one exponential_ over
+# an (n_spikes,) tensor per iteration and nothing else. Drawing those niter
+# vectors up front, ONE ROW AT A TIME, consumes the generator in exactly the
+# stock order (also verified bitwise). One exponential_ over the whole
+# (niter, n_spikes) buffer does NOT: the offset advance depends on the numel of
+# each call, so that produces a different stream. It was checked, and it
+# differs. Do not "simplify" _draw_noise into a single call.
+#
+# SHAPE. Every centre has a different n_spikes, so a graph cannot be reused
+# between centres and capture is paid ~393 times per sort. That is affordable
+# only because capture itself costs 0.18 ms -- but torch.cuda.graph() costs
+# 75 ms, and all of it is the gc.collect() its __enter__ runs (measured: 79 ms
+# for the gc, 0.01 ms for the empty_cache, 0.02 ms for the synchronize). Hence
+# capture_begin/capture_end by hand.
+#
+# Padding to a bucket size would let graphs be reused, but it is not available:
+# dexp.sum(0) over (n + pad, NTRY) is a different reduction tree from
+# (n, NTRY), so the sum comes out with different bits even though the padded
+# rows are exactly zero.
+#
+# MEMORY. A graph's intermediates live in a private pool, and destroying the
+# graph does NOT return that pool to the allocator: with a fresh pool per
+# graph, reserved memory grew 23 MB per capture and reached 9.9 GB after 400.
+# Sharing one pool handle fixes it (reserved plateaus at 790 MB and stays
+# flat), but a shared handle whose graphs have all been destroyed trips
+# `it->second->use_count > 0 INTERNAL ASSERT FAILED` in the caching allocator.
+# So the previous graph is held until the next one has been captured, which
+# keeps the handle's use count above zero without pinning a graph forever.
+# ---------------------------------------------------------------------------
+
+# None until the first capture; then a pool handle kept for the process.
+_POOL = None
+_CAPTURE_STREAM = None
+# The graph captured last, held only so _POOL keeps a live user; see MEMORY.
+_PREV_GRAPH = None
+# None = untested, True = verified against stock, False = unavailable.
+_GRAPH_CHOICE = None
+
+
+def _draw_noise(niter, n_spikes, device):
+    """The niter exponential vectors torch.multinomial would have drawn.
+
+    One row at a time. See the RNG note above: this is not the same stream as
+    a single exponential_ over the whole buffer.
+    """
+    Q = torch.empty(niter, n_spikes, device=device)
+    for j in range(niter):
+        Q[j].exponential_()
+    return Q
+
+
+def _graph_loop(Xg, niter, seed, device):
+    """_fast_loop with the iteration body captured in a CUDA graph.
+
+    Same arithmetic and same random draws; see the block comment above for why
+    each departure from _fast_loop is the same computation. Returns
+    (iclust, n_pos_final) exactly as _fast_loop does.
+    """
+    global _POOL, _CAPTURE_STREAM, _PREV_GRAPH
+
+    n_spikes = Xg.shape[0]
+    vtot = torch.norm(Xg, 2, dim=1)**2
+
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    Q = _draw_noise(niter, n_spikes, device)
+
+    Xg2 = 2 * Xg
+    vexp0 = torch.zeros(n_spikes, device=device)
+    iclust = torch.zeros((n_spikes,), dtype=torch.int, device=device)
+    # j lives on the device and is advanced inside the graph, so the body has
+    # no host-side state and the same recording serves every iteration.
+    jt = torch.zeros(1, dtype=torch.int64, device=device)
+    jt32 = torch.zeros((), dtype=torch.int32, device=device)
+
+    def body():
+        v2 = torch.relu(vtot - vexp0)
+        q = Q.index_select(0, jt).view(-1)
+        isamp = torch.topk(v2 / q, NTRY).indices
+        Xc = Xg.index_select(0, isamp)
+        vexp = Xg2 @ Xc.T - (Xc**2).sum(1)
+        dexp = torch.relu(vexp - vexp0.unsqueeze(1))
+        imax = torch.argmax(dexp.sum(0), dim=0, keepdim=True)
+        ix = dexp.index_select(1, imax).squeeze(1) > 0
+        # out=iclust / out=vexp0: the loop state must be written back to the
+        # SAME addresses every replay, because the graph has those baked in.
+        torch.where(ix, jt32, iclust, out=iclust)
+        torch.where(ix, vexp.index_select(1, imax).squeeze(1), vexp0, out=vexp0)
+        jt.add_(1)
+        jt32.add_(1)
+
+    def reset():
+        vexp0.zero_()
+        iclust.zero_()
+        jt.zero_()
+        jt32.zero_()
+
+    # Warm up on a side stream: capture records without executing, so anything
+    # that lazily initializes (cuBLAS handles, topk workspaces) has to have run
+    # already or capture fails.
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            body()
+    torch.cuda.current_stream().wait_stream(s)
+    reset()
+
+    if _CAPTURE_STREAM is None:
+        _CAPTURE_STREAM = torch.cuda.Stream()
+    if _POOL is None:
+        _POOL = torch.cuda.graph_pool_handle()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(_CAPTURE_STREAM):
+        g.capture_begin(_POOL)
+        body()
+        g.capture_end()
+    # Only now is it safe to drop the previous graph: _POOL needs a live user
+    # at capture_begin. See MEMORY above.
+    _PREV_GRAPH = g
+
+    reset()                    # capture leaves the buffers undefined
+    for _ in range(niter):
+        g.replay()
+
+    n_pos_final = torch.count_nonzero(torch.relu(vtot - vexp0))
+    return iclust, n_pos_final
+
+
 def _eligible(Xg, niter, device):
     if os.environ.get('KILOSORT_NO_FAST_KPP'):
         return False
@@ -171,7 +314,7 @@ def try_run(Xg, niter, seed, device, stock_loop):
     it must be a zero-argument callable returning stock's iclust for this same
     input.
     """
-    global _CHOICE
+    global _CHOICE, _GRAPH_CHOICE
 
     if _CHOICE is False or not _eligible(Xg, niter, device):
         if _CHOICE is None and os.environ.get('KILOSORT_NO_FAST_KPP'):
@@ -179,14 +322,37 @@ def try_run(Xg, niter, seed, device, stock_loop):
             logger.info('fast kmeans_plusplus disabled by KILOSORT_NO_FAST_KPP')
         return None
 
+    if _GRAPH_CHOICE is None and os.environ.get('KILOSORT_NO_KPP_GRAPH'):
+        # Latch it, or the validation below would re-run stock on every call.
+        _GRAPH_CHOICE = False
+        logger.info('kmeans_plusplus CUDA graph disabled by '
+                    'KILOSORT_NO_KPP_GRAPH; using the ungraphed loop')
+    use_graph = _GRAPH_CHOICE is not False
     try:
-        iclust, n_pos_final = _fast_loop(Xg, niter, seed, device)
+        if use_graph:
+            iclust, n_pos_final = _graph_loop(Xg, niter, seed, device)
+        else:
+            iclust, n_pos_final = _fast_loop(Xg, niter, seed, device)
     except RuntimeError as e:
-        # Drawing NTRY candidates without replacement needs NTRY positive
-        # weights; if there were fewer, stock would have drawn fewer too, so
-        # this is the same fallback as n_pos_final < NTRY.
-        logger.debug(f'fast kmeans_plusplus fell back: {e}')
-        return None
+        if use_graph:
+            # Capture can fail for reasons that have nothing to do with this
+            # centre (another stream capturing, a driver that will not graph
+            # one of these kernels). Drop to the ungraphed loop for the rest of
+            # the process rather than retrying 393 times.
+            _GRAPH_CHOICE = False
+            logger.info(f'kmeans_plusplus CUDA graph unavailable, using the '
+                        f'ungraphed loop: {e}')
+            try:
+                iclust, n_pos_final = _fast_loop(Xg, niter, seed, device)
+            except RuntimeError as e2:
+                logger.debug(f'fast kmeans_plusplus fell back: {e2}')
+                return None
+        else:
+            # Drawing NTRY candidates without replacement needs NTRY positive
+            # weights; if there were fewer, stock would have drawn fewer too,
+            # so this is the same fallback as n_pos_final < NTRY.
+            logger.debug(f'fast kmeans_plusplus fell back: {e}')
+            return None
 
     if int(n_pos_final) < NTRY:
         logger.debug(
@@ -194,17 +360,27 @@ def try_run(Xg, niter, seed, device, stock_loop):
             f'so stock would not have drawn a full candidate set')
         return None
 
-    if _CHOICE is None:
+    if _CHOICE is None or _GRAPH_CHOICE is None:
+        # Whichever path just ran gets checked against stock before anything is
+        # trusted. The graph path swaps torch.multinomial for the topk/
+        # exponential identity it is built on, so it needs its own check even
+        # once the ungraphed loop has been cleared.
         ref = stock_loop()
-        if torch.equal(ref, iclust):
+        ok = torch.equal(ref, iclust)
+        if use_graph:
+            _GRAPH_CHOICE = ok
+        if ok:
             _CHOICE = True
             logger.info(
-                f'fast kmeans_plusplus enabled: identical to the stock loop on '
-                f'{iclust.numel():,} labels')
+                f'fast kmeans_plusplus enabled ({"graph" if use_graph else "eager"}): '
+                f'identical to the stock loop on {iclust.numel():,} labels')
         else:
-            _CHOICE = False
-            logger.info('fast kmeans_plusplus disabled: labels differ from the '
-                        'stock loop on this device')
+            if not use_graph:
+                _CHOICE = False
+            logger.info(
+                f'fast kmeans_plusplus '
+                f'{"CUDA graph" if use_graph else "loop"} disabled: labels '
+                f'differ from the stock loop on this device')
             return None
 
     return iclust
