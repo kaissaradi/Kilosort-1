@@ -183,7 +183,7 @@ def run_kilosort(settings, probe=None, probe_name=None, filename=None,
     for idx in shank_idx:
         _filename, _data_dir, _results_dir, _probe = \
             set_files(settings, filename, probe, probe_name, data_dir,
-                      results_dir, bad_channels, idx)
+                      results_dir, bad_channels, idx, file_object=file_object)
         setup_logger(_results_dir, verbose_console=verbose_console)
 
         ops, st, clu, tF, Wall, similar_templates, \
@@ -205,8 +205,9 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
     Notes
     -----
     filename is expected to be a list of Paths at this point, even if it's
-    a singleton list.
-    
+    a singleton list -- unless file_object was provided without filename or
+    data_dir, in which case it is None.
+
     """
 
     try:
@@ -232,7 +233,9 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
             logger.info(f'Using CUDA device: {torch.cuda.get_device_name()} {memory:.2f}GB')
 
         logger.info('-'*40)
-        if len(filename) == 1:
+        if filename is None:
+            logger.info("Sorting via file_object (no filename provided)")
+        elif len(filename) == 1:
             logger.info(f"Sorting {filename}")
         else:
             logger.info(f"Sorting {filename[0].parent}/... (multiple files)")
@@ -366,24 +369,31 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
 
 
 def set_files(settings, filename, probe, probe_name, data_dir, results_dir,
-              bad_channels, shank_idx):
+              bad_channels, shank_idx, file_object=None):
     """Parse file and directory information for data, probe, and results."""
 
-    # Check for filename 
-    filename = settings.get('filename', None) if filename is None else filename 
+    # Check for filename
+    filename = settings.get('filename', None) if filename is None else filename
 
     # Use data_dir if filename not available
     if filename is None:
         data_dir = settings.get('data_dir', None) if data_dir is None else data_dir
-        if data_dir is None:
+        if data_dir is None and file_object is not None:
+            # `file_object` supplies its own dtype/shape directly (see
+            # BinaryFiltered.__init__), so neither filename nor data_dir is
+            # needed to read the data -- only to derive a default results_dir
+            # below, which we require to be explicit in this case instead.
+            data_dir = None
+        elif data_dir is None:
             raise ValueError('no path to data provided, set "data_dir=" or "filename="')
-        data_dir = Path(data_dir).resolve()
-        if not data_dir.exists():
-            raise FileExistsError(f"data_dir '{data_dir}' does not exist")
+        else:
+            data_dir = Path(data_dir).resolve()
+            if not data_dir.exists():
+                raise FileExistsError(f"data_dir '{data_dir}' does not exist")
 
-        # Find binary file in the folder
-        filename  = io.find_binary(data_dir=data_dir)
-        filename = [filename]
+            # Find binary file in the folder
+            filename  = io.find_binary(data_dir=data_dir)
+            filename = [filename]
     else:
         if not isinstance(filename, list):
             filename = [filename]
@@ -402,6 +412,11 @@ def set_files(settings, filename, probe, probe_name, data_dir, results_dir,
     results_dir = settings.get('results_dir', None) if results_dir is None else results_dir
     results_dir = Path(results_dir).resolve() if results_dir is not None else None
     if results_dir is None:
+        if data_dir is None:
+            raise ValueError(
+                'results_dir= must be set explicitly when file_object is '
+                'provided without filename= or data_dir=.'
+                )
         results_dir = data_dir / 'kilosort4'
     if shank_idx is not None:
         results_dir = results_dir / f'shank_{shank_idx}'

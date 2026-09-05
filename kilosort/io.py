@@ -40,7 +40,14 @@ def find_binary(data_dir: Union[str, os.PathLike]) -> Path:
 
     # If there are multiple binary files, find one with "ap" tag
     if len(filenames) > 1:
-        filenames = [f for f in filenames if 'ap.bin' in f.as_posix()]
+        tagged = [f for f in filenames if 'ap.bin' in f.as_posix()]
+        if len(tagged) == 0:
+            raise ValueError(
+                f'Multiple binary files found in {data_dir} and none has an '
+                '"ap.bin" tag to disambiguate; please specify filename= '
+                'explicitly.'
+                )
+        filenames = tagged
 
     # If there is still more than one, raise an error, user needs to specify
     # full path.
@@ -442,8 +449,13 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
         params['dat_path'] = f"'{dat_path.resolve().as_posix()}'"
     else:
         f = ops['settings']['filename']
-        if not isinstance(f, list): f = [f]
-        dat_path = [Path(p).resolve().as_posix() for p in f]
+        if f is None:
+            # file_object was used with no filename/data_dir; there is no
+            # real path to record.
+            dat_path = '"no_path.bin"'
+        else:
+            if not isinstance(f, list): f = [f]
+            dat_path = [Path(p).resolve().as_posix() for p in f]
         params['dtype'] = dtype
         params['hp_filtered'] = False
         params['dat_path'] = dat_path
