@@ -1645,8 +1645,30 @@ candidates only, then compared to `As` exactly as now.
 The 4.087e9 confirms the review's 4.1 billion estimate on this repo's own
 data. Note what the 381x is and is not: peaks are what survive BOTH the
 threshold and the neighbourhood-max test, so they are a **lower bound** on
-candidates, and 381x is therefore an **upper** bound on the saving. The true
-candidate count has not been measured yet and is the number that decides this.
+candidates, and 381x is therefore an **upper** bound on the saving.
+
+**The true candidate count, now measured.** `fused_peaks.try_mask` was wrapped
+with a counter reading `(As > Th_universal).sum()` that then delegates to the
+real implementation, so the sort it ran was byte-identical to an unpatched one.
+300 batches of `slice300.bin`, same 519 ch at 30 um geometry:
+
+| | |
+|---|---:|
+| dense columns per call (`Nfilt x NT`) | 4.087e7 |
+| candidates per call, median | **482,392** |
+| candidates per call, mean | 748,307 |
+| candidates per call, max | 3,733,187 |
+| peaks kept, median | 1,682 |
+| candidate fraction of all columns | **1.83%** |
+| **true reduction ratio** | **54.6x** |
+
+The real headroom is **54.6x, not 381x**: candidates outnumber the peaks that
+survive both tests by roughly 290 to 1, so the peak count was never a usable
+proxy for them. 54.6x on this statement's traffic is still large, but it is a
+ceiling for one statement inside a stage that is 42% of a sort (16.3 s of
+38.7 s on this slice), and the compaction that builds the candidate list must
+itself read `As` densely -- a real kernel starts from 4.087e7 unavoidable reads
+before it gathers anything. Amdahl, not the ratio, decides this one.
 
 **Why the element count still overstates the win.** `fused_detect` computes
 `Aa`, `imax` and `Amax` in one fused launch that already shares its read of
@@ -1665,9 +1687,54 @@ cost +567 spikes and -25 good units (see `template_match`'s note). But:
 2. `mask.nonzero()` fixes the output order (filter-major, then time). Any
    candidate compaction has to sort back to it.
 
-**A small fixture now exists.** `data/sorted/20260903A/chunk2.bin` (768 MB,
-74 batches, ~14 s to sort) was re-staged for this measurement and kept. Kernel
-work on detection should use it rather than a production `.bin`.
+**Fixtures.** `20260903A/chunk2.bin` (768 MB, 74 batches, ~14 s) carried the
+first measurement but has since been cleaned off local disk; re-stage it with
+`prepare_data.sh` if a small case is wanted. The candidate count above used
+`slice300.bin` (3.1 GB, 300 batches, 38.7 s of sort, 49.8 s wall), which is a
+production slice and the better fixture of the two: at 74 batches the median
+candidate count is noisier than the 300-batch median reported here.
+
+---
+
+## 11. Process-level GPU concurrency: measured, and it does NOT work
+
+The obvious parallelism play, and the one worth ruling out before any kernel
+work: run **two sorts at once on the one card**. It needs no code, and it is
+byte-identical by construction -- two OS processes, two result directories, no
+shared mutable state, and the GPU is not a numerical participant in what they
+share. The census made it look promising: peak allocation is 9.60 GB of a
+19.54 GB card, so two fit; and the peel loop is documented launch-bound, which
+is exactly the shape of workload where a second process fills the SM-idle gaps
+between launches. `nvidia-smi` reading 100% does not contradict that -- that
+counter is the fraction of time *any* kernel was resident, not SM occupancy.
+
+Interleaved solo / pair / solo on `slice300.bin`, one process per arm:
+
+| | |
+|---|---:|
+| solo A | 49.8 s |
+| solo B (interleaved baseline) | 50.1 s |
+| machine drift between them | 0.5% |
+| two sorts back to back | 99.9 s |
+| two sorts concurrent | 93.8 s |
+| **throughput speedup** | **1.06x** |
+
+**1.06x is nothing**, and most of even that is the ~11 s of Python/CUDA import
+in each process overlapping, not GPU work overlapping. `compare_sorts.py` says
+`23 files byte-identical, 0 differ` between the solo run and a concurrent one,
+so the identity argument held -- it simply bought no time.
+
+What this rules out, and it is worth the two minutes it cost: **the GPU is
+already saturated at the whole-sort level.** The launch-bound diagnosis for the
+peel loop is a statement about one loop, not about the sort, and it does not
+generalize into free throughput from co-scheduling. Every remaining speedup on
+this machine has to come from *doing less work*, not from overlapping more of
+it. CPU-side parallelism is the exception and is already collected elsewhere:
+staging the next chunk during the current sort (`run_fork_sorts.sh` prefetch)
+is off the GPU's critical path entirely, and so is the EI computation.
+
+Do not re-open this without a materially different setup (a second card, or
+MPS with a workload that is actually launch-bound end to end).
 
 ---
 
