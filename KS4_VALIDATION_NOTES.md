@@ -1233,6 +1233,15 @@ Three things follow, in order of importance:
 
    `--deterministic` remains the supported way to get reproducibility.
 
+   **It is safe as a QA default: it pins the answer, it does not shift it.**
+   On 20260514A -- where there is no wobble to remove, five pairings having
+   come out 23/23 -- a deterministic run is **23/23 identical to the
+   non-deterministic one**. So enabling it does not perturb a sort that was
+   already reproducible; it only removes the freedom where freedom existed.
+   Cost on that geometry is 348.12 s against 309.56 s, 12.5% (7% on
+   20260724A). No op reported a missing deterministic implementation on either
+   recording.
+
 3. **Deterministic mode pins the answer, it does not reproduce a prior run.**
    `D1 vs N1` differs on 3 files. Turning the flag on changes results by the
    usual wobble magnitude relative to any particular earlier nondeterministic
