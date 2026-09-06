@@ -2072,3 +2072,63 @@ of `clu0`+`clu` that *isn't* `kmeans++` (`swarmsplitter.split`, `neigh_mat`, the
 alternating-assignment loop), or requires changing what `kmeans++` computes
 (fewer `NTRY` candidates, fewer `niter` seeds) -- which is an accuracy question,
 not a speed one, and out of scope for this pass.
+
+### 12d. `conv1d`+`einsum` (peel-loop setup): priced, and it's real compute too
+
+Never on any Astra shortlist. `block_timing.py` had already measured the pair
+combined at 16.8% of `run_matching`'s GPU time (32.7 s in production,
+§"Where the detection time actually goes"); this splits the two calls and asks
+whether either is overhead-shaped or FLOP-shaped, the same question asked of
+`kmeans++`'s graph path and of `peel_subtract`.
+
+    B = conv1d(X.unsqueeze(1), W.unsqueeze(1), padding=nt // 2)   # (n_chan,1,NT) x (n_pcs,1,nt)
+    B = torch.einsum('ijk, kjl -> il', Us, B)                     # Us (n_units, n_chan, n_pcs)
+
+Median-of-20, 4 probed batches (n_chan=519, NT=10122, n_pcs=3, n_units=812 --
+this pass's late-sort unit count):
+
+| call | mean | share |
+|---|---:|---:|
+| `conv1d` | 1.425 ms | 38.0% |
+| `einsum` | 2.326 ms | **62.0%** |
+
+`einsum` contracts over both `n_chan` (519) and `n_pcs` (3) at once, against
+812 units x 10,122 samples -- ~25.6 GFLOP for this one batch. That is real
+arithmetic, not launch count: at 812 units this is not a small problem.
+
+Tested one alternative: reshape both operands and replace the einsum with a
+single `(n_units, n_chan*n_pcs) @ (n_chan*n_pcs, NT)` matmul, timed only, never
+substituted. **1.14x** on the einsum call alone (2.326 -> ~2.04 ms), which is
+7.6% off the combined block, not the einsum's dominant term -- because the
+underlying FLOPs are the same either way; cuBLAS's batched contraction was
+already close to as good as a flat GEMM here. And that 1.14x was checked with
+`torch.allclose(atol=1e-3, rtol=1e-3)`, not `torch.equal` -- a different
+summation order over the same contraction is not guaranteed to be bit-identical,
+so this number has not cleared this project's own bar and is reported only as
+a ceiling estimate, not a candidate.
+
+**Conclusion.** Like `kmeans++`'s replay phase and `peel_subtract`'s per-spike
+term, this block is FLOP-bound, not overhead-bound. There is no free lever:
+the realistic ceiling is ~7.6% of 32.7 s (~2.5 s in production), and even that
+requires giving up the byte-identical guarantee to get. Closed.
+
+### Running total against the 160 s target
+
+Every block investigated since the 201.0 s ceiling (§12) was computed has come
+back the same way: real, already-necessary arithmetic, not overhead left on
+the table by an unoptimized implementation.
+
+| block investigated after §12 | prod s | outcome |
+|---|---:|---:|
+| `kmeans_plusplus` (§12c) | 82.9 | closed -- 87% of its cost is already-graphed replay compute |
+| `conv1d`+`einsum` (§12d) | 32.7 | closed -- FLOP-bound, ~7.6% ceiling, not bit-identical |
+
+Neither adds usable headroom beyond the 201.0 s floor already on record. The
+160 s target was answered in §12 and remains answered: **not reachable from
+this pipeline's current computation** without changing what gets computed
+(fewer peels, fewer clustering candidates/seeds, coarser detection), which is
+an accuracy tradeoff outside this pass's scope. Remaining unpriced pieces
+(`swarmsplitter.split`, `neigh_mat`, the alternating-assignment loop, cluster
+merge's 0.88x regression, and postprocessing's untouched 1.00x) are each too
+small individually to change this conclusion even in the best case -- they
+sum to well under the 41 s gap this pipeline is short by.
