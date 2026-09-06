@@ -318,11 +318,13 @@ scratchpad under `/tmp` and will not survive a reboot.
 
 `tests/` pins the **gates**, which is where the safety argument lives:
 `test_fused_detect.py`, `test_fused_peel.py`, `test_fast_kpp.py`,
-`test_fused_peaks.py`.
+`test_fused_peaks.py`, `test_fused_peel_cond.py`, `test_fused_peel_store.py`.
 
 **There is no pytest in any conda env on this machine.** `tools/run_tests.py`
 installs a minimal shim and runs the real files anyway — `python
-tools/run_tests.py`, currently **71 passed, 0 failed, 0 skipped, 0 errored**.
+tools/run_tests.py`, currently **102 passed, 0 failed, 0 skipped, 0 errored**
+across 7 files (`fused_detect` 5, `fused_peel` 20, `fused_peel_cond` 11,
+`fused_peel_store` 9, `fused_peaks` 12, `fast_kpp` 11, `mea_fork` 34).
 Before it existed the gate tests were driven by throwaway scripts under `/tmp`
 that *re-implemented* the assertions, so the committed test files had never
 actually been executed. Run this before trusting a change.
