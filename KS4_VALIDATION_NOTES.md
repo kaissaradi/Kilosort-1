@@ -1154,6 +1154,69 @@ Speed at this scale, same session:
 | **on** | **66.51 s** | **234.32 / 235.46 s** |
 | | **1.64x** | **1.17x** |
 
+#### ROOT CAUSE of the wobble, and byte identity recovered
+
+The wobble has been carried as "root cause unknown" since it was first seen.
+It is a **nondeterministic CUDA reduction**, and the proof is a single flag.
+
+Two runs of the same code on the same 2000-batch cut, with
+`torch.use_deterministic_algorithms(True)` and
+`CUBLAS_WORKSPACE_CONFIG=:4096:8` (`run_full_sort.py --deterministic`):
+
+| pairing | mode | result |
+|---|---|---|
+| N1 vs N2 (new vs new) | default | 3 files differ |
+| O1 vs O2 (old vs old) | default | 5 files differ, pc_features 4502 ULP |
+| C1 vs C2 (new vs new) | cuBLAS workspace pinned only | 5 files differ |
+| **D1 vs D2 (new vs new)** | **deterministic** | **23/23 identical** |
+| **DO1 vs D1 and D2 (OLD vs NEW)** | **deterministic** | **23/23 identical** |
+
+Three things follow, in order of importance:
+
+1. **The optimizations ARE byte-identical on this recording at production
+   scale.** The earlier "not claimable" conclusion was correct about the
+   evidence available at the time and wrong as a permanent verdict: remove the
+   program's own nondeterminism and old and new code agree on all 23 files.
+   Both geometries are now proven at production scale.
+2. **It is not cuBLAS.** Pinning the cuBLAS workspace alone changes nothing
+   (C1 vs C2 still differs on 5 files), so the culprit is a torch-level atomic
+   reduction that `use_deterministic_algorithms` swaps out. No "does not have a
+   deterministic implementation" warning was emitted in any deterministic run,
+   so nothing silently degraded and the clean result is informative.
+3. **Deterministic mode pins the answer, it does not reproduce a prior run.**
+   `D1 vs N1` differs on 3 files. Turning the flag on changes results by the
+   usual wobble magnitude relative to any particular earlier nondeterministic
+   run; it does not reconstruct one.
+
+Cost: 251.5-264.9 s against 234.3 s, roughly 7-13%.
+
+Not yet pinned: WHICH reduction. Two candidates were checked and cleared --
+`clustering_qr._counts_into`'s `scatter_add_` accumulates only `ones`, and
+identical addends make any atomic ordering produce the same float64 sequence;
+and `postprocessing`'s means are fixed-order reductions. Narrowing further
+needs bisection and was not done.
+
+**REJECTED HYPOTHESIS, recorded so it is not re-run.** The obvious suspect was
+the overlapping-window scatter: stock's `-=` is last-write-wins on duplicate
+indices, and `fused_peel` documents it differing on 152-838 elements between
+runs. `tools/count_overlapping_phases.py` refutes it as the explanation:
+
+| recording | peels | overlapping | wobble? |
+|---|---:|---:|---|
+| 20260724A slice300 | 14,491 | **0** | no |
+| 20260724A 2000 batches | 94,633 | 6 (0.0063%) | **yes** |
+| 20260514A full data000 | 144,642 | 3 (0.0021%) | **no** |
+
+Overlapping phases occur in both recordings but only one wobbles, so their
+presence does not distinguish the cases.
+
+**What this changes for the QA pipeline.** Byte identity has been the only safe
+currency in this work *because* kilosort4 was not reproducible, which forced the
+four-arm attribution discipline and made "23/23" unavailable on some
+recordings. With this flag the program is reproducible, so a QA pipeline can
+diff two sorts directly instead of reasoning about attribution. Use
+`--deterministic` for any comparison run; leave it off for timing.
+
 #### The background-task monitor kills on MemFree, and that is a false positive
 
 The first attempt was killed between arms by the harness reporting "system is

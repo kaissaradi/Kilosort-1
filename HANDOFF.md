@@ -9,6 +9,16 @@ regression, so byte identity is the only safe currency.
 Canonical detail lives in `KS4_VALIDATION_NOTES.md`. This file is the summary
 and the roadmap.
 
+**Read this first if you are about to compare two sorts.** kilosort4 is not
+byte-reproducible run to run by default -- two runs of *identical* code differ
+on a few float32 of the tF-derived outputs. That is a property of the program,
+not of this branch, and it makes a naive A/B diff unreadable. The cause is a
+nondeterministic CUDA reduction, and `tools/run_full_sort.py --deterministic`
+(torch.use_deterministic_algorithms + CUBLAS_WORKSPACE_CONFIG=:4096:8) removes
+it: same code twice goes from 5 files differing to **23/23 identical**, and old
+code vs this branch likewise goes to **23/23 identical** at production scale.
+Costs ~7-13%. Use it for every comparison; leave it off for timing.
+
 ---
 
 ## The headline
