@@ -39,12 +39,30 @@ macaque recording on a **512-channel 60 um array** (array 504) against
 and **1920 universal templates instead of 4048**.
 
 All four gates re-validated and enabled there, and `fused_detect` chose the
-*same* BLOCK_M=128 that matched at the old shapes. Three-way byte comparison on
-a 300-batch slice: **23/23 files identical in all three pairings**.
+*same* BLOCK_M=128 that matched at the old shapes.
 
-Speedup there is **1.45x**, not 2.51x, and that is expected rather than a
-regression: half the templates means the detect body these optimizations attack
-is a much smaller share of the sort.
+Validated at **production scale on the whole of `data000`** — 33,140,000
+samples, 1657.0 s, 3314 batches, 33.94 GB, input verified against the run-E
+file-order bug class before any GPU time. Three-way byte comparison:
+**23/23 files identical in all three pairings**, including A vs A2, which is
+the first run on this geometry with the reach to see the run-to-run wobble.
+
+| arm | `Total runtime` |
+|---|---:|
+| stock (all five `KILOSORT_NO_*`) | 858.81 s |
+| this branch | **383.60 s** |
+| same code, second run | 383.57 s |
+| | **2.24x** |
+
+**An earlier version of this file said 1.45x here and blamed the geometry.
+Both halves were wrong.** That number came from a 150 s slice (~9% of one
+recording, and `data000` is 1 of 39), and its fused arm was carrying Triton JIT
+compile cost — the warm slice comparison is 2.01x. At production scale this
+array gives 2.24x against 20260724A's 2.51x, so the template-count argument
+survives only as a small residual. The mechanism: detection is 60% of a slice
+sort and 78% of a production sort, and detection is what these optimizations
+attack — universal detect alone is **3.80x**, the peel **1.96x**, while
+clustering falls to 1.16x.
 
 One thing to know before you sort 60 um data with the lab pipeline: its `tuned`
 profile applies `dmin=15, dminx=32` to both 30 and 60 um arrays, but those

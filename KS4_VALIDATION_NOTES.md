@@ -17,7 +17,7 @@ constant of the code — it depends on the tensor shapes, which depend on the
 array. A second geometry is therefore not a nicety; it is the only way to find
 out whether the gates fall back on hardware and probes they have not seen. See
 *Second array geometry* below for the first such test, on a 512-channel 60 um
-array.
+array — validated at production scale, 23/23 byte-identical three ways, 2.24x.
 
 Two benchmarks are used below:
 
@@ -812,7 +812,12 @@ was known to be shape-contingent picked **the same BLOCK_M=128** at a geometry
 it had never seen. That is evidence the config is not a coincidence of one
 recording — it is not proof that it generalises further, and the gate stays.
 
-### Timing and stage counts
+### Timing and stage counts — slice scale (300 batches, 150 s)
+
+Everything in this subsection and the next is **slice-scale**: 300 batches,
+150 s, ~9% of one recording, and `data000` is 1 of 39. The production-scale run
+on the whole recording is a separate subsection further down, and where the two
+disagree the production numbers are the ones to quote.
 
 Arm A (all optimizations active) sorted the slice in **57.94 s**: 1920
 universal templates, 528,099 spikes and 1224 clusters from the universal pass,
@@ -840,14 +845,27 @@ freshly written 3.07 GB slice. Quote the A-vs-B ratio, not A2-vs-B (1.84x),
 which would be flattered by exactly that. It is also a reminder that the
 same-session rule stated under *Cumulative* is not a formality.
 
-**1.45x, not the 2.26x slice300 gives on 20260724A** — and the reason is the
-geometry, not a regression. This array has 1920 universal templates against
-4048, so the detect body that §2 attacks is simply a smaller share of the sort.
-The optimizations are detection-weighted; on an array with half the templates,
-detection is half the prize. Worth stating plainly because a reader who sees
-2.51x in the headline and 1.45x here will otherwise assume something broke.
+**1.45x, not the 2.26x slice300 gives on 20260724A.** The explanation recorded
+here originally was geometric — 1920 universal templates against 4048, so the
+detect body that §2 attacks is a smaller share of the sort, and on an array with
+half the templates detection is half the prize.
 
-### Byte-identical, three ways
+**That explanation was wrong, and the production run below disproves it.** Two
+compounding measurement faults produced the 1.45x:
+
+1. It is A-vs-B, and arm A paid the Triton JIT cost described just above. The
+   warm comparison at the same scale is A2-vs-B = **2.01x**. The instinct to
+   avoid quoting A2-vs-B was right in general — it *is* flattered by a warm
+   cache — but here it made the fused arm look 39% slower than it is.
+2. Slice scale under-weights exactly the stages the optimizations attack.
+   Detection is 60% of the sort at slice scale and 78% at production scale, so
+   the slice mix hides most of the prize.
+
+At production scale this geometry gives **2.24x**, against 20260724A's 2.51x.
+The geometric argument survives only as a much smaller residual, and no reader
+should conclude anything broke.
+
+### Byte-identical, three ways — slice scale
 
 All three pairings, **23 of 23 files byte-identical, 0 differ**:
 
@@ -866,6 +884,10 @@ float32 of 33 M), and 20260724A's slice300 is likewise clean. A 300-batch slice
 does not have the statistical reach to see it, which is exactly why one clean
 slice comparison is not treated as proof anywhere in this file.
 
+**This paragraph is why the production run below exists.** As written, the
+slice's clean A-vs-A2 is a test that structurally cannot fail, so it is not
+evidence of anything. The subsection after next runs the whole recording.
+
 Logs are one per arm, deliberately, under
 `scratchpad/20260514A_validation/logs/`:
 
@@ -882,6 +904,136 @@ Logs are one per arm, deliberately, under
 `run_slice_ab.sh` in that directory is the driver. Note it deliberately does
 **not** `set -u`: conda's own `activate.d` hooks read unset variables and abort
 the script before the first sort starts.
+
+### Production scale: the whole of data000
+
+Everything above on this geometry is slice-scale. This subsection runs the
+entire recording: **33,140,000 samples, 1657.0 s, 3314 batches, 33.94 GB** —
+11.05x the slice. Same `settings.json`, same probe, same `--invert-sign`; the
+only thing that differs from the slice A/B is `--data`.
+
+**The input was verified before any GPU time was spent**, against the
+file-order bug class that silently corrupted run E in the A/B/C/D/E comparison
+— a concatenation that reads the right bytes in the wrong order yields a file
+of exactly the right size that sorts to garbage, so a size check proves nothing:
+
+| check | result |
+|---|---|
+| a. 14 part files in numeric order, no gaps | pass |
+| b. `33935360000 == 33140000 x 512 x 2` | pass |
+| c. first 3.07 GB `cmp`-identical to `slice300_514a.bin` | pass |
+| d. all 13 inter-file seams + 12 random interior blocks match the reader | pass |
+| e. tail is signal (std 49.9, range -811..1270), not zero padding | pass |
+
+Check (c) is the decisive one: it makes the 34 GB file a strict superset of the
+input that produced the slice result, so an ordering defect would have to be
+identical in both files to survive. Check (d) pins every seam independently.
+
+#### Byte-identical at production scale, three ways
+
+| pairing | result |
+|---|---|
+| A vs B (fused vs stock) | **23/23 identical, 0 differ** |
+| A vs A2 (same code twice) | **23/23 identical, 0 differ** |
+| A2 vs B | **23/23 identical, 0 differ** |
+
+This is the first run on this geometry with the statistical reach to see the
+run-to-run wobble, and it did not wobble. The compared set is substantive —
+737 MB `pc_features.npy`, 278 MB `templates.npy`, 6,168,855 kept spikes,
+amplitudes, spike positions, cluster assignments — and `compare_sorts.py`
+compares through `.view(np.uint8)` behind a dtype/shape gate, so `+0.0`/`-0.0`
+and `NaN` cannot produce a false match. Stage counts are identical in all three
+arms at every stage (3,606,390 spikes -> 2837 clusters -> 6,168,727 spikes ->
+2558 clusters -> 2223 units -> 1630 good), which corroborates independently of
+the comparison tool.
+
+One clean production run is still not proof that this geometry never wobbles;
+it is the strongest evidence available, and the wobble on 20260724A was itself
+intermittent.
+
+#### Timing: 2.24x, and why the slice said 1.45x
+
+Quoting kilosort's internal `Total runtime` for all three arms. Arm A's harness
+wall-time line was lost to a spurious background-task kill (see below), but the
+internal timer is measured identically inside the same code in every arm.
+
+| arm | switches | `Total runtime` |
+|---|---|---:|
+| A | none (all optimizations active) | **383.60 s** |
+| B | all five `KILOSORT_NO_*` set | **858.81 s** |
+| A2 | none (second run of A) | **383.57 s** |
+| | **A vs B** | **2.24x** |
+
+Per stage, against the warm arm A2:
+
+| stage | slice B/A2 | full B/A2 | share of A2 runtime, full |
+|---|---:|---:|---:|
+| universal detect | 3.24x | **3.80x** | 25% |
+| learned detect (peel) | 1.62x | **1.96x** | 53% |
+| universal cluster | 1.66x | 1.19x | 6% |
+| learned cluster | 1.72x | 1.16x | 8% |
+| merge | 1.03x | 1.00x | 1% |
+| **total** | **2.01x** | **2.24x** | |
+
+Three things to take from this table, recorded because two of them refute
+predictions written into the driver *before* the run:
+
+1. **Clustering gains fall with scale; detection gains rise.** Clustering
+   1.7x -> 1.16x reproduces the 20260724A slice->production pattern (2.47x ->
+   1.11x, 2.38x -> 1.23x). Detection went the other way.
+2. **The total rose, and the prediction that it would fall was wrong.** The
+   prediction reasoned from 20260724A's *total* without decomposing. Detection
+   is 60% of the slice sort and 78% of the production sort, so the stages that
+   speed up most gain weight at scale. Predict per stage and weight by share,
+   or don't predict.
+3. **Slice A-vs-A2 was Triton JIT, confirmed — but not by the mechanism
+   claimed.** The 21% same-code gap collapsed to 383.60 vs 383.57 s, a **0.008%**
+   gap. The prediction said fixed costs would amortize over 11x the work.
+   They didn't: `~/.triton/cache` holds 36 kernel files stamped during the slice
+   session and **zero** stamped during the production session, so the full run
+   compiled nothing at all — the on-disk cache was already warm. The JIT
+   attribution is confirmed; the amortization claim is untested.
+
+#### The background-task monitor kills on MemFree, and that is a false positive
+
+The first attempt was killed between arms by the harness reporting "system is
+running low on memory". `/proc/meminfo` at that moment:
+
+| field | GB |
+|---|---:|
+| MemTotal | 197.3 |
+| **MemAvailable** | **190.6 (96.6%)** |
+| MemFree | 7.5 |
+| Cached | 177.1 |
+
+kilosort's own peak was 9.30 GB. `MemFree` was low purely because streaming a
+34 GB input (and the 25.5 GB raw it was built from) fills the page cache with
+fully reclaimable pages — which is what Linux is supposed to do. Confirmed by
+`drop_cache.py`, which calls `posix_fadvise(POSIX_FADV_DONTNEED)` (no root
+needed, unlike `/proc/sys/vm/drop_caches`): 74.3 GB reclaimed across two calls,
+MemFree 7 -> 68 GB, MemAvailable flat at 181 GB. Any long job here that streams
+a large file is exposed to this; `MemAvailable` is the field that matters.
+
+**Cache fairness when resuming.** Reclaiming cache and then restarting arm B
+cold would have penalized B and *inflated* the reported speedup. The resume
+script therefore re-warms the input with `cat $BIN > /dev/null` before B, to
+restore arm A's conditions. The A -> B -> A2 order is kept for the same reason:
+it lets B inherit a warm cache, which understates the A/B speedup rather than
+overstating it. The bias is deliberate and conservative in both cases.
+
+Logs under `scratchpad/20260514A_validation/logs/`, harness committed to
+`tools/validation_runs/`:
+
+| log | arm |
+|---|---|
+| `10_make_full.log` | full .bin construction |
+| `11_verify_full.log` | the five pre-flight checks |
+| `12_full_A_fused.log` | all optimizations active |
+| `13_full_B_stock.log` | all `KILOSORT_NO_*` set |
+| `14_full_A2_fused.log` | second run of arm A (wobble control) |
+| `15_full_compare_A_vs_B.log` | the A/B verdict |
+| `16_full_compare_A_vs_A2.log` | same-code control |
+| `17_full_compare_A2_vs_B.log` | third leg |
 
 ---
 
