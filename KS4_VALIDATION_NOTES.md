@@ -2132,3 +2132,73 @@ an accuracy tradeoff outside this pass's scope. Remaining unpriced pieces
 merge's 0.88x regression, and postprocessing's untouched 1.00x) are each too
 small individually to change this conclusion even in the best case -- they
 sum to well under the 41 s gap this pipeline is short by.
+
+### 12e. Correction to §12c's kmeans++ figure, and swarmsplitter.split priced
+
+**§12c's "82.9 s of kmeans++" mixed two different denominators and is wrong.**
+`fast_kpp.py`'s own docstring measured kmeans++ at 44.5% of
+`clustering_qr.run`'s time; a separate `gpu_busy.py` measurement (§"Where the
+detection time actually goes") measured kmeans++ at 74.4% of
+`clustering_qr.cluster`'s time. `cluster()` is a strict subset of `run()` --
+`run()` also calls `swarmsplitter.split`, `hierarchical.maketree`,
+`get_data_cpu` outside `cluster()`. The ceiling table applied the 74.4%
+(`cluster()`-relative) figure directly to 111.4 s, which is `run()`'s
+production time (the `clu0`+`clu` stage totals `run_kilosort` self-reports) --
+not `cluster()`'s time. Since `cluster()` is not 100% of `run()`, that
+overstates kmeans++'s share of the 111.4 s.
+
+Fixed by measuring `run()`, `cluster()`, `kmeans_plusplus`, `neigh_mat`, and
+`swarmsplitter.split` all in one pass over one sort, sync'd host timing
+throughout, so every share below is against the same `run()`-total denominator
+and none of it is cross-derived:
+
+| | n | share of `run()` |
+|---|---:|---:|
+| `cluster()` (= kmeans++ + neigh_mat + alt-loop) | 184 | 69.5% |
+| ↳ `kmeans_plusplus` | 184 | **51.5%** |
+| ↳ `neigh_mat` | 184 | 7.6% |
+| ↳ alternating-assignment loop + `Mstats` (residual) | -- | 10.4% |
+| `swarmsplitter.split` | 184 | **19.9%** |
+| `get_data_cpu`/`maketree`/other bookkeeping (residual) | -- | 10.6% |
+
+These five sum to 100.0% by construction (four measured, two residuals) --
+that internal consistency is the check the earlier cross-measurement comparison
+didn't have. 51.5% is also just a different number from `fast_kpp.py`'s
+documented 44.5%; different real sorts have different cluster-size mixes and
+this is not claimed to be more authoritative than that figure, only mutually
+consistent with itself, which the 74.4%-of-111.4s arithmetic was not.
+
+**Corrected production breakdown of the 111.4 s `clu0`+`clu` budget:**
+
+| | prod s (corrected) | was (§12c, wrong) |
+|---|---:|---:|
+| `kmeans_plusplus` | **57.4** | 82.9 |
+| `swarmsplitter.split` | **22.2** | (folded into "28.5 s other") |
+| `neigh_mat` | **8.5** | (folded into "28.5 s other") |
+| alt-loop + `Mstats` | 11.6 | (folded into "28.5 s other") |
+| bookkeeping | 11.8 | (folded into "28.5 s other") |
+
+§12c's *conclusion* (kmeans++'s graph-replay phase is 87% real compute, no
+free lever) is about that function's internal anatomy and is unaffected by
+which absolute number it's a percentage of -- only the stated 82.9 s figure
+was wrong, now corrected to 57.4 s.
+
+**`swarmsplitter.split`, now priced: no free lever here either, for a
+different reason than compute-boundedness.** At 22.2 s / 3.5% of the whole
+sort it is too small to matter much either way, but the `run()` call site's
+own comment (`clustering_qr.py`, around the `cluster(...)` call) already
+recorded a directly relevant experiment: truncating the alternating-assignment
+loop's iteration count to cut cost was tried and **refuted** -- leaves get
+cleaner but the merged *output* gets dirtier (contaminated spike mass 8.95% ->
+10.73% on d007 at niter=1), and niter=0 "shatters the sort outright" (recall
+0.909, 2x wall, 4x GPU, two ground-truth cells lost). That is the same
+shape as `max_peels`: an already-tried speed/accuracy trade that made things
+measurably worse, not an unexploited free lever. Not re-tested here -- cited
+because it directly bears on whether `split`/the alternating loop are worth
+attacking, and the answer already on record is no.
+
+**Revised running total.** Every block priced this session across `st0`, `st`,
+and clustering has landed the same way: real compute, an already-tried and
+refuted trade, or too small to matter. The 160 s target's answer from §12
+stands, now on a fully self-consistent accounting of where clustering's 111.4 s
+actually goes.
