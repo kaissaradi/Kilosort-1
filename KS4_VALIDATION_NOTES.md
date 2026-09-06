@@ -1996,3 +1996,79 @@ peels also means more marginal, more-overlapped events, which may split or
 duplicate rather than become good units. Whether the missing 26.7% is signal or
 junk is a question for the QA pipeline, not for this file -- but the tuning
 decision that discarded it was never measured, and now it is.
+
+### 12c. `kmeans_plusplus` dug into: already 3.6x'd, and the remainder is real compute
+
+Astra #2 (sparse clustering assignment) priced `clu0`+`clu` at 111.4 s, 82.9 s
+of which is `kmeans++`. Before pricing that further, what does `kmeans++`
+actually spend its time on *now*? It already carries two shipped, bit-identical
+optimizations (`kilosort/fast_kpp.py`, commits `6ef211a`/`468a778`, both
+predating this "no code changes" pass): cutting 3 host syncs/iteration to 1 per
+call (1.56x), then capturing the 200-iteration body in a CUDA graph (2.3x more).
+Neither is re-tested here -- both cite their own bitwise verification. The
+question is what's left inside the currently-active graph path.
+
+**First pass was wrong, and the bug was mine, not the shipped code's.**
+Bracketing `capture_begin`/body/`capture_end` with CUDA events recorded on the
+default stream while the capture itself ran on a separate, *freshly-created*
+stream (no `wait_stream` linking the two) gave capture = **4.1-4.4 ms**, 15.5%
+of the graph path -- 24x `fast_kpp.py`'s own documented "capture itself costs
+0.18 ms." Switching to synced host timing (`torch.cuda.synchronize()` +
+`perf_counter`, the same technique validated for the guard-cost split in §12b)
+reproduced the same 4.1-4.4 ms, so it wasn't a cross-stream artifact. Two
+hypotheses tested in order:
+
+1. *Fresh graph-pool per call, vs. production's one process-wide pool.*
+   Reused one `graph_pool_handle()` across probed calls -- **no change** (still
+   ~4.4 ms). Rejected.
+2. *Fresh `torch.cuda.Stream()` per call, vs. production's cached
+   `_CAPTURE_STREAM`.* My harness created a brand-new stream object on every
+   probed call; production creates it once (`if _CAPTURE_STREAM is None`) and
+   reuses it for the rest of the process. Caching the stream the same way:
+   capture dropped to **0.22-0.39 ms on every call after the first**, with the
+   first call in-process paying 3.81 ms (one-time stream-creation cost,
+   amortized over hundreds of calls in a real sort). This matches the
+   documented 0.18 ms within measurement noise. **Confirmed and fixed in the
+   harness; not a defect in the shipped module.**
+
+Corrected steady-state anatomy of the graph path (12 probed calls of ~184,
+n_spikes 1,447-15,946, niter=200; first-call stream warmup excluded from the
+per-call reasoning above but left in the aggregate below since it's what any
+single measured call actually pays):
+
+| phase | mean | share |
+|---|---:|---:|
+| `draw_noise` (200x `.exponential_()`, un-graphed -- see fast_kpp.py's RNG note) | 1.05 ms | 4.2% |
+| `warmup` (3 eager `body()` calls, priming cuBLAS/dispatch before capture) | 1.50 ms | 6.0% |
+| `capture` (corrected) | 0.59 ms | 2.4% |
+| **`replay`** (200x `g.replay()`) | **21.64 ms** | **87.0%** |
+| `final` (`count_nonzero` + the one host read) | 0.09 ms | 0.4% |
+
+`replay` costs **108 us/iteration**, essentially flat from 1,447 to 15,946
+spikes (an 11x range) -- confirming the docstring's own read that this is
+overhead/launch-shaped work, not data-shaped, and that the graph already
+converted ~20 launches/iteration into GPU-side execution of the same ops back
+to back. Going from the pre-graph estimate (~222 us/iteration: 168 overhead +
+54 data) to 108 us/iteration matches the shipped "2.3x on top" commit message.
+
+**`warmup` is the one real, currently-unexploited cost**, at 6% of the path
+(~1.2 ms/call is the 3 eager passes beyond what ~324 us of pure compute would
+cost at the measured replay rate). It cannot be skipped: capture requires the
+body to have already run so cuBLAS's algorithm/workspace selection isn't lazily
+triggered *during* capture. And it likely cannot be cached across centers the
+way the stream and pool now are, because that selection is keyed to input
+shape and every center has a different `n_spikes` (the same reason the module's
+own SHAPE note gives for why the graph itself can't be reused between centres).
+Not verified further -- flagged, not priced, since testing it means touching
+`fast_kpp.py` and this pass does not change code.
+
+**Conclusion for Astra #2.** `kmeans_plusplus` is not an idle function waiting
+on launch overhead; 87% of its current graph-path cost is the replayed
+arithmetic itself, already collapsed from per-iteration launches to one
+per-iteration replay. There is no further no-cost lever inside this function --
+the two real optimizations it had (kill the host syncs, kill the launches) are
+both already shipped. Whatever Astra #2 still has to offer lives in the 28.5 s
+of `clu0`+`clu` that *isn't* `kmeans++` (`swarmsplitter.split`, `neigh_mat`, the
+alternating-assignment loop), or requires changing what `kmeans++` computes
+(fewer `NTRY` candidates, fewer `niter` seeds) -- which is an accuracy question,
+not a speed one, and out of scope for this pass.
