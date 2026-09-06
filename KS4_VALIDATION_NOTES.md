@@ -1073,6 +1073,32 @@ inflates precisely the blocks it is used to find. Treat every share in
 statement can return. The store tail behaved the same way: 15.6% by the
 profile, 1.085x in practice.
 
+#### And it holds on the 30 um array too
+
+Everything above is the 60 um geometry, so the same one-recording gap this
+whole section exists to close would reopen if it stopped there. Re-run on
+`slice300.bin` (20260724A, 519 ch at 30 um, 801-unit ctc), replaying that
+sort's own `ops.npy`:
+
+| pairing | result |
+|---|---|
+| new build vs LUT+both tails OFF | **23/23 identical** |
+| new build vs itself (wobble control) | **23/23 identical** |
+
+All three gates enabled at the new shapes without falling back --
+`live-tile LUT`, `peel cond` (config 256,4) and `peel store`.
+
+| stage | tails+LUT off | on |
+|---|---:|---:|
+| peel | 10.49 s | **6.81 s** (1.54x) |
+| total | 43.77 s | 40.00 s (1.09x) |
+
+Same 610,758 / 773,338 spikes, 956 / 683 clusters, 590 units, 480 good.
+
+Still open: a 30 um PRODUCTION-scale check. That matters more here than
+elsewhere, because the run-to-run wobble was only ever observed on this
+recording at that scale.
+
 #### The background-task monitor kills on MemFree, and that is a false positive
 
 The first attempt was killed between arms by the harness reporting "system is
