@@ -1,0 +1,3 @@
+note: recording holds 33140000 samples, writing all of them (3314 batches, not 300)
+wrote 33140000 samples x 512 ch int16 -> /tmp/claude-1001/-home-localadmin-Documents-Development-MEA-fieldlab-src-utilities/5436d4cb-2b4c-4887-a914-4bb3f3826c88/scratchpad/20260514A_validation/full/full_514a_data000.bin
+  33.94 GB, 1657.0 s of data, 3314 batches at batch_size=10000

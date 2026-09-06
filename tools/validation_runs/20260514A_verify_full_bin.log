@@ -1,0 +1,11 @@
+recording: 33140000 samples x 512 ch, fs=20000.0, array 504, 14 part files
+  [PASS] a. part files in numeric order  data000000.bin .. data000013.bin, indices 0..13
+  [PASS] a. no gaps in part indices
+  [PASS] b. flat size == n_samples * n_chan * 2  33935360000 vs 33935360000
+  [PASS] b. sample_edges sum == n_samples  edges [0, 2400000, 4800000] ... [31200000, 33140000]
+  [PASS] d. all inter-file boundaries match the reader  13 seams checked, 0 bad
+  [PASS] d. random interior blocks match the reader  12 spots checked, 0 bad
+  [PASS] e. tail is not zero padding  std 49.9, min -811, max 1270
+  [PASS] e. head std comparable to tail std  head 72.6 / tail 49.9
+
+all checks passed
