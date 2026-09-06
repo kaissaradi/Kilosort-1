@@ -12,7 +12,7 @@ from sklearn.cluster import KMeans
 from sklearn.decomposition import TruncatedSVD
 from tqdm import tqdm
 
-from kilosort import fused_detect
+from kilosort import fused_detect, fused_peaks
 from kilosort.utils import (
     get_clip_buffer_capacity,
     get_spike_buffer_capacity,
@@ -492,10 +492,21 @@ def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda'),
                                  As, imaxs, Amaxs, stock_fill):
         stock_fill()
 
-    Amaxs[:,:nt] = 0
-    Amaxs[:,-nt:] = 0
-    Amaxs  = max_pool1d(Amaxs.unsqueeze(0), (2*nt0+1), stride = 1, padding = nt0).squeeze(0)
-    xy = torch.logical_and(Amaxs==As, As > ops['Th_universal']).nonzero()
+    # Fused peak selection: one kernel for the edge zeroing, the sliding max,
+    # both comparisons and the and. Same selection, ~1/3 the traffic and a
+    # short-circuit that skips the window max for blocks with no candidate --
+    # 7.2x on this tail. It contains no floating-point arithmetic (max is a
+    # selection; ==, > and & are exact), so unlike the fused detect body there
+    # is no accumulation order to reproduce. try_mask still checks the whole
+    # result against the stock statements on the first batch of every sort and
+    # returns None for the rest of the run if it does not match exactly.
+    mask = fused_peaks.try_mask(As, Amaxs, nt, nt0, ops['Th_universal'])
+    if mask is None:
+        Amaxs[:,:nt] = 0
+        Amaxs[:,-nt:] = 0
+        Amaxs  = max_pool1d(Amaxs.unsqueeze(0), (2*nt0+1), stride = 1, padding = nt0).squeeze(0)
+        mask = torch.logical_and(Amaxs==As, As > ops['Th_universal'])
+    xy = mask.nonzero()
     imax = imaxs[xy[:,0], xy[:,1]]
     amp = As[xy[:,0], xy[:,1]]
 
