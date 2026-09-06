@@ -5,7 +5,7 @@ import torch
 from torch.nn.functional import conv1d, max_pool2d, max_pool1d
 from tqdm import tqdm
 
-from kilosort import CCG, fused_peel, fused_peel_cond
+from kilosort import CCG, fused_peel, fused_peel_cond, fused_peel_store
 from kilosort.utils import (
     get_spike_buffer_capacity,
     group_indices_by_label,
@@ -348,8 +348,8 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=None):
             break
 
         iX = xs[:,:1]
-        iY = imax[iX]
-
+        # iY is produced by the fused store below, which needs the grown
+        # buffers -- computing it here as well would just be a second gather.
         nsp = len(iX)
         need = k + nsp
         if need > st.shape[0]:
@@ -360,12 +360,15 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=None):
             amps = torch.cat((amps, amps.new_zeros((extra, 1))), 0)
             th_amps = torch.cat((th_amps, th_amps.new_zeros((extra, 1))), 0)
 
-        st[k:k+nsp, 0] = iX[:,0]
-        st[k:k+nsp, 1] = iY[:,0]
         # B is scaled by s, so B_stock[iY,iX]/nm[iY] == B[iY,iX]*s[iY].
-        amps[k:k+nsp] = B[iY,iX] * s[iY]
+        # Four gathers, a multiply, a sqrt and four scatters to move ~26
+        # spikes -- ~8 launches, so launch-bound like the condition tail.
+        # One program per spike, which also preserves the `nonzero` row order
+        # that st/amps/th_amps are indexed by positionally. See
+        # fused_peel_store.py.
+        iY = fused_peel_store.store_spikes(st, amps, th_amps, k, iX, imax, B,
+                                           s, cmax)
         amp = amps[k:k+nsp]
-        th_amps[k:k+nsp] = cmax[iX[:,0], None]**.5
 
         k+= nsp
 

@@ -50,6 +50,7 @@ FORK_TESTS = [
     'tests/test_fused_detect.py',
     'tests/test_fused_peel.py',
     'tests/test_fused_peel_cond.py',
+    'tests/test_fused_peel_store.py',
     'tests/test_fused_peaks.py',
     'tests/test_fast_kpp.py',
     'tests/test_mea_fork.py',
