@@ -65,7 +65,7 @@ compile cost — the warm slice comparison is 2.01x. At production scale this
 array gives 2.24x against 20260724A's 2.51x, so the template-count argument
 survives only as a small residual. The mechanism: detection is 60% of a slice
 sort and 78% of a production sort, and detection is what these optimizations
-attack — universal detect alone is **3.80x**, the peel **1.96x**, while
+attack — universal detect alone is **3.85x** and the peel **2.87x**, while
 clustering falls to 1.16x.
 
 One thing to know before you sort 60 um data with the lab pipeline: its `tuned`
@@ -119,37 +119,42 @@ is.
 
 ## What to attack next, ranked
 
-### 0. `ctc` is 89% exact zeros — measured, confirmed, not built
+### 0. DONE — `ctc`/`U_time` zero-tile skip (commit `6cb2d94`)
 
-New and the best-evidenced item here. `fused_peel` subtracts
-`amp * ctc[r, iY, :]` over **every** unit row, but `U` is exactly zero off each
-template's local channels (median **18 of 519**), so 88.87% of `ctc`'s
-`(i,j,:)` blocks are exactly `+0.0` and their subtract is a no-op. At the
-kernel's `BLOCK_R=16` granularity, **80.4% of row-tiles are fully skippable** —
-median 10 live tiles of 51 per spike.
+Kept here because the *negative* result is the reusable part.
 
-This aims at `peel_subtract`, **45.7% of the learned pass**, the largest single
-line item in the sort.
+`fused_peel` subtracted `amp * ctc[r, iY, :]` over every unit row, but `U` is
+exactly zero off each template's local channels, so 89.58% of `ctc` rows and
+89.00% of `U_time` tiles are exactly `+0.0` and their subtract is a no-op.
 
-The identity argument is §6-class, not §2-class: nothing is recomputed, only
-omitted, and `o - (+0.0) == o` for every float including `-0.0`. Both
-preconditions are measured, not assumed — **0** zero-blocks carry a `-0.0`, and
-the smallest `amp` over a whole sort is **0.0876 > 0**. Compare bit patterns,
-not `== 0`; `torch.equal` hides exactly this class.
+**The recommended first step was benched and rejected.** An in-kernel early
+exit — load the tile, skip the read-modify-write if dead — was exact but bought
+only **1.04-1.08x**, with a 2-4% regression on dense data. That answered the
+question this section used to pose: skipping 67% of per-program traffic changed
+nothing, so the peel is **still launch-bound after fusion**, and cutting traffic
+is the wrong lever.
 
-**Holds on both array geometries.** 20260514A (60 µm, 512 ch) gives 89.58%
-zero blocks, 82.22% skippable tiles, 0 negative zeros, smallest `amp` 0.0930 —
-slightly *better* than the 30 µm array, as predicted, because footprints stay
-local while the array grows. Two independent geometries means the sparsity is
-structural (how `mean_cluster_templates` builds `U`), not a quirk of one
-recording.
+**Program count is the right lever.** Holding per-program work fixed and cutting
+tiles 65 -> 11 gave 3.27x, so dead tiles are dropped *before* the launch via a
+per-unit live-tile LUT: grid `(n_spk, n_tiles)` -> `(n_spk, MAXT)`. Built once
+per `prepare_matching` (ctc is batch-invariant), cached on the **base** tensor
+because `run_matching` rebuilds `ctc_p` as a fresh permuted view every batch.
 
-Unknown: whether the win is realisable, since §3 measured the peel as
-launch-bound rather than bandwidth-bound. An in-kernel early exit cuts traffic
-but not launches; a compacted per-unit tile list (buildable once — `ctc` is
-batch-invariant) cuts both but is a real rewrite. **Bench the early exit
-first**, it answers which limit binds for a few lines of code. Census tool:
-`tools/measure_ctc_sparsity.py`. Full detail in §8 of the notes.
+    peel   202.71 s -> 138.71 s   (2.87x against stock, was 1.96x)
+    total  383.60 s -> 319.10 s   (2.69x against stock, was 2.24x)
+    23/23 byte-identical, three pairings, at production scale
+
+Two guards make it exact, and both are enforced rather than measured: a tile is
+dropped only if **bitwise all `+0.0`** (a `-0.0` tile is not droppable, since
+`o - (a * -0.0) = o + 0.0` flips a stored `-0.0`), and **`amp > 0` strictly**
+(`>= 0` admits `-0.0`, which causes the same flip). Phases with any non-positive
+amp take the full path; the check rides on the sync the peel already does.
+
+**Trap, and it caught two of my own artefacts.** Do not benchmark or unit-test
+this against uniform-random sparsity. With 89.58% of rows zeroed at random a
+16-row tile survives 93% of the time, giving MAXT 62 and 1.12x. Real liveness is
+spatially clustered — measured MAXT is **19 of 65**. The synthetic benchmark and
+the first draft of the tests both said this change does not work.
 
 ### 1. The learned pass's two tails — ~30% of a 250.8 s stage
 
