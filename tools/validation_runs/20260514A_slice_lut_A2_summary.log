@@ -1,0 +1,7 @@
+kilosort.run_kilosort: 528099 spikes extracted in 10.79s; total 11.60s
+kilosort.run_kilosort: 1224 clusters found, in 4.78s; total 16.44s
+kilosort.run_kilosort: 817489 spikes extracted in 12.33s; total 28.82s
+kilosort.run_kilosort: 1030 clusters found, in 5.04s; total 35.13s
+kilosort.run_kilosort: 905 units found, in 1.41s; total 36.61s
+kilosort.run_kilosort: 743 units found with good refractory periods
+kilosort.run_kilosort: Total runtime: 38.44s = 00:00:38 h:m:s

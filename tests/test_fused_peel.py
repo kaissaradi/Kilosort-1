@@ -66,10 +66,13 @@ def stock_all(Xres, B, iX, iY, amp, U_time, ctc, tiwave, trange, n=2):
 
 @pytest.fixture(autouse=True)
 def reset_choice():
-    saved = fused_peel._CHOICE
+    saved, saved_lut = fused_peel._CHOICE, fused_peel._LUT_CHOICE
     fused_peel._CHOICE = None
+    fused_peel._LUT_CHOICE = None
+    fused_peel._LUT_CACHE.clear()
     yield
-    fused_peel._CHOICE = saved
+    fused_peel._CHOICE, fused_peel._LUT_CHOICE = saved, saved_lut
+    fused_peel._LUT_CACHE.clear()
 
 
 @pytest.mark.parametrize('n_spk', [1, 2, 5, 16])
@@ -160,3 +163,186 @@ def test_env_switch_forces_stock():
     assert fused_peel._CHOICE is False
     assert bit_eq(Xres, Xs)
     assert bit_eq(B, Bs)
+
+
+# ---------------------------------------------------------------------------
+# Live-tile LUT. Dead tiles are dropped BEFORE the launch, which is exact only
+# when a dropped tile is bitwise all +0.0 and amp > 0. Both guards are easy to
+# "simplify" into something that looks equivalent and is not:
+#   * `src == 0` instead of a bit test admits -0.0, and `o - (a * -0.0)` is
+#     `o + 0.0`, which maps a stored -0.0 to +0.0.
+#   * `amp >= 0` admits a = -0.0, which has the same effect on a +0.0 tile.
+# The two tests named for those cases fail if either guard is loosened.
+
+def _dead_mask(n_unit, n_row, zero_frac, g):
+    """Dead-row mask where each unit's LIVE rows form one contiguous band.
+
+    Deliberately not uniform-random. Liveness has to be spatially clustered or
+    no BLOCK_R-wide tile is ever entirely dead: with 85% of rows zeroed at
+    random, a 16-row tile survives with probability 1 - 0.85**16 = 93%, so a
+    random mask tests the skip on data where it cannot fire. Real U is zero
+    off a cluster's own channels, which are contiguous, and the measured ctc
+    has max 19 live tiles of 65 for exactly that reason.
+    """
+    band = max(1, int(round(n_row * (1.0 - zero_frac))))
+    start = torch.randint(0, max(1, n_row - band + 1), (n_unit,), generator=g)
+    rows = torch.arange(n_row)
+    live = ((rows[None, :] >= start[:, None])
+            & (rows[None, :] < start[:, None] + band))
+    return ~live
+
+
+def sparse_problem(n_spk, seed, zero_frac=0.85, neg_zero=False,
+                   positive_amp=True):
+    """problem(), but with most (unit, row) blocks of ctc/U_time exactly zero,
+    which is what real templates look like -- U is written into zeros and only
+    a cluster's own channels are touched."""
+    g = torch.Generator().manual_seed(seed)
+    Xres = (torch.randn(NCHAN, NT_LEN, generator=g) * 10).to(dev)
+    B = (torch.randn(NUNITS, NT_LEN, generator=g) * 10).to(dev)
+    U_time = torch.randn(NUNITS, NCHAN, NT, generator=g).to(dev)
+    ctc = torch.randn(NUNITS, NUNITS, 2 * NT + 1, generator=g).to(dev)
+    # U_time is [y, chan, t] and the LUT tiles over chan, so the band is
+    # already on the right axis. ctc is [i, j, t] but the kernel sees the
+    # permuted ctc_p[j, i, t] and tiles over i -- so ctc's band must be
+    # contiguous in i FOR EACH j, i.e. built as (j, i) and transposed.
+    dead_u = _dead_mask(NUNITS, NCHAN, zero_frac, g).to(dev)
+    dead_c = _dead_mask(NUNITS, NUNITS, zero_frac, g).T.contiguous().to(dev)
+    fill = -0.0 if neg_zero else 0.0
+    U_time = torch.where(dead_u[:, :, None], torch.full_like(U_time, fill),
+                         U_time)
+    ctc = torch.where(dead_c[:, :, None], torch.full_like(ctc, fill), ctc)
+    step = (NT_LEN - 2 * NT - 2) // max(n_spk, 1)
+    pos = torch.arange(n_spk) * step + NT + 1
+    iX = pos.to(dev).unsqueeze(1)
+    iY = torch.randint(0, NUNITS, (n_spk, 1), generator=g).to(dev)
+    amp = torch.rand(n_spk, 1, generator=g).to(dev) + 0.1
+    if not positive_amp:
+        amp[0] = -0.0            # not caught by `amp >= 0`
+        if n_spk > 1:
+            amp[1] = -amp[1]
+    return (Xres, B, U_time.to(dev), ctc.to(dev), iX, iY, amp.to(dev),
+            torch.arange(-(NT // 2), NT // 2 + 1, device=dev),
+            torch.arange(-NT, NT + 1, device=dev))
+
+
+def latch_fused():
+    """Run one peel so the FUSED gate decides, without deciding the LUT gate.
+
+    peel_subtract validates fused-vs-stock on its first eligible phase and
+    returns immediately, so the LUT gate is not reached until the second call.
+    That is correct for a real sort (thousands of peels) but means a
+    single-call test never exercises the LUT at all.
+    """
+    Xres, B, U_time, ctc, iX, iY, amp, tiwave, trange = sparse_problem(4, 999)
+    fused_peel.peel_subtract(Xres, B, iX, iY, amp, U_time, ctc,
+                             ctc.permute(1, 0, 2), tiwave, trange, NT)
+    assert fused_peel._CHOICE is True, 'fused peel not exact on this device'
+    assert fused_peel._LUT_CHOICE is None
+
+
+@pytest.mark.parametrize('n_spk', [1, 2, 5, 16])
+def test_lut_matches_stock_bit_for_bit(n_spk):
+    latch_fused()
+    Xres, B, U_time, ctc, iX, iY, amp, tiwave, trange = sparse_problem(
+        n_spk, 100 + n_spk)
+    Xs, Bs = Xres.clone(), B.clone()
+    stock_all(Xs, Bs, iX, iY, amp, U_time, ctc, tiwave, trange)
+    ctc_p = ctc.permute(1, 0, 2)
+    fused_peel.peel_subtract(Xres, B, iX, iY, amp, U_time, ctc, ctc_p,
+                             tiwave, trange, NT)
+    assert fused_peel._LUT_CHOICE is True
+    assert bit_eq(Xres, Xs) and bit_eq(B, Bs)
+
+
+def test_lut_is_actually_used_and_shrinks_the_grid():
+    """Guard against the LUT silently degenerating to the full kernel."""
+    _, _, U_time, ctc, _, _, _, _, _ = sparse_problem(4, 7)
+    lut, n_live, maxt = fused_peel._get_tile_lut(ctc.permute(1, 0, 2))
+    n_tiles = (NUNITS + fused_peel.BLOCK_R - 1) // fused_peel.BLOCK_R
+    assert 0 < maxt <= n_tiles
+    assert int(n_live.float().median()) < n_tiles
+    assert lut.shape == (NUNITS, maxt)
+
+
+def test_lut_skips_only_POSITIVE_zero_tiles():
+    latch_fused()
+    """Dead tiles made of -0.0 must NOT be skipped.
+
+    Stock computes o - (amp * -0.0) = o + 0.0, which turns a stored -0.0 into
+    +0.0. Skipping leaves the -0.0 in place. A `src == 0.0` liveness test
+    would wrongly call these tiles dead; only a bit test gets this right.
+    """
+    Xres, B, U_time, ctc, iX, iY, amp, tiwave, trange = sparse_problem(
+        8, 21, neg_zero=True)
+    B = torch.where(torch.rand_like(B) < 0.5, torch.full_like(B, -0.0), B)
+    Xres = torch.where(torch.rand_like(Xres) < 0.5,
+                       torch.full_like(Xres, -0.0), Xres)
+    Xs, Bs = Xres.clone(), B.clone()
+    stock_all(Xs, Bs, iX, iY, amp, U_time, ctc, tiwave, trange)
+    fused_peel.peel_subtract(Xres, B, iX, iY, amp, U_time, ctc,
+                             ctc.permute(1, 0, 2), tiwave, trange, NT)
+    assert bit_eq(Xres, Xs) and bit_eq(B, Bs)
+
+
+def test_lut_falls_back_when_any_amp_is_not_positive():
+    latch_fused()
+    """amp = -0.0 gives -0.0 * +0.0 = -0.0, flipping a stored -0.0 to +0.0.
+
+    `amp >= 0` is true for -0.0, so the guard has to be strict. The phase must
+    take the full path, and the result must still equal stock.
+    """
+    Xres, B, U_time, ctc, iX, iY, amp, tiwave, trange = sparse_problem(
+        8, 31, positive_amp=False)
+    B = torch.where(torch.rand_like(B) < 0.5, torch.full_like(B, -0.0), B)
+    Xs, Bs = Xres.clone(), B.clone()
+    stock_all(Xs, Bs, iX, iY, amp, U_time, ctc, tiwave, trange)
+    fused_peel.peel_subtract(Xres, B, iX, iY, amp, U_time, ctc,
+                             ctc.permute(1, 0, 2), tiwave, trange, NT)
+    assert bit_eq(Xres, Xs) and bit_eq(B, Bs)
+    assert fused_peel._LUT_CHOICE is None      # never got an eligible phase
+
+
+def test_lut_env_switch_forces_the_full_fused_path():
+    import os
+    latch_fused()
+    os.environ['KILOSORT_NO_PEEL_LUT'] = '1'
+    try:
+        Xres, B, U_time, ctc, iX, iY, amp, tiwave, trange = sparse_problem(
+            8, 41)
+        Xs, Bs = Xres.clone(), B.clone()
+        stock_all(Xs, Bs, iX, iY, amp, U_time, ctc, tiwave, trange)
+        fused_peel.peel_subtract(Xres, B, iX, iY, amp, U_time, ctc,
+                                 ctc.permute(1, 0, 2), tiwave, trange, NT)
+        assert fused_peel._LUT_CHOICE is False
+        assert bit_eq(Xres, Xs) and bit_eq(B, Bs)
+    finally:
+        del os.environ['KILOSORT_NO_PEEL_LUT']
+
+
+def test_lut_cache_survives_a_fresh_permuted_view_each_call():
+    """ctc_p is rebuilt by run_matching on every batch; the cache must key on
+    the batch-invariant base, or it misses ~3300 times per production sort."""
+    _, _, _, ctc, _, _, _, _, _ = sparse_problem(2, 51)
+    first = fused_peel._get_tile_lut(ctc.permute(1, 0, 2))
+    second = fused_peel._get_tile_lut(ctc.permute(1, 0, 2))
+    assert first[0].data_ptr() == second[0].data_ptr()
+
+
+def test_lut_rebuilds_when_the_source_tensor_changes():
+    _, _, _, ctc, _, _, _, _, _ = sparse_problem(2, 61)
+    first = fused_peel._get_tile_lut(ctc.permute(1, 0, 2))
+    ctc[0, 0, :] = 1.0                       # bumps ._version
+    second = fused_peel._get_tile_lut(ctc.permute(1, 0, 2))
+    assert first[0].data_ptr() != second[0].data_ptr()
+
+
+def test_lut_handles_an_all_zero_source():
+    latch_fused()
+    Xres, B, U_time, ctc, iX, iY, amp, tiwave, trange = sparse_problem(4, 71)
+    ctc = torch.zeros_like(ctc)
+    Xs, Bs = Xres.clone(), B.clone()
+    stock_all(Xs, Bs, iX, iY, amp, U_time, ctc, tiwave, trange)
+    fused_peel.peel_subtract(Xres, B, iX, iY, amp, U_time, ctc,
+                             ctc.permute(1, 0, 2), tiwave, trange, NT)
+    assert bit_eq(Xres, Xs) and bit_eq(B, Bs)

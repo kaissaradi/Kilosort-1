@@ -55,6 +55,7 @@ from kilosort.run_kilosort import run_kilosort  # noqa: E402
 BLOCK_R = 16   # must match fused_peel.BLOCK_R
 
 _stats = []
+_dumped = []
 
 
 def _census(ctc, block_r):
@@ -98,6 +99,13 @@ def main():
     ap.add_argument('--results-dir', required=True)
     ap.add_argument('--invert-sign', action='store_true')
     ap.add_argument('--block-r', type=int, default=BLOCK_R)
+    ap.add_argument('--dump-ctc', metavar='PATH',
+                    help='save the first real ctc (and U_time) to PATH.pt, so '
+                         'kernel work can be benchmarked against the true '
+                         'liveness structure instead of a synthetic one. '
+                         'Uniform-random sparsity is NOT representative: real '
+                         'dead rows cluster into whole dead tiles, which is '
+                         'the entire reason a tile skip pays.')
     args = ap.parse_args()
 
     real_prepare = template_matching.prepare_matching
@@ -105,6 +113,16 @@ def main():
     def wrapped(ops, U, return_cache=False):
         out = real_prepare(ops, U, return_cache=return_cache)
         ctc = out[0] if return_cache else out
+        if args.dump_ctc and not _dumped:
+            _dumped.append(1)
+            cache = out[1] if return_cache else None
+            torch.save({'ctc': ctc.cpu(),
+                        'U': U.cpu(),
+                        'U_time': (cache['U_time'].cpu()
+                                   if cache and 'U_time' in cache else None)},
+                       args.dump_ctc)
+            print(f'\n[dumped real ctc {tuple(ctc.shape)} to {args.dump_ctc}]\n',
+                  flush=True)
         st = _census(ctc, args.block_r)
         st['U_shape'] = tuple(U.shape)
         # Channel support of U itself, for the "why" half of the story.

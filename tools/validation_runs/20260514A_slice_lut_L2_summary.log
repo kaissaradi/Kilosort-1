@@ -1,0 +1,8 @@
+kilosort.run_kilosort: 528099 spikes extracted in 10.85s; total 11.60s
+kilosort.run_kilosort: 1224 clusters found, in 4.47s; total 16.13s
+kilosort.fused_peel: fused peel live-tile LUT enabled: bit-identical to the full fused subtract on the first eligible phase
+kilosort.run_kilosort: 817489 spikes extracted in 8.89s; total 25.08s
+kilosort.run_kilosort: 1030 clusters found, in 5.06s; total 31.41s
+kilosort.run_kilosort: 905 units found, in 1.42s; total 32.89s
+kilosort.run_kilosort: 743 units found with good refractory periods
+kilosort.run_kilosort: Total runtime: 34.68s = 00:00:35 h:m:s
