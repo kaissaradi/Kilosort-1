@@ -1,0 +1,43 @@
+=== re-warm input, same as the baseline arms saw ===
+Sat Sep  5 11:20:18 PM PDT 2026
+MemFree:        30019380 kB
+MemAvailable:   190663476 kB
+=== full LUT run 1 ===
+Sat Sep  5 11:20:21 PM PDT 2026
+L1 exit 0 : 319.10
+=== full LUT run 2 ===
+Sat Sep  5 11:26:29 PM PDT 2026
+L2 exit 0 : 319.84
+=== LUT gate ===
+kilosort.fused_peel: fused peel live-tile LUT enabled: bit-identical to the full fused subtract on the first eligible phase
+=== byte comparisons against the validated no-LUT baseline ===
+--- L1 vs full_A
+
+  23 files byte-identical, 0 differ
+--- L1 vs full_A2
+
+  23 files byte-identical, 0 differ
+--- L1 vs L2 (wobble control)
+
+  23 files byte-identical, 0 differ
+=== stage timings ===
+--- full_L1
+kilosort.run_kilosort: 3606390 spikes extracted in 95.18s; total 96.42s
+kilosort.run_kilosort: 2837 clusters found, in 23.93s; total 120.42s
+kilosort.run_kilosort: 6168727 spikes extracted in 138.71s; total 259.20s
+kilosort.run_kilosort: 2558 clusters found, in 32.68s; total 294.28s
+kilosort.run_kilosort: 2223 units found, in 5.25s; total 299.62s
+kilosort.run_kilosort: 1630 units found with good refractory periods
+kilosort.run_kilosort: Total runtime: 319.10s = 00:05:19 h:m:s
+--- full_L2
+kilosort.run_kilosort: 3606390 spikes extracted in 96.15s; total 97.40s
+kilosort.run_kilosort: 2837 clusters found, in 23.88s; total 121.36s
+kilosort.run_kilosort: 6168727 spikes extracted in 139.34s; total 260.77s
+kilosort.run_kilosort: 2558 clusters found, in 32.59s; total 295.77s
+kilosort.run_kilosort: 2223 units found, in 5.24s; total 301.11s
+kilosort.run_kilosort: 1630 units found with good refractory periods
+kilosort.run_kilosort: Total runtime: 319.84s = 00:05:20 h:m:s
+=== done ===
+Sat Sep  5 11:32:41 PM PDT 2026
+
+[exited with code 0]

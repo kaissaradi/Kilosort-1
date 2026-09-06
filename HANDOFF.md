@@ -50,9 +50,13 @@ the first run on this geometry with the reach to see the run-to-run wobble.
 | arm | `Total runtime` |
 |---|---:|
 | stock (all five `KILOSORT_NO_*`) | 858.81 s |
-| this branch | **383.60 s** |
-| same code, second run | 383.57 s |
-| | **2.24x** |
+| this branch, before the peel live-tile LUT | 383.60 s |
+| **this branch** | **319.10 s** |
+| same code, second run | 319.84 s |
+| | **2.69x** |
+
+The live-tile LUT (below) accounts for the last 383.60 -> 319.10 s and is
+23/23 byte-identical to the pre-LUT output in all three pairings.
 
 **An earlier version of this file said 1.45x here and blamed the geometry.
 Both halves were wrong.** That number came from a 150 s slice (~9% of one

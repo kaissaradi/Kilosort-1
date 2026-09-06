@@ -994,6 +994,36 @@ predictions written into the driver *before* the run:
    compiled nothing at all — the on-disk cache was already warm. The JIT
    attribution is confirmed; the amortization claim is untested.
 
+#### The live-tile LUT at production scale
+
+Validated on the same recording against the byte-checked baseline above.
+Two LUT runs, so this carries its own wobble control:
+
+| pairing | result |
+|---|---|
+| LUT run 1 vs `full_A` (no LUT) | **23/23 identical, 0 differ** |
+| LUT run 1 vs `full_A2` (no LUT) | **23/23 identical, 0 differ** |
+| LUT run 1 vs LUT run 2 | **23/23 identical, 0 differ** |
+
+| stage | stock | fused, no LUT | fused + LUT | vs stock |
+|---|---:|---:|---:|---:|
+| universal detect | 366.80 s | 96.47 s | 95.18 s | 3.85x |
+| **learned detect (peel)** | 397.61 s | 202.71 s | **138.71 s** | **2.87x** |
+| universal cluster | 28.26 s | 23.68 s | 23.93 s | 1.18x |
+| learned cluster | 37.65 s | 32.42 s | 32.68 s | 1.15x |
+| merge | 5.30 s | 5.29 s | 5.25 s | 1.01x |
+| **Total runtime** | **858.81 s** | 383.60 s | **319.10 s** | **2.69x** |
+
+Second LUT run 319.84 s. The LUT is worth **1.20x** here against 1.11x on the
+slice, the expected direction: the peel is 53% of a production sort and 32% of
+a slice one, so the slice under-weights exactly what this change attacks. That
+prediction is recorded as correct only because it was made per stage and
+weighted by share -- the two predictions that failed earlier in this section
+both came from reasoning about totals.
+
+Peel share after the change: 43.5% of the sort, still the largest single
+stage, so it remains the place to look.
+
 #### The background-task monitor kills on MemFree, and that is a false positive
 
 The first attempt was killed between arms by the harness reporting "system is
