@@ -1178,25 +1178,46 @@ Three things follow, in order of importance:
    evidence available at the time and wrong as a permanent verdict: remove the
    program's own nondeterminism and old and new code agree on all 23 files.
    Both geometries are now proven at production scale.
-2. **The culprit is NOT identified. An earlier version of this section said
-   "it is not cuBLAS" and that inference was wrong** -- recorded here rather
-   than quietly deleted, because the reasoning error is easy to repeat.
-   The C1/C2 arm set `CUBLAS_WORKSPACE_CONFIG=:4096:8` WITHOUT
-   `use_deterministic_algorithms`, still saw 5 files differ, and concluded
-   cuBLAS was exonerated. But that env var is a **prerequisite the flag
-   enforces**, not a switch that makes cuBLAS deterministic on its own --
-   verified directly: with the flag set and the variable unset, a plain
-   `a @ a` raises "Deterministic behavior was enabled ... but this". So the
-   env var alone leaves cuBLAS free to be nondeterministic, and C1/C2 says
-   nothing about it either way.
-   What IS known: no "does not have a deterministic implementation" warning
-   was emitted in any deterministic run, so nothing silently degraded. And
-   within a single process the three big GEMM/conv ops on this path
-   (`run_matching`'s einsum K=1536, `extract`'s xfeat matmul, the detect
-   conv1d) are bit-stable over 20 repeats each -- so if cuBLAS is involved it
-   would be through cross-process algorithm selection, not within-run
-   variability. Narrowing further needs a stage-by-stage bisect that dumps
-   intermediates from two runs and finds the first divergence.
+2. **ROOT CAUSE: the overlapping-window scatter.** Found by bisect, not by
+   argument. Dumping each stage's outputs from two runs of identical code puts
+   the FIRST divergence in `template_matching.extract`:
+
+   | stage output | differs |
+   |---|---|
+   | `A_univ_st` / `A_univ_tF` (universal detect) | **identical** |
+   | `B1_clu` / `B1_Wall` (template clustering) | **identical** |
+   | **`C_learn_st` / `C_learn_tF` (learned extract)** | **11 / 163 bytes** |
+   | `B2_Wall` (final clustering) | 3 bytes, inherited |
+
+   The one knowingly-nondeterministic operation in there is the peel's
+   overlapping-window scatter: `Xres[:, iX + tiwave] -= ...` is advanced-index
+   `index_put_`, which on duplicate indices is last-write-wins and
+   nondeterministic, and `fused_peel` falls back to it for exactly those
+   phases. Forcing every phase onto the fused kernel instead (deterministic by
+   construction -- one program per element, no duplicate writes) makes two runs
+   **byte-identical, 0 of 618,187,920 bytes**, against 11 / 163 with the normal
+   fallback. That is the proof.
+
+   **An earlier version of this section recorded this hypothesis as REFUTED.
+   The refutation was wrong**, and the error is worth keeping: it compared the
+   *presence* of overlapping phases across recordings (20260724A/2000 batches
+   6 of 94,633; 20260514A/full 3 of 144,642) and concluded that since both have
+   them and only one wobbles, they cannot be the cause. Presence is necessary,
+   not sufficient -- whether an overlap actually diverges depends on the values
+   at the duplicated indices. A population-level correlation cannot refute a
+   mechanism that fires conditionally.
+
+   This also explains why `use_deterministic_algorithms(True)` works: it
+   selects a deterministic `index_put_`.
+
+   **A zero-cost alternative exists, and it is NOT stock-equivalent.** Forcing
+   the fused kernel onto overlapping phases gives reproducibility without the
+   ~7-13% determinism tax, because the fused kernel is *more* deterministic
+   than the code it replaces. It must stay opt-in and clearly labelled: on
+   those phases it computes a different answer from stock -- though "different
+   from stock" is not meaningful there, since stock's own answer changes
+   between runs. Not implemented; recorded as an option.
+
 3. **Deterministic mode pins the answer, it does not reproduce a prior run.**
    `D1 vs N1` differs on 3 files. Turning the flag on changes results by the
    usual wobble magnitude relative to any particular earlier nondeterministic
