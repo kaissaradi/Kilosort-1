@@ -128,7 +128,15 @@ except Exception as _e:            # pragma: no cover - depends on install
 _CHOICE = None
 # Second, independent gate for the live-tile LUT layered on top of _CHOICE.
 _LUT_CHOICE = None
-BLOCK_R = 16
+# Row-tile height. Swept on the real ctc and U_time with the LUT in place:
+#   BLOCK_R      4      8     16     32     64    128
+#   ctc -> B  51.3   51.5   60.3   63.5   83.0  234.2 us
+# 4 and 8 tie and both beat 16 by ~1.17x; coarser is strictly worse. Note this
+# is NOT purely program-count bound -- BLOCK_R=8 launches MORE programs than 16
+# (grid n_spk x 34 vs n_spk x 19) and still wins, because a tile is live if any
+# of its rows is, so finer tiles resurrect fewer dead rows. 8 over 4 for the
+# smaller LUT and fewer programs at equal speed.
+BLOCK_R = 8
 
 
 if _HAVE_TRITON:
