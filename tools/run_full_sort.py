@@ -62,7 +62,24 @@ def main():
     ap.add_argument('--invert-sign', action='store_true',
                     help='the lab pipeline passes invert_sign=True for Litke')
     ap.add_argument('--do-car', action='store_true')
+    ap.add_argument('--deterministic', action='store_true',
+                    help='force deterministic CUDA algorithms. Diagnostic for '
+                         'the run-to-run wobble: if two runs with this flag '
+                         'agree where two runs without it do not, the wobble '
+                         'is a nondeterministic reduction (index_add / '
+                         'scatter_add / atomics), not anything shape- or '
+                         'data-dependent. warn_only=True so ops with no '
+                         'deterministic implementation degrade instead of '
+                         'raising -- which means a CLEAN result here is '
+                         'informative and a dirty one is not conclusive.')
     args = ap.parse_args()
+
+    if args.deterministic:
+        # cuBLAS needs this set before the first handle is created, or its
+        # own reductions stay nondeterministic regardless of the torch flag.
+        os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+        torch.use_deterministic_algorithms(True, warn_only=True)
+        torch.backends.cudnn.benchmark = False
 
     if bool(args.ops) == bool(args.probe):
         ap.error('give exactly one of --ops or --probe')
