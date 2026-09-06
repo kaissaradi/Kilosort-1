@@ -1015,6 +1015,80 @@ Two things this corrects:
 
 ---
 
+## 8. Measured and CONFIRMED, not yet built: `ctc` is 89% exact zeros
+
+Unlike §7, this one survived its measurement. Nothing is implemented yet; this
+section records the census so the next person starts from evidence.
+
+**The observation.** `fused_peel._scatter_sub` applies
+
+    B[r, pos[s] + t] -= amp[s] * ctc[r, iY[s], t]
+
+over *every* unit row `r`. But `U` is built by
+`clustering_qr.mean_cluster_templates`, which writes into `torch.zeros(...)` and
+only ever touches one cluster centre's channels — so `U` is **exactly** zero off
+a template's local channel set. And
+
+    ctc[i, j, t] = sum_{k,m} sum_l U[i,k,l] * U[j,m,l] * WtW[k,m,t]
+
+contracts `l` over channels (`U` is `(n_units, n_pc, n_chan)`; `WtW` is indexed
+by PC, not channel — easy to misread). If units `i` and `j` have disjoint
+channel support, every product in that sum is exactly 0, so the entire
+`(i, j, :)` block is zero and that row's subtract is a no-op.
+
+**The census** (`tools/measure_ctc_sparsity.py`, slice300, real `ctc`):
+
+| | |
+|---|---:|
+| `ctc` | 801 × 801 × 123 |
+| channels per template (median) | **18 of 519** |
+| rows that are exactly `+0.0` | **88.87%** |
+| live rows per spiking unit (median) | 89 of 801 |
+| row-tiles per spike at `BLOCK_R=16` | 51 |
+| **tiles fully skippable** | **80.44%** |
+| live tiles per spiking unit (median) | **10 of 51** |
+
+`peel_subtract` is 45.7% of the learned pass (251.9 s of a 623.6 s production
+sort), and the B subtract is ~76% of the fused kernel's element traffic
+(801×123 against Xres's 519×61). So a 5.1x cut in B tiles is aimed at the
+single largest line item in the sort.
+
+**Why skipping is bit-identical, and the two ways it could not have been.**
+This is a §6-class argument — no arithmetic is reproduced, only omitted:
+`o - (+0.0) == o` for every float `o`, including `-0.0`. Two preconditions,
+both **measured rather than assumed**, because both are the kind of thing that
+is invisible to `torch.equal`:
+
+1. **The zero blocks must be `+0.0`, not `-0.0`.** `o - (-0.0)` maps `-0.0` to
+   `+0.0`. Products `0.0 * x` are `-0.0` for `x < 0` and `-0.0 + -0.0` stays
+   `-0.0`, so a negative zero in `ctc` is possible in principle. Measured:
+   **0 of 801² blocks** carry one. The gate must compare bit patterns
+   (`.view(torch.int32)`), never `== 0`.
+2. **`amp > 0`,** or `amp * 0.0` is `-0.0` and precondition 1 stops helping.
+   This follows from detection — a peak needs `relu(max B)**2 > Th**2 > 0`, so
+   `B[iY,iX] > 0`, and `s > 0` — but it was checked anyway: smallest `amp` over
+   the whole sort was **0.0876**.
+
+Note the interaction: precondition 2 is what makes precondition 1 sufficient.
+Neither alone is enough, and a settings change that allowed `Th_learned = 0`
+would break 2 without touching 1. Gate on both.
+
+**What is NOT yet known.** Whether the saving is realisable. §3's docstring
+measured the peel as *launch- and allocation-bound, not bandwidth-bound*, and
+an in-kernel early exit keeps the grid at `(n_spk, 51)` while only cutting
+traffic. Cutting the grid instead — a per-unit compacted list of live tiles,
+built once since `ctc` is batch-invariant — is what would cut launches, at the
+cost of a real rewrite. Bench the early exit first: it is a few lines and it
+answers which of the two limits actually binds before anyone commits to the
+rewrite.
+
+Sparsity should be *higher* on 20260514A (60 µm, 1920 templates, 1890×900 µm)
+than on the 30 µm array measured here, since template footprints stay local
+while the array gets bigger. Re-run the census there before assuming the
+figures transfer.
+
+---
+
 ## How the claims here were verified
 
 The inventory, so the method survives even if the scripts do not. All of these

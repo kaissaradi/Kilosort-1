@@ -97,6 +97,31 @@ is.
 
 ## What to attack next, ranked
 
+### 0. `ctc` is 89% exact zeros — measured, confirmed, not built
+
+New and the best-evidenced item here. `fused_peel` subtracts
+`amp * ctc[r, iY, :]` over **every** unit row, but `U` is exactly zero off each
+template's local channels (median **18 of 519**), so 88.87% of `ctc`'s
+`(i,j,:)` blocks are exactly `+0.0` and their subtract is a no-op. At the
+kernel's `BLOCK_R=16` granularity, **80.4% of row-tiles are fully skippable** —
+median 10 live tiles of 51 per spike.
+
+This aims at `peel_subtract`, **45.7% of the learned pass**, the largest single
+line item in the sort.
+
+The identity argument is §6-class, not §2-class: nothing is recomputed, only
+omitted, and `o - (+0.0) == o` for every float including `-0.0`. Both
+preconditions are measured, not assumed — **0** zero-blocks carry a `-0.0`, and
+the smallest `amp` over a whole sort is **0.0876 > 0**. Compare bit patterns,
+not `== 0`; `torch.equal` hides exactly this class.
+
+Unknown: whether the win is realisable, since §3 measured the peel as
+launch-bound rather than bandwidth-bound. An in-kernel early exit cuts traffic
+but not launches; a compacted per-unit tile list (buildable once — `ctc` is
+batch-invariant) cuts both but is a real rewrite. **Bench the early exit
+first**, it answers which limit binds for a few lines of code. Census tool:
+`tools/measure_ctc_sparsity.py`. Full detail in §8 of the notes.
+
 ### 1. The learned pass's two tails — ~30% of a 250.8 s stage
 
 Best available target. Statement profile of `run_matching` over a full
@@ -196,6 +221,7 @@ scratchpad under `/tmp` and will not survive a reboot.
 | `tools/compare_sorts.py` | raw-byte compare of two result dirs |
 | `tools/make_litke_slice.py` | cut a flat int16 slice from a Litke recording |
 | `tools/measure_peel_dirty_region.py` | dirty-set census over a full sort |
+| `tools/measure_ctc_sparsity.py` | exact-zero census of `ctc` + skip preconditions |
 | `tools/profile_peel_statements.py` | statement/block profile of the peel loop |
 | `tools/bench_fused_peaks.py` | identity + timing for §6 on real captured batches |
 
