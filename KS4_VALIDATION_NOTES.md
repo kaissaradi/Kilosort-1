@@ -1761,3 +1761,125 @@ The repo's own `tests/` (`test_fast_kpp.py`, and the fused-detect/peel gate
 tests) are real pytest files and are the durable half of this; they pin the
 *gates and guards*, which is where the safety argument lives, rather than the
 kernels.
+
+## 12. Is 160 s reachable? Measured answer: not from this shortlist
+
+The stated goal was 1601.6 s -> 637.4 s -> **160 s**, a further 3.94x. This
+section tests that target against measurement rather than hope. No code was
+changed to produce any number here; every harness lives in the session
+scratchpad and each one calls the untouched original function after timing a
+replica of it, so the sorts that produced these numbers are byte-identical
+(`compare_sorts.py`: **23 files byte-identical, 0 differ**, against a matched
+control run).
+
+### The arithmetic before any measurement
+
+Against the optimized production budget (630.8 s of stage timers, 637.4 s
+recorded total):
+
+| stage | s | share |
+|---|---:|---:|
+| spike det. (learned) `st` | 255.6 | 40.5% |
+| spike det. (universal) `st0` | 231.0 | 36.6% |
+| clustering `clu0` + `clu` | 111.4 | 17.7% |
+| postprocessing | 21.6 | 3.4% |
+| merge | 9.8 | 1.6% |
+| preprocessing | 1.4 | 0.2% |
+
+Both detection stages together are 486.6 s, 77.1% of the sort. Reaching 160 s
+means removing 470.8 s. **Deleting 100% of all spike detection lands at
+144.2 s** -- so the target is only 15.8 s below a budget in which detection is
+free. Nothing about that is a rounding error: 96.8% of the entire detection
+budget has to disappear.
+
+### Where the detection time actually goes
+
+CUPTI is broken on this machine (`CUPTI_ERROR_INVALID_DEVICE`), so
+`torch.profiler` reports zero device time and kernel-level attribution is not
+available. Two CUDA-event measurements replace it. Events do not sync the host
+between statements, so this does not repeat the mistake recorded in the
+run-to-run wobble section, where synced statement profilers overstated
+launch-bound blocks.
+
+**GPU-busy vs host stall**, every call, all 300 batches of slice300:
+
+| function | calls | host s | gpu s | gap | gap % |
+|---|---:|---:|---:|---:|---:|
+| `spikedetect.template_match` | 300 | 10.98 | 10.24 | 0.74 | 6.8% |
+| `template_matching.run_matching` | 300 | 6.09 | 5.27 | 0.82 | 13.4% |
+| `clustering_qr.cluster` | 184 | 5.67 | 5.67 | 0.00 | **0.1%** |
+| `clustering_qr.kmeans_plusplus` | 184 | 4.22 | 4.22 | 0.00 | 0.1% |
+
+Clustering is fully GPU-bound. Whatever is left in `clu0`/`clu` is *work*, not
+launch overhead -- which retires the "launch overhead" half of the §5 story at
+this scale and matches the production result that §5's slice speedups collapsed
+from 2.47x/2.38x to 1.11x/1.23x. Detection has only 7-13% host gap, so CUDA
+graphs over `st0` could recover at most ~6% of that stage.
+
+**Block split inside each function** (3 probed batches, replayed on the real
+inputs, shares of GPU time):
+
+| `st0` = `template_match` | share | | `st` = `run_matching` | share |
+|---|---:|---|---|---:|
+| `fused_detect` fill (As/Amaxs/imaxs) | **83.9%** | | peel loop | **83.2%** |
+| `conv1d` B | 10.4% | | `conv1d` + `einsum` | 16.8% |
+| `fused_peaks` mask | 3.6% | | *of loop:* `peel_subtract` | 50.9% |
+| `nonzero` + gathers + `adist` | 2.0% | | *of loop:* `max(B,0)` | 12.4% |
+
+The replica runs ~18% faster than the in-situ calls (warm cache, second pass),
+so the *shares* are the reliable output here, not the absolute extrapolation;
+they are rescaled onto measured GPU-busy time below.
+
+Two incidental facts worth recording. `max_peels` is 50 and the peel loop ran
+**exactly 50 iterations on every probed batch** -- it is truncated by its cap,
+never by the `len(xs)==0` break, so no proposal can reduce the iteration count
+without changing results. And `kmeans_plusplus` is 74.4% of all clustering time.
+
+### The ceiling, block by block
+
+Measured shares applied to the production stage times:
+
+| addressable block | prod s | % of sort | sort if it went to ZERO |
+|---|---:|---:|---:|
+| #1 `fused_detect` fill (st0) | 156.6 | 24.8% | 474.2 s |
+| #3/#4/#5 peel loop (st) | 161.7 | 25.6% | 469.1 s |
+| — of which `peel_subtract` | 82.3 | 13.0% | 548.5 s |
+| #2 clustering `clu0`+`clu` | 111.4 | 17.7% | 519.4 s |
+| — of which `kmeans++` | 82.9 | 13.1% | 547.9 s |
+| `conv1d`+`einsum` (st) | 32.7 | 5.2% | 598.1 s |
+| `conv1d` B (st0) | 19.4 | 3.1% | 611.4 s |
+
+**All three shortlist targets driven to zero simultaneously gives 201.0 s**
+(3.14x further) -- and that already misses 160 s by 41 s, with three infinite
+speedups spent. What survives is 61.2 s of `st` non-kernel time, 54.9 s of `st0`
+non-kernel time, 32.7 s of `einsum`, 21.6 s of postprocessing, 19.4 s of
+`conv1d`, 9.8 s of merge.
+
+Plausible scenarios, for calibration:
+
+| scenario | total | further | overall vs 1601.6 |
+|---|---:|---:|---:|
+| 2x fill, 1.5x peel, 1.3x clustering | 472.9 s | 1.33x | 3.4x |
+| 3x fill, 2x peel, 1.5x clustering | 408.4 s | 1.54x | 3.9x |
+| 5x fill, 3x peel, 2x clustering | 342.0 s | 1.84x | 4.7x |
+
+### Conclusion
+
+**160 s is not reachable by optimizing the kernels this shortlist names.** The
+honest ceiling for the whole shortlist, fully realised, is ~200 s, and a
+realistic outcome is 340-470 s (4.7x-3.4x overall). Getting under 200 s requires
+changing what the sorter *computes* -- fewer templates, a different candidate
+representation, or a different matching formulation -- not making the present
+statements faster. Reaching 160 s additionally requires attacking `conv1d`,
+`einsum` and postprocessing, which no current proposal touches.
+
+The single largest addressable block in the sorter is the `fused_detect` fill at
+**24.8% of the sort**, which is where §10's candidate-only proposal points. Note
+it is already the fused Triton path, so the 54.6x candidate ratio from §10 is a
+traffic bound on a statement whose traffic was already cut ~130x; `As` itself
+must still be computed densely because it is the input to the threshold test.
+
+Recorded so this target is not re-litigated: the 4x that took 1601.6 s to
+637.4 s came from four independent 2-7x kernel wins landing on stages that were
+then 58% and 32% of the sort. Those stages are still 77% of it, but the fat has
+been taken off the statements inside them.
