@@ -1,3 +1,4 @@
+import os
 import time
 import gc
 from pathlib import Path
@@ -37,7 +38,8 @@ def run_kilosort(settings, probe=None, probe_name=None, filename=None,
                  data_dtype=None, do_CAR=True, invert_sign=False, device=None,
                  progress_bar=None, save_extra_vars=False, clear_cache=False,
                  save_preprocessed_copy=False, bad_channels=None, shank_idx=None,
-                 verbose_console=False, verbose_log=False, torch_thread_lim=None):
+                 verbose_console=False, verbose_log=False, torch_thread_lim=None,
+                 save_plots=None):
     """Run full spike sorting pipeline on specified data.
     
     Parameters
@@ -124,7 +126,17 @@ def run_kilosort(settings, probe=None, probe_name=None, filename=None,
     torch_thread_lim : int; optional.
         If set, this will limit the number of pytorch threads on CPU.
         See docs for `torch.set_num_threads`.
-    
+    save_plots : bool; optional.
+        Whether to write `diagnostics.png` and `spike_positions.png`. Defaults
+        to True unless the environment variable `KILOSORT_NO_PLOTS` is set.
+        Both figures are drawn after the results are already saved, so
+        skipping them cannot alter any output; over 33 sorts they cost 11.4%
+        of end-to-end wall clock, none of which is counted in
+        `ops['runtime']`. Set False for batch sorting. Note that
+        `spike_positions.png` can be redrawn later from
+        `spike_positions.npy`, but `diagnostics.png` cannot -- it is drawn
+        from first-pass intermediates that are never written to disk.
+
     Raises
     ------
     ValueError
@@ -170,6 +182,27 @@ def run_kilosort(settings, probe=None, probe_name=None, filename=None,
     if torch_thread_lim is not None:
         torch.set_num_threads(torch_thread_lim)
 
+    # The two diagnostic figures are not free: measured over 33 sorts
+    # (tools/log_census.py), matplotlib is 11.4% of end-to-end wall clock, and
+    # none of it appears in `ops['runtime']`, so every speed number this repo
+    # has ever quoted silently excluded it. plot_spike_positions dominates --
+    # it hands `ax.scatter` one RGBA per spike (17.1M of them on a long
+    # recording) for a 9000x4200 px canvas, 126-149 s, against ~10 s for
+    # plot_diagnostics.
+    #
+    # Skipping cannot change a single output byte, and that is a property of
+    # the call order rather than a claim needing a test: both figures are drawn
+    # after `save_sorting` has already written the results to disk.
+    #
+    # Recoverability differs between the two, which is worth knowing before
+    # switching them off for a batch: `spike_positions.png` is regenerable
+    # from the saved `spike_positions.npy` at any time, but
+    # `diagnostics.png` is drawn from `Wall0`/`clu0`, first-pass
+    # intermediates that are never saved -- once skipped, it is gone for
+    # that sort.
+    if save_plots is None:
+        save_plots = not os.environ.get('KILOSORT_NO_PLOTS')
+
     # Configure settings, ops, and file paths
     if settings is None or settings.get('n_chan_bin', None) is None:
         raise ValueError(
@@ -191,6 +224,7 @@ def run_kilosort(settings, probe=None, probe_name=None, filename=None,
                 _filename, _results_dir, _probe, settings, data_dtype, device,
                 do_CAR, clear_cache, invert_sign, save_preprocessed_copy,
                 verbose_log, save_extra_vars, file_object, progress_bar,
+                save_plots=save_plots,
             )
 
     return ops, st, clu, tF, Wall, similar_templates, \
@@ -199,7 +233,8 @@ def run_kilosort(settings, probe=None, probe_name=None, filename=None,
 
 def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
           clear_cache, invert_sign, save_preprocessed_copy, verbose_log,
-          save_extra_vars, file_object, progress_bar, gui_sorter=None):
+          save_extra_vars, file_object, progress_bar, gui_sorter=None,
+          save_plots=True):
     """Run sorting pipeline. See `run_kilosort` for documentation.
     
     Notes
@@ -310,14 +345,17 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
 
         log_thread_count(logger)
 
-        logger.info('Generating diagnostic plots ...')
         if gui_sorter is not None:
+            logger.info('Generating diagnostic plots ...')
             gui_sorter.Wall0 = Wall0
             gui_sorter.wPCA = torch.clone(ops['wPCA'].cpu()).numpy()
             gui_sorter.clu0 = clu0
             gui_sorter.plotDataReady.emit('diagnostics')
-        else:
+        elif save_plots:
+            logger.info('Generating diagnostic plots ...')
             kplots.plot_diagnostics(Wall0, clu0, ops, results_dir)
+        else:
+            logger.info('Skipping diagnostic plots (save_plots=False).')
 
         clu, Wall, st, tF = cluster_spikes(
             st, tF, ops, device, bfile, tic0=tic0, progress_bar=progress_bar,
@@ -338,13 +376,17 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
 
         log_thread_count(logger)
 
-        logger.info('Generating spike position plot ...')
         if gui_sorter is not None:
+            logger.info('Generating spike position plot ...')
             gui_sorter.clu = clu[kept_spikes]
             gui_sorter.is_refractory = is_ref
             gui_sorter.plotDataReady.emit('probe')
-        else:
+        elif save_plots:
+            logger.info('Generating spike position plot ...')
             kplots.plot_spike_positions(clu[kept_spikes], is_ref, results_dir)
+        else:
+            logger.info('Skipping spike position plot (save_plots=False); '
+                        'regenerate from spike_positions.npy if needed.')
         logger.info('Sorting finished.')
         log_sorting_summary(ops, log=logger, level='info')
         
