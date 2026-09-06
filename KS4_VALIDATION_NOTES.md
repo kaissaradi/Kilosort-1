@@ -1095,9 +1095,64 @@ All three gates enabled at the new shapes without falling back --
 
 Same 610,758 / 773,338 spikes, 956 / 683 clusters, 590 units, 480 good.
 
-Still open: a 30 um PRODUCTION-scale check. That matters more here than
-elsewhere, because the run-to-run wobble was only ever observed on this
-recording at that scale.
+#### 30 um at production scale: the wobble shows up, and is not ours
+
+Run on a **2000-batch cut of 20260724A/chunk12_9-11** (20.76 GB, 20,000,000
+samples, `cmp`-verified as an exact prefix of the 42 GB chunk) -- 6.7x the
+slice, 5.15 M spikes in the learned pass, which is the reach that matters
+because the wobble was only ever seen on THIS recording at THIS scale.
+
+Four arms, so BOTH codes have a same-code control. That is the whole point:
+with only one run of the old code the result is unattributable.
+
+| pairing | files differing | total bytes |
+|---|---:|---:|
+| N1 vs N2 -- **new code vs itself** | 3 | 33 |
+| **O1 vs O2 -- old code vs itself** | **5** | **423** |
+| N1 vs O1 / N2 vs O1 -- cross | 5 | 249 / 221 |
+| N1 vs O2 / N2 vs O2 -- cross | 5 | 235 / 268 |
+
+**Every defining output is byte-identical in all six pairings**:
+`spike_times`, `spike_clusters`, `spike_templates`,
+`spike_detection_templates`, `kept_spikes`, `templates_ind`, `whitening_mat`,
+`channel_map`. Which spikes exist, which cluster each belongs to and which
+template matched never move. The differences are confined to the four
+tF-derived float arrays -- exactly the set `compare_sorts.py` documents.
+
+Magnitudes, and this is the attribution:
+
+| pairing | file | n differ | max ULP | max rel |
+|---|---|---:|---:|---:|
+| **O1 vs O2 (same code)** | pc_features | 151 of 154 M | **4502** | **4.13e-04** |
+| | templates | 185 of 28 M | 176 | 1.61e-05 |
+| N1 vs O1 (cross) | pc_features | 96 of 154 M | 1354 | 9.51e-05 |
+| N1 vs N2 (same code) | pc_features | 27 of 154 M | 120 | 1.03e-05 |
+
+The LARGEST disagreement anywhere in the matrix is between two runs of
+**identical, unmodified code**, and it exceeds every new-vs-old pairing. A
+systematic difference introduced by the peel work would make cross > same-code;
+it does not. By the three-way test stated under *Cumulative*, these belong to
+the program.
+
+**So do not claim byte identity for this recording at this scale -- it is not
+available to claim.** kilosort4 is not byte-reproducible on 20260724A at
+production scale, for stock and optimized code alike. The defensible statement
+is: defining outputs identical, residual float wobble demonstrably the
+program's own.
+
+Note the contrast with 20260514A, where the full 3314-batch run came out 23/23
+identical across five pairings including two same-code controls. The wobble is
+recording-specific, not universal, which is a new fact -- it was previously
+only known to appear on 20260724A, but never checked for absence elsewhere at
+matching scale.
+
+Speed at this scale, same session:
+
+| arm | peel | total |
+|---|---:|---:|
+| LUT + both tails OFF | 108.94 s | 274.17 / 274.61 s |
+| **on** | **66.51 s** | **234.32 / 235.46 s** |
+| | **1.64x** | **1.17x** |
 
 #### The background-task monitor kills on MemFree, and that is a false positive
 
