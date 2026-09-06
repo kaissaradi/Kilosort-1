@@ -1,5 +1,20 @@
 """Statement-level profile of run_matching's peel loop (the learned pass).
 
+READ THIS BEFORE ACTING ON THE SHARES.
+
+1. This file INLINES A COPY of run_matching. It has already gone stale once --
+   after the two tails were fused it still profiled the old statements and
+   reported an unchanged 17.5% / 15.6% for code that no longer ran. If you
+   change run_matching, change it here too, or these numbers describe a
+   program that does not exist.
+
+2. The shares OVERSTATE what fusing a launch-bound block can return, because
+   the CUDA sync around each statement forbids exactly the overlap those
+   launches normally get. Measured: the condition tail read 17.5% here, and
+   replacing it with a kernel 5.1x faster on the part it covers (45.7 -> 8.9
+   us/call) moved the end-to-end sort by 1.03x. The store tail read 15.6% and
+   returned 1.085x. Treat every share below as an UPPER BOUND.
+
 The validation notes attribute the learned pass coarsely (peel_subtract 65.9%,
 torch.max 10.3%, rest 23.8%). That "rest" is now the largest single unexplained
 block after the peel fusion landed, so this pins every statement.
@@ -17,7 +32,8 @@ import torch
 from torch.nn.functional import conv1d, max_pool1d
 
 sys.path.insert(0, '/home/localadmin/Downloads/Kilosort-1')
-from kilosort import template_matching, fused_peel          # noqa: E402
+from kilosort import (template_matching, fused_peel,        # noqa: E402
+                      fused_peel_cond, fused_peel_store)
 from kilosort.template_matching import _matching_unit_cache  # noqa: E402
 from kilosort.run_kilosort import run_kilosort               # noqa: E402
 
@@ -80,15 +96,7 @@ def run_matching_prof(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=No
         with Tic('03_max'):
             Cfmax, imax = torch.max(B, 0)
         with Tic('04_TAIL_cond'):
-            Cfmax = torch.relu(Cfmax)
-            Cfmax.mul_(Cfmax)
-            Cfmax[:nt] = 0
-            Cfmax[-nt:] = 0
-            Cmax = max_pool1d(Cfmax.view(1, 1, -1), (2 * nt + 1), stride=1, padding=(nt))
-            cmax = Cmax[0, 0]
-            cnd1 = cmax > Th2
-            cnd2 = torch.abs(cmax - Cfmax) < 1e-9
-            both = cnd1 & cnd2
+            cmax, both = fused_peel_cond.peak_condition(Cfmax, nt, Th2)
             xs = torch.nonzero(both)
         with Tic('08_len_sync'):
             nxs = len(xs)
@@ -96,7 +104,6 @@ def run_matching_prof(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=No
             break
         with Tic('09_TAIL_store'):
             iX = xs[:, :1]
-            iY = imax[iX]
             nsp = len(iX)
         need = k + nsp
         if need > st.shape[0]:
@@ -107,11 +114,9 @@ def run_matching_prof(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=No
                 amps = torch.cat((amps, amps.new_zeros((extra, 1))), 0)
                 th_amps = torch.cat((th_amps, th_amps.new_zeros((extra, 1))), 0)
         with Tic('09_TAIL_store'):
-            st[k:k + nsp, 0] = iX[:, 0]
-            st[k:k + nsp, 1] = iY[:, 0]
-            amps[k:k + nsp] = B[iY, iX] * s[iY]
+            iY = fused_peel_store.store_spikes(st, amps, th_amps, k, iX, imax,
+                                               B, s, cmax)
             amp = amps[k:k + nsp]
-            th_amps[k:k + nsp] = cmax[iX[:, 0], None] ** .5
         k += nsp
         with Tic('12_peel_subtract'):
             fused_peel.peel_subtract(Xres, B, iX, iY, amp, U_time, ctc, ctc_p,
