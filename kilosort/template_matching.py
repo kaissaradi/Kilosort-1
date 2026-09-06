@@ -5,7 +5,7 @@ import torch
 from torch.nn.functional import conv1d, max_pool2d, max_pool1d
 from tqdm import tqdm
 
-from kilosort import CCG, fused_peel
+from kilosort import CCG, fused_peel, fused_peel_cond
 from kilosort.utils import (
     get_spike_buffer_capacity,
     group_indices_by_label,
@@ -334,17 +334,15 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=None):
         # Reduce first, then apply relu/square on the (NT,) result.
         # In-place square avoids a full (NT,) temporary per peel.
         Cfmax, imax = torch.max(B, 0)
-        Cfmax = torch.relu(Cfmax)
-        Cfmax.mul_(Cfmax)
-        Cfmax[:nt] = 0
-        Cfmax[-nt:] = 0
-
-        Cmax = max_pool1d(Cfmax.view(1, 1, -1), (2*nt+1), stride=1, padding=(nt))
-        cmax = Cmax[0, 0]
-
-        cnd1 = cmax > Th2
-        cnd2 = torch.abs(cmax - Cfmax) < 1e-9
-        xs = torch.nonzero(cnd1 & cnd2)
+        # relu -> square -> zero the two nt-wide edges -> max_pool1d -> two
+        # comparisons -> and, in one kernel. That is ~10 launches on a (NT,)
+        # array of 40 KB, so the block is launch-bound rather than
+        # bandwidth-bound, and it runs ~48x per batch. `nonzero` stays outside:
+        # its length is data-dependent and its row ORDER is load-bearing for
+        # the st/amps writes below. See fused_peel_cond.py; falls back to the
+        # stock statements unless it proves bit-identical on the first peel.
+        cmax, cnd = fused_peel_cond.peak_condition(Cfmax, nt, Th2)
+        xs = torch.nonzero(cnd)
 
         if len(xs)==0:
             break
