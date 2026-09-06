@@ -115,6 +115,13 @@ preconditions are measured, not assumed — **0** zero-blocks carry a `-0.0`, an
 the smallest `amp` over a whole sort is **0.0876 > 0**. Compare bit patterns,
 not `== 0`; `torch.equal` hides exactly this class.
 
+**Holds on both array geometries.** 20260514A (60 µm, 512 ch) gives 89.58%
+zero blocks, 82.22% skippable tiles, 0 negative zeros, smallest `amp` 0.0930 —
+slightly *better* than the 30 µm array, as predicted, because footprints stay
+local while the array grows. Two independent geometries means the sparsity is
+structural (how `mean_cluster_templates` builds `U`), not a quirk of one
+recording.
+
 Unknown: whether the win is realisable, since §3 measured the peel as
 launch-bound rather than bandwidth-bound. An in-kernel early exit cuts traffic
 but not launches; a compacted per-unit tile list (buildable once — `ctc` is

@@ -1082,10 +1082,26 @@ cost of a real rewrite. Bench the early exit first: it is a few lines and it
 answers which of the two limits actually binds before anyone commits to the
 rewrite.
 
-Sparsity should be *higher* on 20260514A (60 µm, 1920 templates, 1890×900 µm)
-than on the 30 µm array measured here, since template footprints stay local
-while the array gets bigger. Re-run the census there before assuming the
-figures transfer.
+**Confirmed on both geometries.** The prediction was that sparsity would be
+*higher* on 20260514A, since template footprints stay local while the array
+gets bigger. Recorded before the run, and it held:
+
+| | 20260724A, 30 µm | 20260514A, 60 µm |
+|---|---:|---:|
+| `ctc` | 801 × 801 × 123 | 1031 × 1031 × 123 |
+| channels per template (median) | 18 of 519 | 15 of 512 |
+| blocks exactly `+0.0` | 88.87% | **89.58%** |
+| blocks carrying a `-0.0` | 0 | **0** |
+| tiles skippable (`BLOCK_R=16`) | 80.44% | **82.22%** |
+| live tiles per spike (median) | 10 of 51 | 11 of 65 |
+| smallest `amp` in the sort | 0.0876 | **0.0930** |
+
+That both preconditions hold on two independent array geometries is the point:
+it says the zeros come from the *structure* of how `mean_cluster_templates`
+builds `U` — local channel support written into a zeros tensor — and not from
+some property of one recording. Unit count does not track template count here
+(1031 units from 1920 universal templates against 801 from 4048), so the
+sparsity is genuinely geometric rather than a headcount artifact.
 
 ---
 

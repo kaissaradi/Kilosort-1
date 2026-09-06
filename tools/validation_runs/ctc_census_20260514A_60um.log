@@ -1,0 +1,20 @@
+kilosort.run_kilosort: cluster (final):       sys     7.9 GB  |  gpu    0.3 GB
+kilosort.run_kilosort: cluster merge:         sys     8.0 GB  |  gpu    0.3 GB
+kilosort.run_kilosort: postprocessing:        sys     8.2 GB  |  gpu    0.3 GB
+kilosort.run_kilosort: ********************************************************
+
+======================================================================
+ctc census over 1 prepare_matching call(s), 45.5s
+======================================================================
+
+call 0: ctc 1031 x 1031 x 123   U (1031, 3, 512)
+  channels per template (median) : 15 of 512
+  rows that are exactly +0.0     : 89.58%
+  zero rows carrying a -0.0      : 0   (must be 0 to skip safely)
+  live rows per spiking unit     : 106 (median)
+  --- at BLOCK_R=16 ---
+  row-tiles per spike            : 65
+  tiles skippable                : 82.22%
+  live tiles per spiking unit    : 11 (median)
+
+smallest amp seen in any peel    : 0.0930096   (must be > 0 for the skip to be exact)
