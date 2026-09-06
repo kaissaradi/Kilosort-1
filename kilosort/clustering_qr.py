@@ -347,7 +347,13 @@ def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
 
 def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'),
                     verbose=False):
-    """k-means++ seeding. 78-87% of clustering_qr.run's time lives below here.
+    """k-means++ seeding. 44.5% of clustering_qr.run's time lives below here.
+
+    That share used to read "78-87%" and was stale: re-measured 2026-09-06 by
+    wrapping whole functions over a real sort, run() splits as kmeans_plusplus
+    44.5%, swarmsplitter.split 32.1%, neigh_mat 6.4%, the alternating-
+    assignment loop ~8.3%. The number moved because fast_kpp and the CUDA-graph
+    capture (§4, §5) took most of it out. Do not re-plan against the old figure.
 
     The body is unchanged and lives in _kmeans_plusplus_stock. fast_kpp runs
     the same loop without its two per-iteration host reads and returns None

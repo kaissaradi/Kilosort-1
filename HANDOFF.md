@@ -168,35 +168,45 @@ this against uniform-random sparsity. With 89.58% of rows zeroed at random a
 spatially clustered — measured MAXT is **19 of 65**. The synthetic benchmark and
 the first draft of the tests both said this change does not work.
 
-### 1. The learned pass's two tails — ~30% of a 250.8 s stage
+### 1. DONE -- both peel tails fused (commits `1e8c39e`, `63db84f`)
 
-Best available target. Statement profile of `run_matching` over a full
-slice300 sort (14,557 peel iterations, 815 units, NT 10,122):
+Kernel speedups were large (condition tail 45.7 -> 8.9 us/call, 5.1x; store
+tail 49.9 us -> one program per spike) but the END-TO-END return was 1.03x and
+1.085x. That gap is the lesson: `tools/profile_peel_statements.py` syncs around
+each statement, which inflates exactly the launch-bound blocks it is used to
+find. Its shares are UPPER BOUNDS.
 
-| block | s | share | µs/call |
-|---|---:|---:|---:|
-| `peel_subtract` (already fused, §3) | 4.70 | 45.7% | 323.0 |
-| **condition tail** relu→square→edges→`max_pool1d`→`cnd1`/`cnd2`→`nonzero` | **1.63** | **15.8%** | 111.1 |
-| **store tail** `imax[iX]`, 4 slice writes, `B[iY,iX]`, `s[iY]`, `**.5` | **1.46** | **14.2%** | 50.2 |
-| `torch.max(B, 0)` | 1.25 | 12.2% | 85.6 |
-| `einsum` / `conv1d` (once per batch) | 1.14 | 11.1% | — |
+Also from that work: `tl.sqrt` is the approximate instruction and is NOT
+bit-identical to torch's `**.5` -- use `tl.math.sqrt_rn`. The gate caught it.
 
-The two tails are **launch-overhead bound, not bandwidth bound** — roughly 20
-kernels per peel iteration, each on a 10,122-element (40 KB) array. 40 KB in
-31 µs is 1.3 GB/s, three orders off this card. The peel loop runs ~48.5
-iterations per batch, so that overhead is multiplied 48x.
+### 2. Clustering -- 18% of the sort, ~1.17x, the least-optimized block left
 
-Two things to know before starting:
+Re-measured 2026-09-06 by wrapping whole functions over a real sort (whole
+functions, not statements, so the sync distortion above is much smaller):
 
-* The same sparse short-circuit as §6 applies. `cnd1 = cmax > Th2` is satisfied
-  by ~61 of 10,122 positions, so the window max only needs computing for
-  candidates.
-* **Order is load-bearing.** `nonzero` returns ascending indices and `st` /
-  `amps` rows are written in that order. Any compaction scheme must preserve
-  it — an atomic-counter compaction will not. A block-level `cumsum` will.
-* `th_amps` uses `cmax[iX]**.5`. Check whether torch lowers `**.5` to `sqrt`
-  before assuming `tl.sqrt` matches it bit-for-bit; that is a real hazard and
-  the gate must catch it.
+| block | share of `clustering_qr.run` |
+|---|---:|
+| `kmeans_plusplus` | 44.5% |
+| **`swarmsplitter.split`** | **32.1%** |
+| alternating-assignment loop | ~8.3% |
+| `neigh_mat` | 6.4% |
+| `Mstats` | 0.7% |
+
+Two corrections to what this file used to say. `kmeans_plusplus` is 44.5%, not
+the 78-87% its own docstring claimed -- §4 and §5 already took most of it out,
+and the docstring is now fixed. And `swarmsplitter.split` is 32.1% of
+clustering, not the 12.3% recorded earlier.
+
+`split` is CPU-side numpy and pure Python. A cProfile of it over one sort:
+`check_split` is 24% of its own time, and ~29% WAS numba JIT compilation --
+now removed by `@njit(cache=True)` on `CCG.compute_CCG` (33.63 -> 32.44 s on
+slice300, byte-identical).
+
+Be realistic about what is left here: clustering is 18% of the sort, `split` is
+a third of that, and `check_split` a quarter of THAT -- so even a 3x on the hot
+function is ~1% of a sort. The loop is also a sequential tree walk whose
+pruning is data-dependent, so it does not parallelise without changing
+semantics. Rank it below anything in detection.
 
 ### 2. `torch.max(B, 0)` — do NOT bother
 

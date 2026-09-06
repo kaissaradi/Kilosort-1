@@ -5,7 +5,11 @@ from torch.nn.functional import conv1d
 import math 
 from tqdm import trange 
 
-@njit()
+# cache=True: measured ~1.0 s of LLVM compilation inside swarmsplitter.split
+# on every process (llvmlite ffi 0.751 s + deduplicate 0.195 s in a cProfile of
+# one sort). Caching persists the compiled artifact instead of rebuilding it
+# per run. Semantics are unchanged -- same function, same target, same result.
+@njit(cache=True)
 def compute_CCG(st1, st2, tbin = 1/1000, nbins = 500,
                 assume_sorted=False):
 
