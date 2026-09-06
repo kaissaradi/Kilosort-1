@@ -501,6 +501,87 @@ increments itself, which is what lets one recording serve all 200 iterations.
 
 ---
 
+## 6. Fusing the peak-selection tail (Triton), 6.2x
+
+The tail of `template_match`, after the §2 body has filled `As`/`Amaxs`/`imaxs`:
+
+    Amaxs[:, :nt] = 0 ; Amaxs[:, -nt:] = 0
+    Amaxs = max_pool1d(Amaxs, 2*nt0+1, stride=1, padding=nt0)
+    xy    = logical_and(Amaxs == As, As > Th_universal).nonzero()
+
+At production shapes each buffer is `Nfilt x NT = 4048 x 10122` = 41 M float32
+= 164 MB, and that sequence moves roughly a gigabyte per batch to produce one
+bool array: the pool reads and writes a full copy, the two comparisons read
+three more, `logical_and` reads and writes two. Every output element depends
+only on its own row and a +/-nt0 window, so one kernel does it in a single pass.
+
+### The short-circuit is where the win actually comes from
+
+`As > Th` is the cheap half of the test and is brutally sparse -- **1,437
+survivors of 41 M** at production shapes. The kernel tests it first and skips
+the entire `2*nt0+1 = 41`-iteration window max for any block where no lane has
+a candidate, which is nearly every block. This is a pure short-circuit, not an
+approximation: `(m == a) & (a > Th)` is False wherever `a > Th` is False,
+whatever `m` turns out to be, so a skipped block stores exactly what the full
+path would have stored. Without it the kernel is 2.3x; with it, 6.2x.
+
+Smaller blocks win here, which is the opposite of the usual advice: a block is
+skipped whole, and smaller blocks are skipped more often. `_CONFIGS` is ordered
+by measured speed, `(128, 4)` first.
+
+### Why identity is easy here, unlike §2
+
+This tail does **no floating-point arithmetic at all**:
+
+  * `max` is a *selection*, not an accumulation. The maximum of a set of float32
+    values is the same bit pattern regardless of comparison order, so the fused
+    window max is exactly what `max_pool1d` produces. No rounding, no FMA
+    contraction, no accumulation order to reproduce.
+  * The maxima's **indices are never used** here -- unlike §2, where the argmax
+    tie-break had to be matched -- so exact ties are harmless: only the value is
+    compared.
+  * `==`, `>` and `&` are exact.
+
+Consequently all three block sizes matched, where §2's identity was contingent
+on the block size, cuBLAS's kernel choice and the shape. The one genuine
+semantic question is the array ends, where `max_pool1d`'s -inf padding meets the
+explicit zeroing of the first and last `nt` columns; the kernel reproduces it by
+loading out-of-range positions as -inf, and `tests/test_fused_peaks.py` puts
+peaks exactly there, on block boundaries, and in dense ties.
+
+### Verification
+
+8 real batches captured from a live sort, **327,790,848 elements compared, all
+equal**, for every config -- including the `nonzero()` the caller actually
+consumes, since its order is load-bearing downstream.
+
+Three full slice300 sorts -- stock tail (`KILOSORT_NO_FUSED_PEAKS=1`), fused,
+and fused again -- compared all three ways: **23/23 files byte-identical in
+every pairing**.
+
+### Result
+
+Call site, mean of 10, production shapes:
+
+| | ms/batch |
+|---|---:|
+| stock tail | 5.332 |
+| fused `(128, 4)` | **0.859** |
+| | **6.20x** |
+
+**What this is NOT yet.** The three sorts above ran 52.87 / 52.33 / 52.55 s --
+a 0.43 s delta where the call-site number predicts 1.34 s over 300 batches.
+That is inside this machine's known run-to-run drift, so **slice300 cannot
+confirm the end-to-end win** and the production total is unconfirmed. The
+per-batch figure is the claim; a production run is needed to settle the rest.
+
+A first version of the benchmark reported 7.24x. Its stock baseline did a
+164 MB `clone()` that the real call site does not do (the call site mutates
+`Amaxs` in place, and both the edge zeroing and `max_pool1d` are safe to time
+repeatedly without one). Corrected to 6.20x. `tools/bench_fused_peaks.py`.
+
+---
+
 ## Kilosort4 is not bit-reproducible run to run
 
 Found while verifying §5, and it changes how every claim in this file should be
@@ -654,6 +735,10 @@ baseline at every step:
 | + fused peel subtract (§3) | 62.6 |
 | + sync-free k-means++ (§4) | 61.7 |
 | + graph-captured k-means++ (§5) | 53.3 |
+| + fused peak tail (§6) | 52.3 |
+
+The §6 row is same-session against 52.9 s for the §5 build and is **within
+drift** -- see §6 for why slice300 cannot resolve it.
 
 These rows are **not all from one sitting, and the machine drifts**: re-running
 the §3 build in the §4 session gave 70.7 s, not 62.6 s. Only same-session A/B
@@ -699,7 +784,7 @@ production sort, and detection and clustering are now roughly the same size.
 
 ---
 
-## 6. Measured and rejected: dirty-region peel
+## 7. Measured and rejected: dirty-region peel
 
 Recorded so nobody builds it twice. **Rejected on measurement, before any
 kernel was written.**
