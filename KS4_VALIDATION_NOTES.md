@@ -1611,6 +1611,66 @@ is that the ranking moves.
 
 ---
 
+## 10. Candidate-only universal suppression: measured, not yet built
+
+Third-party review (Astra, reading `3f0483b`) proposed deferring the dense
+spatial reduction in `spikedetect.template_match` to above-threshold
+candidates. Two of that review's seven items are already built here -- the
+learned-pass tails are `NO_PEEL_COND`/`NO_PEEL_STORE`, and the "measure dirty
+unit x time coverage" item is section 8 -- but this one is live, and it lands
+on exactly the stage the production census (section 9) puts on top.
+
+**The statement, at `spikedetect.py:323`:**
+
+    Amax = torch.max(Aa.index_select(0, iC2_flat).view(nC2, Nfilt, -1), 0)[0]
+
+`Aa` is `(Nfilt, NT)`; `iC2_flat` is `(nC2 * Nfilt)`. So this reads `Aa` with
+**nC2-fold amplification**, densely, for every filter at every sample.
+
+**The dependency is breakable, and that is the whole idea.** Candidates are
+`As > Th_universal`, and `As` comes from `torch.max(A.abs(), 0)` -- it does not
+depend on `Amax` at all. So the neighbourhood maximum can be computed for
+candidates only, then compared to `As` exactly as now.
+
+**Measured on 20260903A/chunk2, 74 real batches, 519 ch at 30 um:**
+
+| | |
+|---|---:|
+| `nC2 x Nfilt x NT` | 100 x 4038 x 10122 |
+| dense spatial reads per batch | **4.087e9** |
+| peaks kept per batch (median) | 2422 |
+| sparse reads at that count | 1.073e7 |
+| **upper bound on the ratio** | **381x** |
+
+The 4.087e9 confirms the review's 4.1 billion estimate on this repo's own
+data. Note what the 381x is and is not: peaks are what survive BOTH the
+threshold and the neighbourhood-max test, so they are a **lower bound** on
+candidates, and 381x is therefore an **upper** bound on the saving. The true
+candidate count has not been measured yet and is the number that decides this.
+
+**Why the element count still overstates the win.** `fused_detect` computes
+`Aa`, `imax` and `Amax` in one fused launch that already shares its read of
+`A`, and `fused_peaks.try_mask` already short-circuits the temporal window for
+blocks containing no candidate. Part of the theoretical saving is therefore
+already collected. Benchmark before writing a kernel.
+
+**Two identity hazards, both specific to this rewrite.** The mask is
+`Amaxs == As`, an equality on a *selection* rather than an arithmetic result,
+so ties are order-independent -- this is safer than the max/gather rewrite that
+cost +567 spikes and -25 good units (see `template_match`'s note). But:
+
+1. The edge zeroing `Amaxs[:, :nt] = 0` happens **before** the pool, so it
+   changes pooled values near the batch edges. A candidate-only path must
+   reproduce that, not just skip the edges.
+2. `mask.nonzero()` fixes the output order (filter-major, then time). Any
+   candidate compaction has to sort back to it.
+
+**A small fixture now exists.** `data/sorted/20260903A/chunk2.bin` (768 MB,
+74 batches, ~14 s to sort) was re-staged for this measurement and kept. Kernel
+work on detection should use it rather than a production `.bin`.
+
+---
+
 ## How the claims here were verified
 
 The inventory, so the method survives even if the scripts do not. All of these
