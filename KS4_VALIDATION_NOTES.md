@@ -1024,6 +1024,55 @@ both came from reasoning about totals.
 Peel share after the change: 43.5% of the sort, still the largest single
 stage, so it remains the place to look.
 
+#### Both peel tails fused, and one trap worth the whole exercise
+
+After the LUT, the statement profile of the learned pass reordered: the two
+tails around the peel became 33.1% together, ahead of `peel_subtract`'s 30.8%.
+Both are now one kernel each (`fused_peel_cond.py`, `fused_peel_store.py`),
+plus `BLOCK_R` 16 -> 8 swept on the real ctc.
+
+| pairing | result |
+|---|---|
+| M1 vs `full_A` / `full_A2` (pre-LUT) | **23/23 identical** |
+| M1 vs `full_L1` / `full_L2` (LUT only) | **23/23 identical** |
+| M1 vs M2 (wobble control) | **23/23 identical** |
+
+| stage | stock | pre-LUT | + LUT | + tails | vs stock |
+|---|---:|---:|---:|---:|---:|
+| universal detect | 366.80 s | 96.47 s | 95.18 s | 95.62 s | 3.84x |
+| **peel** | 397.61 s | 202.71 s | 138.71 s | **128.84 s** | **3.09x** |
+| universal cluster | 28.26 s | 23.68 s | 23.93 s | 23.58 s | 1.20x |
+| learned cluster | 37.65 s | 32.42 s | 32.68 s | 32.22 s | 1.17x |
+| **Total runtime** | **858.81 s** | 383.60 s | 319.10 s | **309.03 s** | **2.78x** |
+
+Second run 311.10 s.
+
+**`tl.sqrt` is not bit-identical to torch's `**.5`.** This is the single most
+transferable finding in this section. `th_amps = cmax[iX]**.5` was flagged in
+the roadmap as needing a check, and the two sides disagree:
+
+* torch's `x**.5` IS correctly-rounded sqrt -- compared against `torch.sqrt`
+  on 4,194,304 random positives and on 0.0/-0.0/1.0/4.0/denormal/3.4e38/inf,
+  every bit pattern agreed. So the stock side is clean.
+* Triton's `tl.sqrt` lowers to the APPROXIMATE hardware instruction and
+  differed on 7 of 26 real values by 1 ULP. `tl.math.sqrt_rn` is
+  round-to-nearest and matches exactly.
+
+The gate rejected the kernel on its first peel and fell back to stock, so no
+output was ever at risk -- which is the entire argument for the gates. Nothing
+else in this series has had an operation that looks IEEE-exact and is not;
+assume the same for any future kernel reaching for a transcendental,
+a reciprocal, or a rsqrt.
+
+**The synced statement profiler overstates launch-bound blocks.** The
+condition tail measured 17.5% of the learned pass. Fusing 73% of it at 5.1x
+(45.7 -> 8.9 us per call) returned **1.03x** end to end. A CUDA sync around
+each statement forbids exactly the overlap those launches normally get, so it
+inflates precisely the blocks it is used to find. Treat every share in
+`tools/profile_peel_statements.py` as an upper bound on what fusing that
+statement can return. The store tail behaved the same way: 15.6% by the
+profile, 1.085x in practice.
+
 #### The background-task monitor kills on MemFree, and that is a false positive
 
 The first attempt was killed between arms by the harness reporting "system is
@@ -1035,6 +1084,15 @@ running low on memory". `/proc/meminfo` at that moment:
 | **MemAvailable** | **190.6 (96.6%)** |
 | MemFree | 7.5 |
 | Cached | 177.1 |
+
+**This recurred on 2026-09-06** and is not a one-off: a second run was killed
+with MemAvailable at **190.7 of 197.3 GB (96.6%)** and MemFree at 25.2 GB, so
+the trigger is not a fixed small-MemFree threshold. The reliable workaround is
+to run production sorts in the FOREGROUND, where the background-task monitor
+is not involved at all; a fused run is ~356 s wall and fits inside the tool's
+600 s cap. Reclaiming the cache of every large file EXCEPT the input also
+helps, and preserves A/B cache fairness because the input stays warm exactly
+as the baseline arms had it.
 
 kilosort's own peak was 9.30 GB. `MemFree` was low purely because streaming a
 34 GB input (and the 25.5 GB raw it was built from) fills the page cache with
