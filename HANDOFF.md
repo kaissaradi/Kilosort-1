@@ -179,7 +179,33 @@ find. Its shares are UPPER BOUNDS.
 Also from that work: `tl.sqrt` is the approximate instruction and is NOT
 bit-identical to torch's `**.5` -- use `tl.math.sqrt_rn`. The gate caught it.
 
-### 2. Clustering -- 18% of the sort, ~1.17x, the least-optimized block left
+### 2. Universal detection -- 30.9% of the sort, and it is DONE
+
+Measured 2026-09-06 by wrapping whole functions over a real sort, so this is
+the answer to "is anything left in the biggest stage":
+
+| block | share of `spikedetect.run` | at production |
+|---|---:|---:|
+| `template_match` (fused_detect + fused_peaks) | 75.5% | ~72 s |
+| per-batch tail (gather + wPCA matmul + D2H) | 13.5% | ~12.9 s |
+| `extract_wPCA_wTEMP` (ONE call, fixed cost) | 10.1% | ~1.1 s |
+| `yweighted`, `nearest_chans` | <1% | -- |
+
+`template_match` is already 3.84x against stock and what remains inside it is
+`conv1d` (cuDNN) and the loop einsum (cuBLAS). Beating those means matching
+cuBLAS's accumulation order, which §2 established is the hard constraint of
+this whole series -- high risk, and the shapes here are ones cuBLAS is good at.
+
+The per-batch tail is the only soft spot, and it is small: 13.5% of 30.9% is
+**4.2% of a sort**, of which the gather and matmul are real work. The
+realistic prize is the per-batch `.cpu()` (pinned + non_blocking), worth maybe
+1.5% overall for a loop restructure that has to keep buffers alive across the
+copy. Not taken; ranked below clustering.
+
+Note `extract_wPCA_wTEMP` reads 10.1% on a 300-batch slice but is ONE call, so
+it is ~1.1% at production. Do not size it from a slice profile.
+
+### 3. Clustering -- 18% of the sort, ~1.17x, the least-optimized block left
 
 Re-measured 2026-09-06 by wrapping whole functions over a real sort (whole
 functions, not statements, so the sync distortion above is much smaller):

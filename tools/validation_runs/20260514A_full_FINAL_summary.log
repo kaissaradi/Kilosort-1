@@ -1,0 +1,10 @@
+kilosort.run_kilosort: 3606390 spikes extracted in 95.68s; total 96.95s
+kilosort.run_kilosort: 2837 clusters found, in 24.62s; total 121.66s
+  0%|          | 0/3314 [00:00<?, ?it/s]kilosort.fused_peel_cond: fused peel cond enabled: bit-identical to the stock condition tail on the first peel (10,122 positions), config (256, 4)
+kilosort.fused_peel_store: fused peel store enabled: bit-identical to the stock spike store on the first peel (79 spikes)
+kilosort.fused_peel: fused peel live-tile LUT enabled: bit-identical to the full fused subtract on the first eligible phase
+kilosort.run_kilosort: 6168727 spikes extracted in 128.13s; total 249.86s
+kilosort.run_kilosort: 2558 clusters found, in 31.02s; total 283.39s
+kilosort.run_kilosort: 2223 units found, in 5.23s; total 288.72s
+kilosort.run_kilosort: 1630 units found with good refractory periods
+kilosort.run_kilosort: Total runtime: 309.56s = 00:05:10 h:m:s
