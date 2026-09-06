@@ -17,7 +17,9 @@ nondeterministic CUDA reduction, and `tools/run_full_sort.py --deterministic`
 (torch.use_deterministic_algorithms + CUBLAS_WORKSPACE_CONFIG=:4096:8) removes
 it: same code twice goes from 5 files differing to **23/23 identical**, and old
 code vs this branch likewise goes to **23/23 identical** at production scale.
-Costs ~7-13%. Use it for every comparison; leave it off for timing.
+Costs ~7-13%. Use it for every comparison; leave it off for timing. Which
+operation is responsible is still unidentified -- see the notes for what has
+been ruled in and out, including one inference that looked sound and was not.
 
 ---
 

@@ -1178,11 +1178,25 @@ Three things follow, in order of importance:
    evidence available at the time and wrong as a permanent verdict: remove the
    program's own nondeterminism and old and new code agree on all 23 files.
    Both geometries are now proven at production scale.
-2. **It is not cuBLAS.** Pinning the cuBLAS workspace alone changes nothing
-   (C1 vs C2 still differs on 5 files), so the culprit is a torch-level atomic
-   reduction that `use_deterministic_algorithms` swaps out. No "does not have a
-   deterministic implementation" warning was emitted in any deterministic run,
-   so nothing silently degraded and the clean result is informative.
+2. **The culprit is NOT identified. An earlier version of this section said
+   "it is not cuBLAS" and that inference was wrong** -- recorded here rather
+   than quietly deleted, because the reasoning error is easy to repeat.
+   The C1/C2 arm set `CUBLAS_WORKSPACE_CONFIG=:4096:8` WITHOUT
+   `use_deterministic_algorithms`, still saw 5 files differ, and concluded
+   cuBLAS was exonerated. But that env var is a **prerequisite the flag
+   enforces**, not a switch that makes cuBLAS deterministic on its own --
+   verified directly: with the flag set and the variable unset, a plain
+   `a @ a` raises "Deterministic behavior was enabled ... but this". So the
+   env var alone leaves cuBLAS free to be nondeterministic, and C1/C2 says
+   nothing about it either way.
+   What IS known: no "does not have a deterministic implementation" warning
+   was emitted in any deterministic run, so nothing silently degraded. And
+   within a single process the three big GEMM/conv ops on this path
+   (`run_matching`'s einsum K=1536, `extract`'s xfeat matmul, the detect
+   conv1d) are bit-stable over 20 repeats each -- so if cuBLAS is involved it
+   would be through cross-process algorithm selection, not within-run
+   variability. Narrowing further needs a stage-by-stage bisect that dumps
+   intermediates from two runs and finds the first divergence.
 3. **Deterministic mode pins the answer, it does not reproduce a prior run.**
    `D1 vs N1` differs on 3 files. Turning the flag on changes results by the
    usual wobble magnitude relative to any particular earlier nondeterministic
