@@ -1458,10 +1458,34 @@ Two things this corrects:
 
 ---
 
-## 8. Measured and CONFIRMED, not yet built: `ctc` is 89% exact zeros
+## 8. Measured, CONFIRMED, and now BUILT: `ctc` is 89% exact zeros
 
-Unlike §7, this one survived its measurement. Nothing is implemented yet; this
-section records the census so the next person starts from evidence.
+Unlike §7, this one survived its measurement. The census below is what the
+build was based on; the build landed as the live-tile LUT
+(`_scatter_sub_lut_kernel` in `kilosort/fused_peel.py`, disabled by
+`KILOSORT_NO_PEEL_LUT=1`) together with the two fused peel tails
+(`NO_PEEL_COND`, `NO_PEEL_STORE`).
+
+**Remeasured at production scale, 2026-09-06** — same binary at `f513a07`,
+both arms replaying 20260724A/chunk12_9-11's own `ops.npy` against the 40 GB
+production `.bin`, back to back in one sitting:
+
+| arm | env | wall |
+|---|---|---:|
+| NEW | all optimizations on | **624 s** |
+| OLD | `NO_PEEL_LUT=1 NO_PEEL_COND=1 NO_PEEL_STORE=1` | **700 s** |
+
+**1.12×**, 76 s saved, against 1.24× on 20260514A where the work was developed.
+`compare_sorts.py`: 18 of 23 arrays byte-identical, including `spike_times`,
+`spike_clusters`, `spike_templates`, `kept_spikes`, `whitening_mat` and
+`channel_map`. The 5 that move are the tF-derived floats and carry the known
+20260724A wobble signature (see "Open, not resolved"), which one run per arm
+cannot attribute — that needs the 4-arm NEW/NEW2/OLD/OLD2 design.
+
+**Do not A/B against the archived 637.4 s.** This machine drifts ~10% between
+sittings; today's own OLD arm measured 700 s. Comparing today's NEW against the
+archived figure gives 1.02× and the false conclusion that the LUT bought
+nothing.
 
 **The observation.** `fused_peel._scatter_sub` applies
 
@@ -1545,6 +1569,45 @@ builds `U` — local channel support written into a zeros tensor — and not fro
 some property of one recording. Unit count does not track template count here
 (1031 units from 1920 universal templates against 801 from 4048), so the
 sparsity is genuinely geometric rather than a headcount artifact.
+
+---
+
+## 9. Where the time actually goes now — 31 production sorts, not a slice
+
+Every sort writes its per-stage timers into `ops.npy` (`runtime_st0`,
+`runtime_clu0`, `runtime_st`, `runtime_clu`, `runtime_merge`,
+`runtime_postproc`). That is a free bottleneck census over every sort this fork
+has ever produced — no instrumentation, no re-runs — and it is worth far more
+than slice300, because slice300's stage mix is not production's.
+
+Read off 31 fork-era sorts under `data/sorted/*/chunk*/kilosort4/ops.npy`,
+**2.99 GPU-hours** of real sorting across both array geometries:
+
+| | preproc | **st0** | clu0 | **st** | clu | merge | postproc |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| all 31 | 0.3% | **41.7%** | 9.9% | **31.8%** | 11.0% | 1.1% | 3.3% |
+| 519 ch @ 30 µm (2.16 h) | 0.3% | **46.8%** | 7.8% | 31.5% | 9.5% | 0.7% | 2.6% |
+| 512 ch @ 60 µm (0.83 h) | 0.3% | 28.2% | 15.5% | **32.6%** | 14.9% | 2.2% | 5.0% |
+
+**Universal detection (`st0`) is now the single largest line item at
+production scale — 41.7%, ahead of the whole learned pass at 31.8%.** §2
+already took it 3.7× on slice300; it is back on top because everything around
+it got faster, not because that work regressed.
+
+Two things this says that slice300 could not:
+
+1. **The geometry splits the profile.** `st0` is 46.8% at 30 µm against 28.2%
+   at 60 µm, because `st0` scales with the universal template count and the
+   30 µm grid lays 4,048 of them against 1,920 at 60 µm. Any further `st0`
+   work pays roughly 1.7× more on the 519-channel arrays.
+2. **Clustering is not negligible at 60 µm.** `clu0 + clu` is 30.4% there
+   against 17.3% at 30 µm — so the earlier "clustering is 17.5%, questionable
+   whether it is worth moving" conclusion is a 30 µm conclusion and does not
+   transfer.
+
+Reproduce with the loop over `ops.npy` in this section's header; it costs
+nothing and should be re-read after every optimization, since the whole point
+is that the ranking moves.
 
 ---
 
