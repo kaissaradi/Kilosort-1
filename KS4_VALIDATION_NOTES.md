@@ -1210,13 +1210,28 @@ Three things follow, in order of importance:
    This also explains why `use_deterministic_algorithms(True)` works: it
    selects a deterministic `index_put_`.
 
-   **A zero-cost alternative exists, and it is NOT stock-equivalent.** Forcing
-   the fused kernel onto overlapping phases gives reproducibility without the
-   ~7-13% determinism tax, because the fused kernel is *more* deterministic
-   than the code it replaces. It must stay opt-in and clearly labelled: on
-   those phases it computes a different answer from stock -- though "different
-   from stock" is not meaningful there, since stock's own answer changes
-   between runs. Not implemented; recorded as an option.
+   **A "zero-cost alternative" looked available here and DOES NOT WORK.**
+   The idea was to route overlapping phases to the fused kernel permanently,
+   on the reasoning that it is deterministic by construction. It is not. The
+   kernel does a NON-ATOMIC read-modify-write (`o = load(out); store(out,
+   o - v)`), so when two spikes' windows overlap, their programs race on the
+   same element. It is deterministic only when the windows are DISJOINT --
+   which is exactly the condition it already tests for.
+
+   This was implemented, and a unit test with severe overlap (positions 3
+   apart, 123-wide windows) failed immediately on two identical runs. It was
+   then reverted. The full-run diagnostic that showed 0 of 618,187,920 bytes
+   differing is not contradicted but is not a guarantee either: with only 6
+   overlapping phases the races are rare and happened to resolve the same way
+   twice.
+
+   So the diagnostic above still localises the ROOT CAUSE correctly -- forcing
+   those phases off the stock path removed the observed divergence -- but
+   "force the fused kernel" is swapping one nondeterministic operation for
+   another, not a fix. A real zero-cost fix needs atomics or serialised
+   handling of the overlapping spikes, and is not done.
+
+   `--deterministic` remains the supported way to get reproducibility.
 
 3. **Deterministic mode pins the answer, it does not reproduce a prior run.**
    `D1 vs N1` differs on 3 files. Turning the flag on changes results by the
