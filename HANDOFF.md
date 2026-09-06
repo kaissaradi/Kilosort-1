@@ -29,6 +29,31 @@ agreeing to 0.05%.
 
 `slice300.bin` (300-batch dev benchmark) cumulative: **118.2 s → 53.3 s**.
 
+### It now holds on a second array
+
+Everything above was one recording, so one set of tensor shapes — which matters
+because §2's bit-identity depends on reproducing cuBLAS's accumulation order
+and *which* Triton block size does that is shape-dependent. `20260514A` is a
+macaque recording on a **512-channel 60 um array** (array 504) against
+20260724A's **519-channel 30 um** (array 1551): 2x the pitch, ~3x the area,
+and **1920 universal templates instead of 4048**.
+
+All four gates re-validated and enabled there, and `fused_detect` chose the
+*same* BLOCK_M=128 that matched at the old shapes. Three-way byte comparison on
+a 300-batch slice: **23/23 files identical in all three pairings**.
+
+Speedup there is **1.45x**, not 2.51x, and that is expected rather than a
+regression: half the templates means the detect body these optimizations attack
+is a much smaller share of the sort.
+
+One thing to know before you sort 60 um data with the lab pipeline: its `tuned`
+profile applies `dmin=15, dminx=32` to both 30 and 60 um arrays, but those
+numbers *are* the 30 um array's row/column pitch. On the 60 um array they give
+**14,280** universal templates instead of 1,920 and OOM a 20 GB card — and
+`max_channel_distance=66` culls nothing there, so the cull that holds Nfilt
+down at 30 um does no work. Details and the measured grid table are in the
+notes.
+
 ---
 
 ## What is optimized (and what each one actually bought)
@@ -166,14 +191,24 @@ scratchpad under `/tmp` and will not survive a reboot.
 
 | tool | what it does |
 |---|---|
+| `tools/run_tests.py` | runs the test suite without pytest (see below) |
+| `tools/run_full_sort.py` | one full sort from a flat `.bin`; both arms of every A/B |
+| `tools/compare_sorts.py` | raw-byte compare of two result dirs |
+| `tools/make_litke_slice.py` | cut a flat int16 slice from a Litke recording |
 | `tools/measure_peel_dirty_region.py` | dirty-set census over a full sort |
 | `tools/profile_peel_statements.py` | statement/block profile of the peel loop |
 | `tools/bench_fused_peaks.py` | identity + timing for §6 on real captured batches |
 
 `tests/` pins the **gates**, which is where the safety argument lives:
 `test_fused_detect.py`, `test_fused_peel.py`, `test_fast_kpp.py`,
-`test_fused_peaks.py`. Note **there is no pytest in any conda env on this
-machine** — drive them with the hand-written runners.
+`test_fused_peaks.py`.
+
+**There is no pytest in any conda env on this machine.** `tools/run_tests.py`
+installs a minimal shim and runs the real files anyway — `python
+tools/run_tests.py`, currently **71 passed, 0 failed, 0 skipped, 0 errored**.
+Before it existed the gate tests were driven by throwaway scripts under `/tmp`
+that *re-implemented* the assertions, so the committed test files had never
+actually been executed. Run this before trusting a change.
 
 Every optimization sits behind a `KILOSORT_NO_*` env switch and a runtime gate
 that validates against the stock path once per process. Keep that pattern.

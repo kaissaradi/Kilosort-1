@@ -36,7 +36,12 @@ import time
 from pathlib import Path
 
 import numpy as np
-import torch
+
+# The lab pipeline's run_kilosort4.py sets this before importing torch, so the
+# harness has to as well: without it an A/B can OOM where production does not,
+# and the fragmentation behaviour is part of what is being timed.
+os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+import torch  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from kilosort.run_kilosort import run_kilosort   # noqa: E402

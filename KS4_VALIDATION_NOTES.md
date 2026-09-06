@@ -3,12 +3,21 @@
 What was measured, on what, and what it proves. Referenced from comments in
 `kilosort/spikedetect.py` and `kilosort/fused_detect.py`.
 
-Everything here is on **20260724A/chunk12_9-11**: 519 channels, fs = 20000,
-`batch_size` = 10000 (NT = 10122), nt = 61, nblocks = 0, dmin = 15.0,
-dminx = 32.0, `nearest_chans` = 10, `nearest_templates` = 100,
+Unless a section says otherwise, everything here is on
+**20260724A/chunk12_9-11**: 519 channels at a 30 um pitch (array 1551),
+fs = 20000, `batch_size` = 10000 (NT = 10122), nt = 61, nblocks = 0,
+dmin = 15.0, dminx = 32.0, `nearest_chans` = 10, `nearest_templates` = 100,
 Th_universal = 9, Th_learned = 8, `max_peels` = 50. 4784 universal templates
 on a 46x104 grid, 4048 surviving `max_channel_distance`. Hardware: RTX 4000
 Ada (19.54 GB), Threadripper PRO 7975WX, torch 2.5.1, Triton 3.1.0.
+
+**One recording is one shape.** Every Triton kernel here is gated on a runtime
+bit-comparison, and for §2 *which* block size passes that gate is not a
+constant of the code — it depends on the tensor shapes, which depend on the
+array. A second geometry is therefore not a nicety; it is the only way to find
+out whether the gates fall back on hardware and probes they have not seen. See
+*Second array geometry* below for the first such test, on a 512-channel 60 um
+array.
 
 Two benchmarks are used below:
 
@@ -719,6 +728,160 @@ the same data:
   over 3.1 GB.
 
 42,080,520,000 bytes = 40,540,000 samples × 519 channels × int16.
+
+---
+
+## Second array geometry: 20260514A, 512 channels at 60 um
+
+Everything above this section was measured on one recording, and therefore on
+one set of tensor shapes. That is a real limitation, not a cosmetic one: §2's
+bit-identity is pinned to reproducing cuBLAS's split-K-2 accumulation, and
+**which Triton block size reproduces it is shape-dependent** — BLOCK_M=128
+agrees at 20260724A's production shapes while 64 and 32 do not, and at the
+small test shapes it is the other way round. Nothing in the code guarantees
+that a config which matched at 519 channels still matches at 512. The gates
+exist precisely because it might not.
+
+`20260514A` is the first test of that. It is a macaque recording on a
+**different array**: 512 electrodes at a uniform 60.0 um nearest-neighbour
+pitch (array id 504), against 20260724A's 519 electrodes at 30.0 um
+(array 1551).
+
+| | 20260724A | 20260514A |
+|---|---:|---:|
+| array id | 1551 | 504 |
+| channels | 519 | 512 |
+| NN pitch | 30.0 um | **60.0 um** |
+| extent | 720 x 780 um | **1890 x 900 um** |
+| universal templates (`Nfilt`) | 4048 | **1920** |
+
+Raw lives on the share at `/mnt/lab/Array-data/20260514A` — 39 recordings,
+772.9 GB — and there is a complete Vision-format **kilosort2.5 sort** beside it
+at `/mnt/lab/Array-data/Duke/sorted/20260514A/kilosort25/`, with `.ei`,
+`.neurons`, `.sta`, `.params` and phy output under `ksfiles/`. That makes this
+the better of the two datasets for the QA pipeline when it exists, because it
+already has an independent sort to compare against; 20260724A does not.
+
+`data000` (14 files, 25.5 GB, 27.6 min) was staged to
+`~/Documents/Development/data/raw/20260514A/data000` and a 300-batch slice cut
+from it with `tools/make_litke_slice.py` — 3.07 GB, 150 s, 512 channels — so
+the A/B matches slice300's scale.
+
+### The tuned profile's template grid is wrong for 60 um arrays
+
+The first attempt **OOMed** on a 19.54 GB card before finishing detection. The
+cause is not the optimizations; it is the settings. The lab pipeline's `tuned`
+profile lists `VALIDATED_PITCHES = (30, 60)` and applies `dmin = 15.0`,
+`dminx = 32.0` to both. But those two numbers *are* the 30 um array's own row
+and column pitch (its rows are 15 um apart, its columns 30 um). On a 60 um
+array they lay a candidate grid four times finer than the electrodes:
+
+| probe | dmin / dminx | grid | templates kept |
+|---|---|---|---:|
+| 519 ch @ 30 um | 15 / 32 | 45 x 104 | 3983 |
+| 512 ch @ 60 um | 15 / 32 | 119 x 120 | **14280** |
+| 512 ch @ 60 um | 60 / 60 | 63 x 30 | 1890 |
+
+Two things compound. The template count is 3.5x higher, and
+`max_channel_distance = 66` — the cull that discards 15% of the grid on the
+30 um array — discards **nothing** here, because on a 60 um array every grid
+point is within 66 um of some electrode by construction. `B` is `Nfilt x NT`
+and everything downstream of it scales the same way.
+
+This run therefore used `dmin = dminx = 60`, i.e. candidate templates at half
+the electrode pitch, which is the relationship kilosort's grid is designed
+around. That yields **1920** universal templates. Recorded here as a finding
+against the pipeline profile, not as a tuning recommendation: which dmin gives
+the best *sort* on this array is a yield question and needs the QA pipeline,
+not this file.
+
+### All four gates passed on the new geometry
+
+This is the result the section was run for. Every gate re-validated against the
+stock path on the first real batch of this recording and enabled:
+
+| gate | verdict at 512 ch / 60 um | validated on |
+|---|---|---|
+| `fused_detect` | enabled, **BLOCK_M=128 warps=4**, 15.6 ms/batch | 58,302,720 elements |
+| `fused_peaks` | enabled, config (128, 4) | 19,434,240 elements |
+| `fused_peel` | enabled | 15,618,246 elements |
+| `fast_kpp` | enabled (graph) | 10,364 labels |
+
+The `fused_detect` line is the informative one: the block size whose agreement
+was known to be shape-contingent picked **the same BLOCK_M=128** at a geometry
+it had never seen. That is evidence the config is not a coincidence of one
+recording — it is not proof that it generalises further, and the gate stays.
+
+### Timing and stage counts
+
+Arm A (all optimizations active) sorted the slice in **57.94 s**: 1920
+universal templates, 528,099 spikes and 1224 clusters from the universal pass,
+817,489 spikes and 1030 clusters from the learned pass, 905 units of which 743
+have good refractory periods. For scale, 20260724A's slice300 gives 600 units /
+481 good — the wider array finds more, which is what you would expect from
+~3x the tissue area.
+
+Arm B (all five `KILOSORT_NO_*` switches set) reproduced **528,099 spikes and
+1224 clusters exactly**, with universal detection at 35.35 s against arm A's
+22.20 s (1.59x) and template clustering at 7.80 s against 4.79 s (1.63x).
+
+| arm | switches | s |
+|---|---|---:|
+| A | none (all optimizations active) | **57.94** |
+| B | all five `KILOSORT_NO_*` set | **84.26** |
+| A2 | none (second run of A) | 45.69 |
+| | A vs B | **1.45x** |
+
+A2 ran the *same code as A* 12.25 s faster (45.69 vs 57.94), which is a 21%
+swing between two identical runs in one sitting. Arm A paid first-run costs
+this benchmark does not otherwise expose — Triton JIT compilation and autotune
+for four kernels at shapes never seen before, plus a cold page cache on a
+freshly written 3.07 GB slice. Quote the A-vs-B ratio, not A2-vs-B (1.84x),
+which would be flattered by exactly that. It is also a reminder that the
+same-session rule stated under *Cumulative* is not a formality.
+
+**1.45x, not the 2.26x slice300 gives on 20260724A** — and the reason is the
+geometry, not a regression. This array has 1920 universal templates against
+4048, so the detect body that §2 attacks is simply a smaller share of the sort.
+The optimizations are detection-weighted; on an array with half the templates,
+detection is half the prize. Worth stating plainly because a reader who sees
+2.51x in the headline and 1.45x here will otherwise assume something broke.
+
+### Byte-identical, three ways
+
+All three pairings, **23 of 23 files byte-identical, 0 differ**:
+
+| pairing | result |
+|---|---|
+| A vs B (fused vs stock) | 23/23 identical |
+| A vs A2 (same code twice) | 23/23 identical |
+| A2 vs B | 23/23 identical |
+
+So the optimization series is bit-identical on a second array geometry, at
+half the template count, with every gate enabled rather than falling back.
+
+Note A vs A2 came out clean here. That does **not** contradict the wobble
+section above: the wobble was only ever observed at production scale (13
+float32 of 33 M), and 20260724A's slice300 is likewise clean. A 300-batch slice
+does not have the statistical reach to see it, which is exactly why one clean
+slice comparison is not treated as proof anywhere in this file.
+
+Logs are one per arm, deliberately, under
+`scratchpad/20260514A_validation/logs/`:
+
+| log | arm |
+|---|---|
+| `00_make_slice.log` | slice construction |
+| `01_slice_A_fused.log` | all optimizations active |
+| `02_slice_B_stock.log` | all `KILOSORT_NO_*` set |
+| `03_slice_A2_fused.log` | second run of arm A (wobble control) |
+| `04_compare_A_vs_B.log` | the A/B verdict |
+| `05_compare_A_vs_A2.log` | same-code control |
+| `06_compare_A2_vs_B.log` | third leg |
+
+`run_slice_ab.sh` in that directory is the driver. Note it deliberately does
+**not** `set -u`: conda's own `activate.d` hooks read unset variables and abort
+the script before the first sort starts.
 
 ---
 
