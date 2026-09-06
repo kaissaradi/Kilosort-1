@@ -1930,3 +1930,69 @@ equivalent" change silently altered the full-file result.
 
 Even driving `_amax_kernel` to **zero** leaves 560.3 s. This is a real ~9% win,
 not a step toward 160 s.
+
+### 12b. The peel loop is overhead-bound, Astra #6 is dead, and max_peels=50 truncates
+
+**The loop's cost barely depends on how many spikes it peels.** Per-iteration
+measurement over 150 iterations (3 batches, 812 units, NT=10122):
+
+    peel_subtract = 0.1788 ms fixed + 0.2717 us per spike
+
+At the median 62 spikes the fixed part is **91%**. This is not a regression
+artifact of a narrow range -- the direct observation is that iterations 0-4
+(74.1 spikes) cost 0.202 ms and iterations 45-49 (22.9 spikes) cost 0.182 ms:
+**3.2x fewer spikes for 10% less time.**
+
+The consequence for Astra #4 is that "remove work from the peel loop" has almost
+nothing to remove. The loop's cost is set by its *iteration count*, which is
+pinned at `max_peels`, not by the work inside an iteration.
+
+**The guard is not the cause** (hypothesis tested and rejected).
+`fused_peel.py:405` does `torch.stack((phases_disjoint(...), (amp>0).all())).tolist()`
+every iteration -- a D2H copy that forces a host sync, 15,000 times per
+slice300 sort. It looked like the fixed cost. Measured, it is **16.7%** of
+peel_subtract (0.068 ms of 0.407 ms; note this split was measured with explicit
+syncs and so is inflated in absolute terms against the 0.193 ms event figure --
+the ratio is the usable part). Worth ~1 s of a 5.5 s peel loop, real but not the
+story. The remaining fixed cost is inside `_fused_phase`, whose grid does not
+shrink with the spike count. Both guard verdicts were constant across all 50
+iterations (`disjoint=1, amp_pos=1`).
+
+**Astra #6 answered: dirty unit x time coverage is far too high to exploit.**
+`torch.max(B, 0)` is recomputed over the full `(n_units, NT)` B every iteration,
+while `peel_subtract` only touches a ±nt window per spike. But the max reduces
+over *units*, so a column must be recomputed if any unit changed there, and the
+number that matters is dirtied **time columns**:
+
+| dirty time columns of B per iteration | |
+|---|---:|
+| mean | **55.4%** |
+| median | 67.3% |
+| min / max | 1.2% / 87.5% |
+
+A perfect dirty-column max would skip 44.6% of `max(B,0)`, which is 8.7% of
+(max + subtract) and under 2% of the loop. **Do not build this.** It confirms
+with a number what the shortlist already said about reviving time-only dirty
+peeling.
+
+**max_peels=50 truncates the learned pass, and the loss is heavily skewed.**
+The tuned profile sets `max_peels` 200 -> 50 (`run_kilosort4.py:60`); stock KS4
+defaults to 100. Replaying the peel to 200 iterations on 30 batches:
+
+| | |
+|---|---:|
+| iterations to convergence | median **57**, min 38, max 192 |
+| batches still finding spikes at iteration 50 | **21 / 30** |
+| per-batch share of spikes captured by 50 peels | median **98.9%**, mean 86.7%, min **29.8%** |
+| aggregate share of a 200-peel total | **73.3%** |
+
+The skew is the point: the typical batch loses ~1%, but busy batches both need
+more peels *and* contribute more spikes, so in aggregate 50 peels finds 73.3% of
+what 200 finds. `max_peels=100` reaches 89.8% at ~2x the peel-loop cost
+(+161.7 s in production), because cost is flat per iteration.
+
+Stated carefully: these are learned-pass *detections*, not accepted units. More
+peels also means more marginal, more-overlapped events, which may split or
+duplicate rather than become good units. Whether the missing 26.7% is signal or
+junk is a question for the QA pipeline, not for this file -- but the tuning
+decision that discarded it was never measured, and now it is.
