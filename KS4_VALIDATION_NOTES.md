@@ -1883,3 +1883,50 @@ Recorded so this target is not re-litigated: the 4x that took 1601.6 s to
 637.4 s came from four independent 2-7x kernel wins landing on stages that were
 then 58% and 32% of the sort. Those stages are still 77% of it, but the fat has
 been taken off the statements inside them.
+
+### 12a. Pricing Astra #1 properly: the fill is two kernels, and only one is the target
+
+`fused_detect._run` launches exactly two kernels, and they split the fill almost
+evenly (real inputs, batch 150, median of 20 reps):
+
+| kernel | produces | ms | share of fill |
+|---|---|---:|---:|
+| `_tm_fused_kernel` | `As`, `imaxs` | 12.963 | **55.0%** |
+| `_amax_kernel` | `Amaxs` | 10.602 | **45.0%** |
+
+`_tm_fused_kernel` **must stay dense**: `As` is the input to the threshold test
+that defines a candidate, so it cannot be deferred to candidates. Astra #1 can
+only touch `_amax_kernel`, which is 45% of the fill and **11.2% of the sort** --
+not the 24.8% the fill as a whole represents.
+
+`_amax_kernel` scales essentially linearly in its neighbour count, so it is
+really doing the work: NC2 = 1 / 10 / 25 / 50 / 100 gives 1.078 / 1.175 / 2.618
+/ 5.446 / 10.602 ms (9.83x from 1 to 100).
+
+**The halo, which the first estimate missed.** The peak test is not
+`Amax == As`. `Amaxs` is temporally pooled over `2*nt0+1 = 41` samples *before*
+the comparison, so evaluating the mask at a candidate `(k,m)` needs raw `Amax`
+over `m-nt0 .. m+nt0`. A candidate-only kernel must therefore compute `Amax` on
+the candidate set **dilated by ±nt0**, not on the bare candidate set. Measured
+over 4 batches:
+
+| | fraction of positions |
+|---|---:|
+| bare candidates `As > Th` | 1.977% |
+| dilated by ±`nt0` (what the mask actually needs) | **11.840%** |
+| dilation cost | **5.99x** |
+
+So the ceiling drops from 8.15x to **4.73x on `_amax_kernel`**, and from 1.65x
+to **1.55x on the fill**. Also measured: **99.01% of rows contain at least one
+candidate**, which kills any row-level gating scheme — there are no empty rows
+to skip.
+
+**Sort-level value of Astra #1, at its optimistic ceiling:** the fill goes
+156.6 s -> 101.0 s in production, saving **55.6 s of 630.8 s (8.8%)**, for
+575.2 s total and 2.78x overall. That assumes perfect compaction, no launch
+overhead on the compaction pass, and a new Triton kernel proven bit-identical --
+against a precedent (§ the max/min rewrite) where a similar "obviously
+equivalent" change silently altered the full-file result.
+
+Even driving `_amax_kernel` to **zero** leaves 560.3 s. This is a real ~9% win,
+not a step toward 160 s.
