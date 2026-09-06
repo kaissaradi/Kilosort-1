@@ -694,7 +694,76 @@ production sort, and detection and clustering are now roughly the same size.
   optimized production sort, against detection+peel at 76.3%.
 * **Where the profiling harnesses live.** Everything that verifies the claims in
   this file is in a session-local scratchpad under `/tmp`, which does not
-  survive a reboot. Not yet preserved in this repo — see below.
+  survive a reboot. Not yet preserved in this repo — see below. `tools/` is the
+  start of fixing this.
+
+---
+
+## 6. Measured and rejected: dirty-region peel
+
+Recorded so nobody builds it twice. **Rejected on measurement, before any
+kernel was written.**
+
+The idea: `run_matching`'s peel loop recomputes `torch.max(B, 0)`, the
+`max_pool1d`, the two comparisons and the `nonzero` over all `NT` columns on
+every one of up to `max_peels` iterations — but `peel_subtract` writes only
+`B[:, iX + trange]`, `trange = arange(-nt, nt+1)`. So B changes only within
+±`nt` of a spike, `Cfmax`/`imax` only there, and `cmax` (a `2nt+1` sliding max)
+only within ±`2nt`. A position that failed `cnd1 & cnd2` at iteration *t* and
+whose inputs did not change still fails it at *t+1*, so every new candidate must
+lie within ±`2nt` of one of iteration *t*'s spikes. Keep persistent full-width
+`Cfmax`/`imax`/`cmax`, recompute only the dirty columns. Over-approximating the
+dirty set is safe, so block granularity would have been fine. `max` and
+`max_pool` are *selections*, not accumulations, so restricted values are exactly
+equal — the only identity risk was `imax` tie-breaking.
+
+**It does not pay.** `tools/measure_peel_dirty_region.py` measures the dirty set
+against `NT` over a full slice300 sort (14,557 peel iterations, 815 units,
+NT 10,122, nt 61):
+
+| iter | median spikes | median dirty cols | dirty % |
+|---:|---:|---:|---:|
+| 0 | 82 | 10,075 | 99.5% |
+| 5 | 69 | 9,780 | 96.6% |
+| 20 | 62 | 9,380 | 92.7% |
+| 30 | 53 | 8,354 | 82.5% |
+| 40 | 27 | 4,447 | 43.9% |
+| 45 | 24 | 3,888 | 38.4% |
+
+**Total reduction 1.27× — 21.5% of the columns are provably redundant.** The
+peel does not converge: ~61 spikes per iteration at the median, each spreading a
+`4nt+1 = 245`-column dirty window, so ~60 spikes already saturate NT ≈ 10k. The
+premise ("late iterations touch almost nothing") is simply false for this data.
+1.27× on ~30% of one stage is ~4% of the sort, for a Triton kernel plus an
+`imax` tie-break identity argument. Not worth it. **Note this is data-dependent**
+— on a probe where the peel converges in a handful of iterations the arithmetic
+would look completely different, so re-measure before rejecting it elsewhere.
+
+## Where the learned pass actually spends its time
+
+Statement-level, same slice300 sort, CUDA-synced per block
+(`tools/profile_peel_statements.py`). Coarse blocks, because per-statement syncs
+inflate exactly the small items; the two agree to 0.3 s of 10.3 s, so the
+attribution is trustworthy.
+
+| block | s | share | µs/call |
+|---|---:|---:|---:|
+| `peel_subtract` (already fused, §3) | 4.70 | 45.7% | 323.0 |
+| condition tail: relu→square→edges→`max_pool1d`→`cnd1`/`cnd2`→`nonzero` | 1.63 | 15.8% | 111.1 |
+| store tail: `imax[iX]`, 4 slice writes, `B[iY,iX]`, `s[iY]`, `**.5` | 1.46 | 14.2% | 50.2 |
+| `torch.max(B, 0)` | 1.25 | 12.2% | 85.6 |
+| `einsum` (once per batch) | 0.70 | 6.8% | 2329.3 |
+| `conv1d` (once per batch) | 0.44 | 4.3% | 1469.0 |
+
+Two things this corrects:
+
+* **`torch.max` is not a problem.** 33 MB (815×10,122 float32) in 85.6 µs is
+  384 GB/s — near peak. The notes' earlier "10.3%" reading invited optimising it;
+  there is nothing there to win.
+* **The two tails are 30% of the pass and are almost pure launch overhead.**
+  Roughly 20 kernels per peel iteration, each on a 10,122-element (40 KB) array —
+  40 KB at 31 µs is 1.3 GB/s, three orders off bandwidth. This, not the
+  reductions, is the remaining target in the learned pass.
 
 ---
 
