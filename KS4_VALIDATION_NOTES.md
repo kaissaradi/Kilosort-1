@@ -2491,3 +2491,101 @@ different sections of this file, five days apart, both concluded something
 about occupancy from a measurement that could not see occupancy. The check
 that catches it is cheap and should be the default -- **always time both
 sides, and compare against serial.**
+
+### 12j. The peel loop takes 58 spikes per iteration and could take 161-354
+
+The one surviving structural idea, now measured (`peel_density.py`). It never
+depended on the device being idle -- it is an iteration-count argument.
+
+`peel_subtract` is hooked, so `B` and the real selection are observed live at
+every iteration of the real loop. No replica, no trajectory divergence, sort
+untouched. 200 probed iterations over 4 batches, 812 units, NT=10122, nt=61,
+`Th_learned`=8.
+
+**Two independence relations, both read off `ctc`'s exact-zero pattern.**
+`prepare_matching` builds `ctc = einsum('ikl,jml,kmt->ijt', U, U, WtW)`, and
+the subtract is `B[:, iX + trange] -= amp * ctc[:, iY, :]`, so a spike of unit
+`v` perturbs row `u` exactly when `ctc[u,v,:] != 0`:
+
+| relation | meaning | density | partners/unit |
+|---|---|---:|---:|
+| LOOSE | do `u`,`v` perturb *each other*? | 13.4% | 109 of 812 |
+| STRICT | do `u`,`v` both write into some *common* row? | 45.3% | 368 of 812 |
+
+LOOSE is what detection identity needs. STRICT is what a *single-phase* peel
+needs: two spikes uncoupled to each other can still both land on a third row,
+and float subtraction is not associative, so their write order changes `B`
+bitwise. The existing loop already respects this -- it splits into `n=2`
+phases guarded by `phases_disjoint`, because "advanced-index `-=` is
+last-write-wins on overlapping `trange` windows."
+
+**Measured per iteration:**
+
+| | median | mean | min | max |
+|---|---:|---:|---:|---:|
+| `n_now` -- what the real 1-D test selects | **58.0** | 51.0 | 5 | 87 |
+| per-unit peaks above threshold | 1937.0 | 2860.6 | 32 | 10121 |
+| `n_fat` LOOSE -- conflict-free, ordered writes | **354.0** | 321.4 | 16 | 567 |
+| `n_fat` STRICT -- conflict-free, single phase | **161.5** | 139.1 | 7 | 226 |
+| distinct units in the accepted set | 218.0 | 183.2 | 15 | 278 |
+| max spikes from any one unit | 10.5 | 10.4 | 1 | 26 |
+| median time separation of the real selection | 138.0 | 146.9 | 100 | 808 |
+
+| | density gain | projected iterations |
+|---|---:|---:|
+| LOOSE | **5.94x** median | **8.2** of 50 |
+| STRICT | **2.70x** median | **18.0** of 50 |
+
+Three checks that the number is real. `n_now` median 58 matches §12b's
+independently measured "median 62 spikes/iteration", so the hook is watching
+the loop it claims to. The accepted set spreads over a median of 218 distinct
+units with at most 10.5 spikes from any one, so it is not a degenerate row
+inflating the count. And the real selection's median time separation is 138
+samples against a `2*nt` window of 122 -- the 1-D test is landing just past
+its own exclusion width, which is the signature of a constraint that binds.
+
+**Worth, via §12b's own cost model** (`0.1788 ms fixed + 0.2717 us/spike`, so
+92% fixed at 58 spikes). Total spikes peeled is held constant; the per-spike
+term (~4.1% of the loop, ~6.7 s) does not shrink, the fixed-per-iteration term
+(~155.0 s of the 161.7 s loop) scales with iteration count:
+
+| | peel loop | saves | sort |
+|---|---:|---:|---:|
+| today, 50 iterations | 161.7 s | -- | 637.4 s |
+| STRICT, 18 iterations | ~62.5 s | **~99 s** | ~538 s |
+| LOOSE, 8.2 iterations | ~32.1 s | **~130 s** | ~507 s |
+
+That is far larger than anything else this investigation has found, and it is
+the first lever whose size was established by measurement rather than assumed.
+
+**Four caveats, none of them small.**
+
+1. **Not byte-identical to today's output.** Each individual subtraction is
+   the same arithmetic on disjoint memory, but the trajectory differs, and
+   today's run truncates at `max_peels=50` at 73.3% of a 200-peel total
+   (§12b). A loop converging in ~18 fat iterations finds *more* spikes than
+   today. Its validation target is stock `max_peels=200`, not the current 50
+   -- same fixed point, reached far cheaper. Whether the extra spikes are
+   signal or junk is the QA pipeline's question, as with `max_peels` itself.
+2. **A fixed spatial partition will not deliver this.** The obvious
+   implementation -- split units into disjoint spatial groups and run the
+   existing 1-D test per group -- fails, because at 45.3% STRICT (and 13.4%
+   LOOSE) edge density the coupling graph is almost certainly one connected
+   component. What produced these numbers is a per-iteration greedy maximal
+   independent set, run here on the CPU in Python. On the GPU that is a real
+   piece of work and its cost is not in the projection above.
+3. **A cheaper approximation is untested.** Units whose channel footprints are
+   far enough apart are certainly uncoupled, so a geometric checkerboard over
+   the array with a guard band would be write-safe by construction and needs
+   no greedy. It would admit somewhere between `n_fat` STRICT and `n_now`
+   spikes per iteration. Not measured -- flagged as the implementable variant
+   worth pricing next.
+4. **These are ceilings.** 161.5 and 354 are what a perfect selector could
+   take from the state the real loop was in; no implementation will reach
+   them exactly.
+
+**Where this leaves the totals.** Combining the demonstrated statement-level
+work (~59 s, §12g), clustering overlap (~10-20 s, §12i) and this
+(~99-130 s): **637.4 s -> roughly 430-465 s**, a further 1.37-1.48x. Still
+not 300 s, and nowhere near 160 s, but for the first time since §12 there is a
+lever on the board big enough to be worth building.
