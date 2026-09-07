@@ -2202,3 +2202,52 @@ and clustering has landed the same way: real compute, an already-tried and
 refuted trade, or too small to matter. The 160 s target's answer from §12
 stands, now on a fully self-consistent accounting of where clustering's 111.4 s
 actually goes.
+
+### 12f. Postprocessing priced: the last stage nobody had looked at
+
+Postprocessing sat at 1.00x through every change in this file (21.5 -> 21.6 s)
+because it was never touched, not because it was checked and found optimal.
+`io.save_to_phy` does three different kinds of thing -- real compute, array
+assembly, and disk I/O -- so it was worth knowing which one actually dominates
+before writing it off as small-and-therefore-irrelevant.
+
+Sync'd host timing around every named sub-call, one full slice300 sort
+(`save_to_phy` called once per pass):
+
+| piece | share of `save_to_phy` |
+|---|---:|
+| `make_pc_features` | **42.9%** |
+| `np.save` (19 calls, disk I/O) | 36.0% |
+| `CCG.refract` (refractory/contamination) | 15.1% |
+| `CCG.similarity` (pairwise template correlation) | 3.2% |
+| `remove_duplicates` | 0.6% |
+
+Two importing traps worth recording since they'd silently no-op a lazier hook:
+`remove_duplicates` is bound into `io.py`'s namespace by
+`from kilosort.postprocessing import (remove_duplicates, ...)` -- a direct name
+import, so it has to be patched as `io.remove_duplicates`, not
+`kilosort.postprocessing.remove_duplicates` (patching the original module
+would not touch `io.py`'s already-bound copy). `CCG` is imported as
+`from kilosort import CCG` -- a module reference, so `io.CCG.similarity` and
+`io.CCG.refract` ARE late-bound and patchable directly, unlike `remove_duplicates`.
+
+**`make_pc_features` is the single largest piece of postprocessing, ahead of
+all disk I/O combined.** Scaled to production's 21.6 s: ~9.3 s
+`make_pc_features`, ~7.8 s I/O, ~3.3 s `CCG.refract`, ~0.7 s `CCG.similarity`,
+~0.1 s `remove_duplicates`. Not further decomposed -- at this absolute size
+(9.3 s, 1.5% of the whole sort) even a 2x here is ~4.6 s, and postprocessing's
+1.00x was never the thing standing between this pipeline and 160 s. Recorded
+so "postprocessing is untouched" reads as "measured and small," not "unknown."
+
+### Session close-out
+
+Every stage of this sort has now been measured at least once: the two
+detection passes and their dominant kernels (already exhaustively tuned before
+this pass began -- config ladders, live-tile LUTs, roofline analysis, all
+predating and outside this "no code changes" investigation), both clustering
+passes end to end (kmeans++, `swarmsplitter.split`, `neigh_mat`, the
+alternating-assignment loop), the peel-loop setup (`conv1d`+`einsum`), and now
+postprocessing. Every single one came back one of three ways: real,
+already-necessary compute; an accuracy trade already tried and refuted; or too
+small in absolute seconds to move a 41 s gap. The 160 s target's answer,
+unchanged since §12: **not reachable from this pipeline's current computation.**
