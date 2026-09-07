@@ -2251,3 +2251,55 @@ postprocessing. Every single one came back one of three ways: real,
 already-necessary compute; an accuracy trade already tried and refuted; or too
 small in absolute seconds to move a 41 s gap. The 160 s target's answer,
 unchanged since §12: **not reachable from this pipeline's current computation.**
+
+### 12g. Is 300 s reachable? No -- not even by destroying the learned peel loop
+
+A softer target than 160 s: half of the current 637.4 s. This section answers
+it from data already collected in §12/12a-f -- no new sort was run, and no code
+was touched; it is an analytical projection from the per-iteration cost model
+in §12b and the fill-kernel ceiling in §12a.
+
+**The real, byte-identical ceiling is ~578.6 s, not 300 s.** Two genuine
+levers were found this session and neither is shipped yet:
+
+| lever | saves | new total |
+|---|---:|---:|
+| Astra #1: rebuild `_amax_kernel` on the dilated candidate set (§12a) | 55.6 s | 581.8 s |
+| Astra #6: dirty-time-column `max(B,0)` (§12b, explicitly "do not build") | 3.2 s | 578.6 s |
+
+578.6 s is 1.10x further than today, 2.77x overall. This is the honest floor
+if every byte-identical idea this investigation found were actually built.
+Reaching 300 s needs a further 1.93x on top of that -- **278.6 s that no
+byte-identical lever identified anywhere in this pipeline accounts for.**
+
+**Even the most destructive non-byte-identical cut available doesn't reach
+it.** §12b's cost model (`peel_subtract = 0.1788 ms fixed + 0.2717 us/spike`,
+91% fixed at the median) says the peel loop's cost is set by iteration count,
+not spike count, and 21/30 probed batches were still running at iteration 50
+(median convergence is iteration 57, above the cap) -- so the loop is capped,
+not converged, and its cost scales close to linearly with `max_peels` down to
+small values. Setting `max_peels = 0` -- i.e. the learned pass emits **no
+spikes at all** -- removes the entire 161.7 s peel-loop line, not a fraction
+of it:
+
+    630.8 (stage-timer total) - 156.6 (fill, if also driven to zero) - 161.7 (peel loop, entirely gone)
+    = 312.5 s
+
+That is fill *and* peel loop both driven to zero -- the two largest blocks in
+the sort, one of which (fill) is already known to have a real ceiling of only
+1.55x, not infinity, and the other of which (peel loop) is the entire output
+of the learned detection pass. 312.5 s is the floor of a sort that no longer
+detects anything in its second pass, and it is still **12.5 s short of 300 s**
+before clustering (111.4 s, independently shown compute-bound with no lever in
+§12c/12e) contributes anything. `conv1d`+`einsum`'s 32.7 s setup is not even
+in this subtraction -- it seeds the first candidates before the loop starts
+and runs regardless of `max_peels`.
+
+**Conclusion.** 300 s is not reachable by any byte-identical means this
+investigation found (real ceiling ~578.6 s), and is not reachable even by the
+single most destructive cut available (zeroing the entire learned peel loop,
+which is not a sort anymore, landing at 312.5 s) without also cutting into
+clustering, which has no lever either. The 160 s and 300 s targets fail for
+the same underlying reason: the three dominant blocks are compute-bound, not
+overhead-bound, and this pipeline's actual headroom -- everywhere this session
+looked -- is ~59 s, not ~280-340 s.
