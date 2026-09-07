@@ -2589,3 +2589,93 @@ work (~59 s, §12g), clustering overlap (~10-20 s, §12i) and this
 (~99-130 s): **637.4 s -> roughly 430-465 s**, a further 1.37-1.48x. Still
 not 300 s, and nowhere near 160 s, but for the first time since §12 there is a
 lever on the board big enough to be worth building.
+
+**§12k prices the selection step §12j never costed, and the answer is that
+this projection does not survive it. Read on before building anything.**
+
+### 12k. The fat peel is MEASURED SLOWER: selection, not subtraction, is the cost
+
+§12j priced the fat peel by counting spikes and applying §12b's cost model for
+`peel_subtract`. It never asked what it costs to *find* the fat set. That
+turns out to be the whole story, and the sign of the result flips.
+
+Timed through the real kernel on clones taken before each real call
+(`peel_checker.py`, 26 probed iterations, 812 units, NT=10122):
+
+| | ms/call | peak MiB |
+|---|---:|---:|
+| `peel_subtract`, 61 spikes (real) | 0.1770 | 0.00 |
+| `peel_subtract`, 70 spikes (checkerboard) | 0.1742 | 0.00 |
+| **selection: current 1-D test** | **0.0574** | **0.17** |
+| selection: per-unit pooled max (§12j's set) | **2.0358** | **94.06** |
+| selection: per-tile checkerboard | **0.2549** | **24.77** |
+
+`peel_subtract` is confirmed flat in spike count -- 70 spikes cost *less* than
+61, within noise, exactly as §12b's model says. That half of §12j holds. But
+the current 1-D selection costs 0.0574 ms, while making the test spatially
+aware costs 0.25 ms (per tile) to 2.04 ms (per unit) -- **4x to 35x more than
+the subtract it is trying to amortise.**
+
+**The checkerboard, priced end to end and verified:**
+
+| | per-iteration | iterations | total | |
+|---|---:|---:|---:|---:|
+| current | 0.2344 ms | 50 | 11.72 ms | 61 spikes/iter |
+| checkerboard | 0.4292 ms | 43.9 | 18.83 ms | 70 spikes/iter |
+
+**Verified speedup: 0.62x -- the checkerboard is 1.6x SLOWER.** Not projected,
+measured, on the real kernel.
+
+**Why the partition barely helps: the array is smaller than the coupling
+radius.** Unit positions span 720 x 780 um, and the maximum distance between a
+STRICT-coupled pair is **579 um** (p99 446 um). Stripes must be at least R
+wide to be independent, so only 2 fit -- one tile per colour. Processing one
+colour is processing half the array, which is why the density gain is 1.14x
+and not the 2.70x §12j's greedy reached. On this geometry a unit couples to
+most of the array, and there is simply not enough space to partition.
+
+**Applying the same correction to §12j's own numbers**: at 8.2 iterations with
+per-unit selection, 8.2 x (0.177 + 2.036) = 18.1 ms against the current
+11.72 ms -- **0.65x, also slower.** §12j's ~99-130 s saving was an artifact of
+costing only half the loop. For the LOOSE variant to deliver even a 2x win,
+selection would have to come in under **0.54 ms**, against 2.04 ms today.
+
+**What that target actually requires.** The cost is `max_pool1d` with a
+123-wide window over (812, 10122): ~1e9 comparisons and a materialised 94 MiB
+output. A van Herk / Gil-Werman sliding-window maximum is O(n) -- ~3
+comparisons per element regardless of window width -- which is ~40x fewer
+operations and needs no full-size intermediate. That single kernel is the
+whole difference between this idea working and not working. It does not exist
+in the codebase and nothing here says it would hit the target.
+
+**Memory, which is the other reason not to build the per-unit variant.** Peak
+allocation per peel iteration: 0.17 MiB today, 24.77 MiB checkerboard, 94.06
+MiB per-unit. `peel_subtract` itself allocates nothing (it is in-place). The
+fat schemes scale as `n_units x NT`, and both grow with recording length and
+array size -- so the variant that looked best on paper is also the one that
+would OOM first on a smaller card or a longer dataset. Worth stating plainly
+given this pipeline already has a MemFree-based monitor killing runs.
+
+**Two harness bugs found and fixed en route**, both caught by an implausible
+number rather than by the code looking wrong:
+
+1. Striping on x when x-span was reported as 120 um -- narrower than the
+   coupling radius -- so every unit fell in one tile and the scheme was never
+   exercised. Fixed by striping the longer axis.
+2. The 120 um itself was wrong: `U` is `(n_units, n_pcs, n_chan)`, not
+   `(n_units, n_chan, n_pcs)`, so `(U**2).sum(-1).argmax(1)` returned an
+   argmax over 3 PCs instead of 519 channels. The axis order is fixed by
+   `prepare_matching`'s einsum (`l` is contracted as the channel axis) and by
+   `U_time = einsum('ijk,jl->ikl', U, wPCA)` being documented
+   `(n_units, n_chan, nt)`. A 519-channel array "spanning 120 x 30 um" is the
+   tell.
+
+**Status of the peel idea: not refuted in principle, but no implementable
+variant measured today is faster than what ships.** The ceiling in §12j is
+real; the path to it is not, and it runs through a sliding-window-max kernel
+nobody has written. **Nothing here should be built on the strength of §12j's
+99-130 s.**
+
+**Corrected totals.** Demonstrated headroom returns to §12g's ~59 s plus
+§12i's ~10-20 s of clustering overlap: **637.4 s -> ~560-570 s**. The
+430-465 s figure at the end of §12j is withdrawn.
