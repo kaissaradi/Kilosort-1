@@ -2396,3 +2396,98 @@ cheap conservative bound admits a candidate, rather than densely everywhere
 because "`As` feeds the threshold test." None of these makes a statement
 faster; all of them stop the device from idling. No number is claimed for any
 of them yet.
+
+### 12i. §12h's central claim was wrong: the device is NOT idle. Both sides now measured
+
+**§12h measured the tenant and inferred the victim -- the same error it
+accuses §12 of making.** "A 1.1 TFLOP matmul runs at 0.97-1.02x alongside
+kmeans++" was reported as "the device is idle." It is not evidence for that. A
+large GEMM takes essentially all SMs; the small dependent kernels it displaces
+simply wait. The tenant looks free precisely *because* the victim absorbs all
+the contention. The only measurement that settles it is the round trip: **does
+A running concurrently with B beat A then B?**
+
+§12h's own depth sweep already contained the refutation, unread:
+
+| co-tenant | tenant alone | tenant now | kmeans++ alone | kmeans++ now | serial | concurrent |
+|---|---:|---:|---:|---:|---:|---:|
+| 8x matmul | 79.33 ms | 81.89 ms (1.03x) | 22.25 ms | 103.3 ms (**4.64x**) | 101.6 ms | 103.3 ms |
+
+Concurrent is *slower* than serial. There was never any spare capacity; the
+tenant was winning a fight, not filling a gap.
+
+**Measured properly, in-sort, both sides timed** (`capacity_v3.py`; every call
+sync-wrapped, probed calls compared against un-probed calls of the same
+function in the same sort):
+
+| block | tenant | block solo | block w/ tenant | tenant solo | tenant now | serial | concurrent | **gain** |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `template_match` | compute | 27.57 | 38.00 | 9.80 | 9.93 | 37.36 | 38.00 | **0.98x** |
+| `template_match` | bandwidth | 27.57 | 37.67 | 10.43 | 35.81 | 37.99 | 37.67 | **1.01x** |
+| `run_matching` | compute | 17.88 | 27.88 | 9.80 | 9.92 | 27.68 | 27.88 | **0.99x** |
+| `run_matching` | bandwidth | 17.88 | 28.37 | 10.43 | 12.27 | 28.31 | 28.37 | **1.00x** |
+
+**Gain is 1.00x on every combination.** Both detection passes fully occupy the
+device; extra work costs exactly what it costs run separately. §12's "real
+compute" verdict for the 486.6 s of detection stands, and §12h's retraction of
+it is itself retracted.
+
+The tenant column also identifies *which* resource each block saturates, which
+is a genuinely new and coherent fact: during `template_match` the bandwidth
+tenant slows **3.4x** (10.43 -> 35.81 ms) while the compute tenant is
+untouched (1.01x). That is exactly what `fused_detect.py`'s own roofline
+measurement said -- the fill is DRAM-bound, and it is using the DRAM.
+`run_matching` slows the bandwidth tenant only 1.18x, so it is less
+bandwidth-hungry, but its overlap gain is still 1.00x.
+
+**Do independent clustering chains overlap with each other?** The one question
+none of the co-tenant probes asked, since a GEMM is the wrong proxy for the
+real workload. N threads, one stream each, so a thread blocking on its own
+host read does not stop the others issuing (graph path off -- `_CAPTURE_STREAM`
+/ `_POOL` are module globals and concurrent capture would race):
+
+| chains | sequential | threaded | speedup |
+|---:|---:|---:|---:|
+| 1 | 36.19 ms | 40.99 ms | 0.88x |
+| 2 | 70.58 ms | 65.07 ms | 1.08x |
+| 4 | 141.18 ms | 113.39 ms | **1.25x** |
+| 8 | 282.79 ms | 242.98 ms | 1.16x |
+
+Real, but small and non-monotonic -- and measured on the **ungraphed** path,
+which costs 36.19 ms/chain against the shipped graphed path's 22.25 ms. The
+shipped path has already collected most of what overlap would buy, so its
+remaining headroom is *less* than 1.25x, not more. Call it ~10-20 s of the
+111.4 s clustering budget, optimistically.
+
+**What survives §12i, and why.**
+
+* **Batching/overlapping clustering centers** survives at a much reduced
+  value (~10-20 s, not the "most of 111.4 s" §12h implied). Still
+  byte-identical-compatible: centers are independent and `fast_kpp` re-seeds
+  to a constant per call (§12h), so that part of §12h stands.
+* **The peel loop's spatial partition survives, on grounds that never
+  depended on occupancy.** It is an *iteration-count* argument, not an idle-
+  device argument: `_fused_phase`'s grid does not shrink with spike count
+  (§12b), so each of the 50 iterations pays a near-fixed full-grid cost to
+  peel a median of 62 spikes. Peeling 5x more spikes per iteration costs
+  barely more per iteration (+0.2717 us/spike) and needs ~5x fewer of them.
+  A saturated device does not refute this; it is about doing fewer passes,
+  not about filling gaps.
+* **Bound-and-prune on the fill is now the most interesting unexplored idea,
+  not the least.** If detection is genuinely DRAM-saturated, the only lever
+  left is to *move less data*, which is exactly what a conservative cheap
+  bound would do -- compute `As` exactly only where the bound admits a
+  candidate. Untested.
+
+**Net headroom, corrected again.** Back to roughly §12g's ~59 s of
+statement-level wins, plus ~10-20 s of clustering overlap, plus whatever the
+two structural ideas above prove to be worth (unmeasured, and the peel one is
+not byte-identical to today's truncated output). 637.4 s -> ~557 s on what is
+actually demonstrated. **160 s and 300 s both remain out of reach**, and the
+brief §12h suggestion otherwise was an artifact of a one-sided measurement.
+
+Recorded at length because the failure mode is the interesting part: two
+different sections of this file, five days apart, both concluded something
+about occupancy from a measurement that could not see occupancy. The check
+that catches it is cheap and should be the default -- **always time both
+sides, and compare against serial.**
