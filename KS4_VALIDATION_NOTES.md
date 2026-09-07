@@ -2303,3 +2303,96 @@ clustering, which has no lever either. The 160 s and 300 s targets fail for
 the same underlying reason: the three dominant blocks are compute-bound, not
 overhead-bound, and this pipeline's actual headroom -- everywhere this session
 looked -- is ~59 s, not ~280-340 s.
+
+**§12h supersedes this conclusion.** "Compute-bound" was inferred from
+GPU-busy == host-busy, which is not the same claim, and the difference is the
+whole answer. Read on.
+
+### 12h. The blind spot: "GPU-bound" was measured as "the stream is never empty"
+
+Every conclusion in §12-12g rests on one inference: `gpu_busy.py` measured
+`clustering_qr.cluster` at host 5.67 s / gpu 5.67 s / **gap 0.1%**, and that
+was read as "fully GPU-bound", from which "real compute, no lever" followed
+for the rest of the section. **That inference is wrong.** A 0.1% host gap
+means the stream always has work queued. It says nothing whatsoever about how
+much of the *device* that work uses. A chain of 200 dependent kernels each
+occupying 3% of the SMs keeps the stream 100% busy and the GPU 97% idle, and
+every measurement in this file would report it as "GPU-bound".
+
+**Measured directly** (`spare_capacity.py`). A 4096x4096 fp32 matmul x8
+(~1.1 TFLOP) is queued on its own stream and timed with CUDA events on that
+stream, alone and then again with a real `kmeans_plusplus` call running
+concurrently on a second stream. Both streams non-default, so PyTorch's legacy
+default-stream synchronisation cannot serialise them:
+
+| kmeans++ input | kmeans++ alone | matmul alone | matmul + kmeans++ | slowdown |
+|---|---:|---:|---:|---:|
+| 1500 x 96 | 25.48 ms | 81.06 ms | 82.66 ms | **1.02x** |
+| 5000 x 96 | 23.81 ms | 80.44 ms | 82.02 ms | **1.02x** |
+| 16000 x 96 | 38.45 ms | 82.89 ms | 80.63 ms | **0.97x** |
+
+**A 1.1 TFLOP matmul runs for free alongside clustering.** The device is not
+doing 111.4 s of arithmetic; it is spending 111.4 s walking a serial
+dependency chain of kernels far too small to fill it. This is also exactly why
+§12c found replay flat at 108 us/iteration across an 11x spike range: the
+work never got big enough to matter.
+
+**Naive streams do not collect this** (`occupancy_probe.py`: K=8 independent
+calls, sequential vs. on 8 streams, overlap 0.88x / 1.11x / 0.99x -- i.e.
+none). The cause is not device saturation, it is that `kmeans_plusplus` does a
+host read at the end of every call, so the host blocks on center A before it
+ever issues center B. A fixable implementation detail, not physics.
+
+**The centers are independent, and provably so.** `clustering_qr.run`'s loop
+(`for jj in xcent: for kk in ycent:`) calls `get_data_cpu` -> `cluster()` ->
+`kmeans_plusplus` on spatially disjoint spike sets and only appends to a
+result list. And `fast_kpp._graph_loop` does `torch.manual_seed(seed)` at
+**line 226, on entry to every call**, with `seed` a constant -- so each
+center's RNG stream is a function of `seed` alone, not of call order. There is
+no cross-center coupling of any kind to preserve. Concurrency here is
+byte-identical by construction; the only mechanical change needed is a
+per-call `torch.Generator` in place of the global one (itself bitwise
+checkable, and the module already validates far subtler identities).
+
+**The same question is now open on the peel loop**, which is the larger prize
+at 161.7 s and which §12b diagnosed as "launch-bound, 91% fixed cost per
+iteration" -- then concluded "nothing to remove." Under the corrected reading
+that diagnosis says the opposite: a loop whose cost does not depend on how
+much work it is given is a loop running on an idle device. Not yet measured
+with the co-tenant probe.
+
+**And the peel loop serialises spikes that cannot interact.** The peak test
+(`fused_peel_cond.py`) is
+
+    Cfmax = max(B, 0)                       # collapses ALL n_units -> (NT,)
+    cmax  = max_pool1d(Cfmax, 2*nt+1, ...)  # 1-D temporal local max
+    cnd   = (cmax > Th2) & (|cmax - Cfmax| < 1e-9)
+
+The unit axis is reduced away *before* the local-max test, so two spikes
+within `2*nt+1` = 123 samples (~4 ms at 30 kHz) can never be peeled in the
+same iteration **even when they sit at opposite ends of a 519-channel array
+and share no channels at all**. §8 already measured `ctc` at 89% exact zeros
+-- most unit pairs do not interact -- and §12b measured the disjointness guard
+returning `disjoint=1` on all 50 iterations, i.e. the selected set was always
+already disjoint and never once approached the limit. The loop is paying ~50
+near-identical fixed costs to peel spikes that overwhelmingly do not touch
+each other. A per-spatial-group peak test, unioned, would peel far more per
+iteration; disjoint subtractions commute exactly (disjoint memory, no shared
+accumulation), so no arithmetic changes.
+
+Stated honestly: that one is **not** byte-identical to today's output. Today's
+run truncates at `max_peels=50`, which §12b measured at 73.3% of a 200-peel
+total; converging in ~10 fat iterations would find *more* spikes, and the
+`nonzero` row order written into `st` would change. Its validation target is
+stock `max_peels=200`, not the current 50 -- same fixed point, reached far
+cheaper.
+
+**Revised view of the headroom.** §12g's "~59 s of headroom" measured how much
+faster these *statements* could run. It never asked whether the device was
+busy while they ran. It is not. The unexamined levers are structural --
+overlap independent centers, peel spatially independent spikes together, and
+(untested) bound-and-prune the fill so `As` is computed exactly only where a
+cheap conservative bound admits a candidate, rather than densely everywhere
+because "`As` feeds the threshold test." None of these makes a statement
+faster; all of them stop the device from idling. No number is claimed for any
+of them yet.
