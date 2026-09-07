@@ -257,7 +257,8 @@ def select_shank(probe, shank_idx):
 
 def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
                 data_dtype=None, save_extra_vars=False,
-                save_preprocessed_copy=False, skip_dat_path=False):
+                save_preprocessed_copy=False, skip_dat_path=False,
+                save_pc_features=True):
     """Save sorting results to disk in a format readable by Phy.
 
     Parameters
@@ -402,13 +403,21 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
     # This will momentarily copy tF which is pretty large, but it's on CPU
     # so the extra memory hopefully won't be an issue.
     tF = tF[kept_spikes]
-    pc_features, pc_feature_ind = make_pc_features(
-        ops, spike_templates, spike_clusters, tF
-        )
-    np.save(results_dir / 'pc_features.npy', pc_features)
-    np.save(results_dir / 'pc_feature_ind.npy', pc_feature_ind)
-    log_performance(logger, level='debug', header='save_to_phy, pc features',
-                    reset=True)
+    # `pc_features.npy` is only read by Phy's feature views. The MEA pipeline
+    # deletes it immediately after the sort (utilities/pipeline.sh and
+    # mea/transfer.py both list it as an intermediate), so computing it costs
+    # make_pc_features plus a multi-GB write whose only consumer is `rm`.
+    # Default stays True so stock Kilosort behaviour is unchanged.
+    if save_pc_features:
+        pc_features, pc_feature_ind = make_pc_features(
+            ops, spike_templates, spike_clusters, tF
+            )
+        np.save(results_dir / 'pc_features.npy', pc_features)
+        np.save(results_dir / 'pc_feature_ind.npy', pc_feature_ind)
+        log_performance(logger, level='debug', header='save_to_phy, pc features',
+                        reset=True)
+    else:
+        logger.info('skipping pc_features (save_pc_features=False)')
 
     # contamination ratio
     acg_threshold = ops['settings']['acg_threshold']

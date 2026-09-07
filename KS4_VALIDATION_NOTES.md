@@ -2679,3 +2679,53 @@ nobody has written. **Nothing here should be built on the strength of §12j's
 **Corrected totals.** Demonstrated headroom returns to §12g's ~59 s plus
 §12i's ~10-20 s of clustering overlap: **637.4 s -> ~560-570 s**. The
 430-465 s figure at the end of §12j is withdrawn.
+
+### 12m. THE STAGE MIX MOVES UNDER max_peels, AND IT DEMOTES ASTRA #1
+
+Every priority in §12/12a-l was priced at `max_peels=50`. The mosaic evidence
+(see SORTER_QA_20260514A.md §8/8.1) says 100 is the right setting -- it recovers
++24.9% distinct RGCs. Re-measuring the stage mix at 100 changes what is worth
+optimizing. 20260514A/data003, `ops['runtime_*']`, seconds:
+
+| stage | mp=50 | mp=100 | mp=200 | d(100-50) | share 50 -> 100 |
+|---|---:|---:|---:|---:|---|
+| st0 (universal detect) | 26.26 | 26.17 | 25.46 | **-0.09** | 35.7% -> **25.1%** |
+| st (learned / peel) | 24.09 | 39.48 | 51.45 | **+15.39** | 32.8% -> **37.9%** |
+| clu (cluster final) | 7.53 | 19.34 | 24.19 | **+11.81** | 10.2% -> **18.6%** |
+| clu0 (cluster temp) | 8.75 | 8.72 | 9.02 | -0.03 | 11.9% -> 8.4% |
+| merge | 2.92 | 5.74 | 6.78 | +2.83 | 4.0% -> 5.5% |
+| postproc | 1.12 | 1.85 | 2.10 | +0.73 | 1.5% -> 1.8% |
+| **total** | **73.49** | **104.10** | **121.75** | **+30.61** | |
+
+**Three consequences.**
+
+1. **`st0` is invariant in max_peels** (26.26 -> 26.17 -> 25.46, flat within noise,
+   exactly as expected -- universal detection runs before the peel). So raising
+   max_peels DILUTES it: 35.7% -> 25.1% of the sort. **Astra #1 targets
+   `_amax_kernel`, which lives in `fused_detect` and therefore in `st0`.** Its
+   headline "8.8% of the sort" was computed at mp=50; at mp=100 the same absolute
+   saving is **~6.2%**. Astra #1 is now the THIRD-ranked target, not the first.
+
+2. **Final clustering is the surprise.** `clu` grows **2.57x** (7.53 -> 19.34 s) and
+   is **39% of the entire cost of running max_peels=100**, nearly matching the peel's
+   own +15.39 s. §12c/12e wrote clustering off as compute-bound with no lever, which
+   was reasonable when it was 10% of the sort; at 18.6% that conclusion deserves a
+   re-test. Its `sum(n*k)` cost model predicts this: mp=100 has 1363 clusters against
+   903 and more spikes per centre.
+
+3. **The right framing for the next speed push is not "make the sort faster", it is
+   "make max_peels=100 affordable."** The accuracy win costs +30.61 s, of which the
+   peel is 50% and final clustering 39%. Halving the clustering growth alone would
+   turn "+10% cells for +42% time" into roughly "+10% cells for +26% time."
+
+**Two hypotheses tested and REJECTED this session, recorded so they are not retried:**
+- *"A van Herk / Gil-Werman sliding-window max would speed up `_amax_kernel` too,
+  not just the fat peel's selection."* **False.** `_amax_kernel` computes
+  `Am[k,m] = max_p Aa[iC2[p,k], m]` -- a max over NC2 SPATIAL neighbours at fixed
+  time, gathered through an arbitrary index set. There is no sliding window and no
+  overlap between adjacent m to exploit. van Herk does not apply.
+- *"The 41-sample temporal pool is an unexploited van Herk target."* **Already done.**
+  That `max_pool1d(2*nt0+1)` lives in `fused_peaks.py` and is already fused (§ the
+  fused-peaks work: 6.2x on the kernel, ~1.0x at sort level).
+  The only surviving van Herk target remains the fat peel's 123-wide per-unit
+  `max_pool1d` (§12k), and the fat peel is measured 1.6x SLOWER, so that stays dead.

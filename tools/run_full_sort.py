@@ -58,10 +58,26 @@ def main():
     ap.add_argument('--ops', help='a previous sort\'s ops.npy to replay')
     ap.add_argument('--probe', help='probe .mat (with --settings)')
     ap.add_argument('--settings', help='settings JSON (with --probe)')
+    ap.add_argument('--set', action='append', default=[], metavar='KEY=VALUE',
+                    help='override one settings key after --ops/--settings is '
+                         'loaded, e.g. --set batch_size=60000. Values parse as '
+                         'JSON, falling back to str. Repeatable. The override '
+                         'is printed and written to settings_override.json in '
+                         'the results dir -- a settings sweep that does not '
+                         'record its own arm is indistinguishable from a '
+                         'wobble. Only keys already present are accepted, so a '
+                         'typo fails loudly instead of being silently ignored.')
     ap.add_argument('--device', default='cuda')
     ap.add_argument('--invert-sign', action='store_true',
                     help='the lab pipeline passes invert_sign=True for Litke')
     ap.add_argument('--do-car', action='store_true')
+    ap.add_argument('--no-pc-features', action='store_true',
+                    help='skip make_pc_features and the pc_features.npy / '
+                         'pc_feature_ind.npy writes. Only Phy feature views '
+                         'read them, and the MEA pipeline deletes both right '
+                         'after the sort. tF is consumed by spike positions '
+                         'and amplitudes BEFORE this block and never after, '
+                         'so no other output file can change.')
     ap.add_argument('--deterministic', action='store_true',
                     help='force deterministic CUDA algorithms. Diagnostic for '
                          'the run-to-run wobble: if two runs with this flag '
@@ -99,6 +115,21 @@ def main():
         do_CAR = args.do_car
         invert_sign = args.invert_sign
 
+    overrides = {}
+    for item in args.set:
+        if '=' not in item:
+            ap.error(f'--set expects KEY=VALUE, got {item!r}')
+        key, raw = item.split('=', 1)
+        if key not in settings:
+            ap.error(f'--set {key}: not a key of the loaded settings '
+                     f'(typo?). Known keys: {sorted(settings)}')
+        try:
+            val = json.loads(raw)
+        except json.JSONDecodeError:
+            val = raw
+        overrides[key] = val
+        settings[key] = val
+
     settings['filename'] = args.data
     settings['data_dir'] = None
     settings.pop('probe', None)
@@ -109,13 +140,18 @@ def main():
     print(f'off-switches set: {on if on else "none (all optimizations active)"}')
     print(f'n_chan={settings.get("n_chan_bin")} fs={settings.get("fs")} '
           f'batch_size={settings.get("batch_size")}')
+    print(f'settings overrides: {overrides if overrides else "none"}')
+    os.makedirs(args.results_dir, exist_ok=True)
+    Path(args.results_dir, 'settings_override.json').write_text(
+        json.dumps(overrides, indent=1))
 
     t0 = time.time()
     run_kilosort(settings=settings, probe=probe, filename=args.data,
                  results_dir=args.results_dir, data_dtype='int16',
                  do_CAR=do_CAR, invert_sign=invert_sign,
                  device=torch.device(args.device), save_extra_vars=False,
-                 save_preprocessed_copy=False, clear_cache=False)
+                 save_preprocessed_copy=False, clear_cache=False,
+                 save_pc_features=not args.no_pc_features)
     print(f'\nTOTAL_WALL_SECONDS {time.time() - t0:.2f}')
 
 
