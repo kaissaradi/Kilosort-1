@@ -1,7 +1,6 @@
 import logging
 logger = logging.getLogger(__name__)
 
-from scipy.sparse import coo_matrix
 import numpy as np
 from scipy.ndimage import gaussian_filter
 import torch

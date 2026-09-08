@@ -1,4 +1,4 @@
-import torch, os, scipy
+import torch, os
 import numpy as np
 from scipy.signal import butter, filtfilt
 from scipy.interpolate import interp1d

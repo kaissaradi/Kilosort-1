@@ -29,7 +29,7 @@ from __future__ import annotations
 import os
 import struct
 from pathlib import Path
-from typing import BinaryIO, List, Optional, Sequence, Tuple, Union
+from typing import BinaryIO, List, Optional, Tuple, Union
 
 import numpy as np
 from numba import njit, prange

@@ -1,10 +1,10 @@
 import gc
 import os
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
-from torch import sparse_coo_tensor as coo
 from scipy.sparse import csr_matrix
 from scipy.ndimage import gaussian_filter
 from scipy.signal import find_peaks
@@ -130,51 +130,13 @@ def neigh_mat(Xd, nskip=1, n_neigh=10, max_sub=25000, device=None):
     return kn, M
 
 
-def assign_iclust(rows_neigh, isub, kn, tones2, nclust, lam, m, ki, kj, device=torch.device('cuda')):
-    n_spikes = kn.shape[0]
-
-    ij = torch.vstack((rows_neigh.flatten(), isub[kn].flatten()))
-    xN = coo(ij, tones2.flatten(), (n_spikes, nclust))
-    xN = xN.to_dense()
-
-    if lam > 0:
-        tones = torch.ones(len(kj), device = device)
-        tzeros = torch.zeros(len(kj), device = device)
-        ij = torch.vstack((tzeros, isub))    
-        kN = coo(ij, tones, (1, nclust))
-    
-        xN = xN - lam/m * (ki.unsqueeze(-1) * kN.to_dense()) 
-    
-    iclust = torch.argmax(xN, 1)
-
-    return iclust
-
-
-def assign_isub(iclust, kn, tones2, nclust, nsub, lam, m,ki,kj, device=torch.device('cuda')):
-    n_neigh = kn.shape[1]
-    cols = iclust.unsqueeze(-1).tile((1, n_neigh))
-    iis = torch.vstack((kn.flatten(), cols.flatten()))
-
-    xS = coo(iis, tones2.flatten(), (nsub, nclust))
-    xS = xS.to_dense()
-
-    if lam > 0:
-        tones = torch.ones(len(ki), device = device)
-        tzeros = torch.zeros(len(ki), device = device)
-        ij = torch.vstack((tzeros, iclust))    
-        kN = coo(ij, tones, (1, nclust))
-        xS = xS - lam / m * (kj.unsqueeze(-1) * kN.to_dense())
-
-    isub = torch.argmax(xS, 1)
-    return isub
-
 
 def Mstats(M, device=torch.device('cuda')):
     m = M.sum()
     ki = np.array(M.sum(1)).flatten()
     kj = np.array(M.sum(0)).flatten()
     # All-zero adjacency (e.g. single spike after self-edges removed) used to
-    # produce 0/0 → NaN and poison assign_iclust / hierarchical prepare.
+    # produce 0/0 → NaN and poison hierarchical prepare.
     ki_sum = float(ki.sum())
     kj_sum = float(kj.sum())
     if ki_sum <= 0 or kj_sum <= 0 or float(m) == 0:
@@ -706,6 +668,57 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
     t = 0
     v = False
     n_pcs = ops['settings']['n_pcs']
+    Nchan = ops['Nchan']
+
+    split_ccg_thresh = ops['settings'].get(
+        'split_ccg_threshold', swarmsplitter.SPLIT_CCG_THRESHOLD)
+    refrac_veto = _veto_on(ops)
+    refrac_veto_ratio = float(ops['settings'].get(
+        'refractory_veto_ratio', swarmsplitter.REFRAC_VETO_RATIO))
+    refrac_veto_alpha = float(ops['settings'].get(
+        'refractory_veto_alpha', swarmsplitter.REFRAC_VETO_ALPHA))
+
+    def _postprocess(Xd, iclust, iclust0, M, st0, snaps, iclust_init,
+                     igood, ichan, v_flag):
+        """Tree build + split + relabel + templates for one center (CPU)."""
+        if snaps is not None:
+            swarmsplitter.write_trace_stats(st0, snaps, iclust)
+        if st0 is not None and os.environ.get('KS4_SPLIT_STATS'):
+            swarmsplitter.write_init_stats(
+                st0, iclust,
+                iclust_init.cpu().numpy()
+                if hasattr(iclust_init, 'cpu') else np.asarray(iclust_init))
+
+        xtree, tstat, my_clus = hierarchical.maketree(M, iclust, iclust0)
+        xtree, tstat = swarmsplitter.split(
+            Xd.numpy(), xtree, tstat, iclust, my_clus, meta=st0,
+            split_ccg_threshold=split_ccg_thresh,
+            refrac_veto=refrac_veto,
+            refrac_veto_ratio=refrac_veto_ratio,
+            refrac_veto_alpha=refrac_veto_alpha)
+        iclust = swarmsplitter.new_clusters(iclust, my_clus, xtree, tstat)
+
+        if st0 is not None and os.environ.get('KS4_SPLIT_STATS'):
+            swarmsplitter.write_post_stats(st0, iclust)
+
+        wall_part = mean_cluster_templates(Xd, iclust, ichan, Nchan, n_pcs)
+
+        if v_flag:
+            log_performance(logger, header='clustering_qr.run, after iclust')
+
+        return iclust, igood, wall_part
+
+    def _collect_pending(fut):
+        """Apply a completed _postprocess result to clu/nmax/wall_parts."""
+        nonlocal nmax, Nfilt
+        iclust_r, igood_r, wall_r = fut.result()
+        clu[igood_r] = iclust_r + nmax
+        Nfilt = int(iclust_r.max() + 1)
+        nmax += Nfilt
+        wall_parts.append(wall_r)
+
+    cpu_pool = ThreadPoolExecutor(1)
+    pending = None
 
     try:
         for jj in prog:
@@ -729,6 +742,10 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                     if verbose:
                         v = True
 
+                if pending is not None:
+                    _collect_pending(pending)
+                    pending = None
+
                 Xd, igood, ichan = get_data_cpu(
                     ops, xy, iC, iclust_template_t, tF, ycent[kk], xcent[jj],
                     dmin=dmin, dminx=dminx, ix=ix,
@@ -745,30 +762,19 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                     v = True
                 if Xd.shape[0] < 1000:
                     iclust = np.zeros(Xd.shape[0], dtype=np.int32)
+                    clu[igood] = iclust + nmax
+                    Nfilt = int(iclust.max() + 1)
+                    nmax += Nfilt
+                    wall_parts.append(
+                        mean_cluster_templates(Xd, iclust, ichan, Nchan, n_pcs))
                 else:
                     if mode == 'template':
                         st0 = st[igood,0]/ops['fs']
                     else:
                         st0 = None
 
-                    # find new clusters
                     snaps = [] if (st0 is not None and
                                    os.environ.get('KS4_CLUSTER_TRACE')) else None
-                    # How many rounds of alternating assignment the tree's
-                    # leaves are taken from. Diagnostic only -- do NOT lower it.
-                    #
-                    # The loop is where the contamination is born: traced on
-                    # d007, the partition goes from 80 leaves per centre at 6.5%
-                    # refractorily impossible after one round to 19 leaves at
-                    # 12.6% at convergence, and at the k-means++ seeds it is
-                    # 2.7%. But truncating it was REFUTED: the leaves get
-                    # cleaner and the OUTPUT gets dirtier (contaminated spike
-                    # mass 8.95% -> 10.73% on d007 at niter=1), and niter=0
-                    # shatters the sort outright (recall 0.909, 2x wall, 4x GPU,
-                    # two ground-truth cells lost). The defect is real here and
-                    # the repair is not; it is the refractory merge veto in
-                    # swarmsplitter. The knob stays only so the measurement can
-                    # be reproduced.
                     iclust, iclust0, M, iclust_init = cluster(
                         Xd, nskip=nskip, n_neigh=n_neigh, max_sub=max_sub,
                         lam=1, seed=seed, device=device, verbose=v,
@@ -785,63 +791,31 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                         if v:
                             log_performance(logger, header='clustering_qr after gc')
 
-                    if snaps is not None:
-                        swarmsplitter.write_trace_stats(st0, snaps, iclust)
-
-                    if st0 is not None and os.environ.get('KS4_SPLIT_STATS'):
-                        swarmsplitter.write_init_stats(
-                            st0, iclust,
-                            iclust_init.cpu().numpy()
-                            if hasattr(iclust_init, 'cpu') else
-                            np.asarray(iclust_init))
-
-                    xtree, tstat, my_clus = hierarchical.maketree(M, iclust, iclust0)
-
-                    xtree, tstat = swarmsplitter.split(
-                        Xd.numpy(), xtree, tstat,iclust, my_clus, meta=st0,
-                        split_ccg_threshold=ops['settings'].get(
-                            'split_ccg_threshold',
-                            swarmsplitter.SPLIT_CCG_THRESHOLD),
-                        refrac_veto=_veto_on(ops),
-                        refrac_veto_ratio=float(ops['settings'].get(
-                            'refractory_veto_ratio',
-                            swarmsplitter.REFRAC_VETO_RATIO)),
-                        refrac_veto_alpha=float(ops['settings'].get(
-                            'refractory_veto_alpha',
-                            swarmsplitter.REFRAC_VETO_ALPHA)),
-                        )
-
-                    iclust = swarmsplitter.new_clusters(iclust, my_clus, xtree, tstat)
-
-                    if st0 is not None and os.environ.get('KS4_SPLIT_STATS'):
-                        swarmsplitter.write_post_stats(st0, iclust)
-
-                if v:
-                    log_performance(logger, header='clustering_qr.run, after iclust')
-
-                clu[igood] = iclust + nmax
-                Nfilt = int(iclust.max() + 1)
-                nmax += Nfilt
-
-                # Per-cluster feature means → templates. One group-by replaces
-                # Nfilt full boolean scans of iclust (same mean as the loop).
-                wall_parts.append(
-                    mean_cluster_templates(Xd, iclust, ichan, ops['Nchan'], n_pcs)
-                )
+                    pending = cpu_pool.submit(
+                        _postprocess, Xd, iclust, iclust0, M, st0,
+                        snaps, iclust_init, igood, ichan, v)
 
                 if progress_bar is not None:
                     progress_bar.emit(int((kk+1) / len(ycent) * 100))
+
+        if pending is not None:
+            _collect_pending(pending)
+            pending = None
     except:
         logger.exception(f'Error in clustering_qr.run on center {ii}')
-        logger.debug(f'Xd shape: {Xd.shape}')
+        try:
+            logger.debug(f'Xd shape: {Xd.shape}')
+        except (UnboundLocalError, NameError):
+            logger.debug('Xd not yet assigned')
         logger.debug(f'Nfilt: {Nfilt}')
         logger.debug(f'num spikes: {nsp}')
         try:
             logger.debug(f'iclust shape: {iclust.shape}')
-        except UnboundLocalError:
+        except (UnboundLocalError, NameError):
             logger.debug('iclust not yet assigned')
-            pass
         raise
+    finally:
+        cpu_pool.shutdown(wait=False)
 
     if nearby_chans_empty == total_centers:
         raise ValueError(
@@ -924,7 +898,7 @@ def get_data_cpu(ops, xy, iC, PID, tF, ycenter, xcenter, dmin=20, dminx=32,
 
     pid = PID[igood]
     data = tF[igood]
-    nspikes, nchanraw, nfeatures = data.shape
+    nspikes, _, nfeatures = data.shape
     # iC[:, ix] with bool ix; torch.unique on the selected columns.
     ichan, imap = torch.unique(iC[:, ix], return_inverse=True)
     nchan = ichan.nelement()
@@ -956,19 +930,3 @@ def get_data_cpu(ops, xy, iC, PID, tF, ycenter, xcenter, dmin=20, dminx=32,
     return Xd, igood, ichan
 
 
-def assign_clust(rows_neigh, iclust, kn, tones2, nclust):    
-    n_spikes = len(iclust)
-
-    ij = torch.vstack((rows_neigh.flatten(), iclust[kn].flatten()))
-    xN = coo(ij, tones2.flatten(), (n_spikes, nclust))
-    
-    xN = xN.to_dense() 
-    iclust = torch.argmax(xN, 1)
-
-    return iclust
-
-def assign_iclust0(Xg, mu):
-    vv = Xg @ mu.T
-    nm = (mu**2).sum(1)
-    iclust = torch.argmax(2*vv-nm, 1)
-    return iclust

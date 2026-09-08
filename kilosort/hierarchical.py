@@ -120,11 +120,6 @@ def get_my_clus(xtree, tstat):
     return my_clus
 
 def maketree(M, iclust, iclust0):
-
-    #m, ki, kj = Mstats(M)
-    #iclust = swarmer.assign_iclust(M, ki, kj, m, iclust[::nskip], lam = 1)
-    #iclust, nc  = swarmer.cleanup_index(iclust)
-
     iclust = np.asarray(iclust)
     if iclust.size == 0:
         # No spikes → empty tree / no leaves (caller should not split).

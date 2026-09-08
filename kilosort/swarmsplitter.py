@@ -85,17 +85,13 @@ def check_split(Xd, kk, xtree, iclust, my_clus, member_tables=None):
         labels = 2*labels_in(iclu, my_clus[xtree[kk, 0]]) - 1
 
     Xs = Xd[ixy]
-    # One class empty → weighted LS / bimod_score are meaningless; treat as
-    # non-bimodal rather than solving a singular/zero-weight system.
     pos = labels > 0
     neg = labels < 0
     if not np.any(pos) or not np.any(neg):
         return np.zeros(Xs.shape[0], dtype=np.float64), 0.0
 
-    Xs = Xs.copy()
     Xs[:,-1] = 1
 
-    # np.mean(bool) == fraction True; compute via counts (bit-identical float).
     n = float(labels.shape[0])
     n_pos = float(np.count_nonzero(pos))
     n_neg = float(np.count_nonzero(neg))
@@ -103,9 +99,10 @@ def check_split(Xd, kk, xtree, iclust, my_clus, member_tables=None):
     w[pos, 0] = n_neg / n
     w[neg, 0] = n_pos / n
 
-    CC = Xs.T @ (Xs * w)
+    Xw = Xs * w
+    CC = Xs.T @ Xw
     CC = CC + .01 * np.eye(CC.shape[0])
-    b = np.linalg.solve(CC, labels @ (Xs * w))
+    b = np.linalg.solve(CC, labels @ Xw)
     xproj = Xs @ b
 
     score = bimod_score(xproj)
