@@ -337,6 +337,55 @@ def test_lut_rebuilds_when_the_source_tensor_changes():
     assert first[0].data_ptr() != second[0].data_ptr()
 
 
+def test_lut_key_separates_two_views_with_the_same_shape_and_stride():
+    """id(base) plus shape plus stride is not a key. Two slices of one tensor
+    can agree on all three and still cover different rows, so the cache handed
+    back a table for the wrong tiles -- not a stale answer, a wrong one."""
+    _, _, _, ctc, _, _, _, _, _ = sparse_problem(2, 81)
+    src = ctc.permute(1, 0, 2)
+    half = src.shape[0] // 2
+    assert half >= 1
+    lo, hi = src[:half], src[half:2 * half]
+    assert lo.shape == hi.shape and lo.stride() == hi.stride()
+    assert lo.storage_offset() != hi.storage_offset()
+
+    # Make the two halves genuinely different, so a wrong table is visible.
+    ctc[:, :half] = 0.0
+    ctc[:, half:2 * half] = 1.0
+
+    lut_lo = fused_peel._get_tile_lut(src[:half])
+    lut_hi = fused_peel._get_tile_lut(src[half:2 * half])
+    # the all-zero half has no live tile; the all-ones half has one per row
+    assert int(lut_lo[1].max()) == 0
+    assert int(lut_hi[1].min()) > 0
+
+
+def test_lut_key_separates_two_tile_sizes():
+    """A table built for one block_r describes a different tile set than a
+    table built for another, so block_r has to be part of the key."""
+    _, _, _, ctc, _, _, _, _, _ = sparse_problem(2, 82)
+    src = ctc.permute(1, 0, 2)
+    coarse = fused_peel._get_tile_lut(src, block_r=src.shape[1])
+    fine = fused_peel._get_tile_lut(src, block_r=1)
+    assert coarse[2] != fine[2], 'MAXT must differ between tile sizes'
+
+
+def test_lut_cache_does_not_outlive_its_source():
+    """The entry holds the table STRONGLY and only a weakref to the base, so
+    without an eviction hook every table ever built stays for the life of the
+    process. On CUDA that is retained device memory."""
+    fused_peel._LUT_CACHE.clear()
+    for seed in range(8):
+        _, _, _, ctc, _, _, _, _, _ = sparse_problem(2, 90 + seed)
+        fused_peel._get_tile_lut(ctc.permute(1, 0, 2))
+        del ctc
+    import gc
+    gc.collect()
+    assert len(fused_peel._LUT_CACHE) == 0, (
+        '{0} tables outlived their source tensors'.format(
+            len(fused_peel._LUT_CACHE)))
+
+
 def test_lut_handles_an_all_zero_source():
     latch_fused()
     Xres, B, U_time, ctc, iX, iY, amp, tiwave, trange = sparse_problem(4, 71)

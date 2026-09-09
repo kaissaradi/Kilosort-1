@@ -79,6 +79,19 @@ _CONFIGS = ((128, 4), (128, 2), (64, 2), (64, 4), (256, 4), (32, 2))
 # None = not yet tested this process; False = disabled; else (block_m, warps).
 _CHOICE = None
 
+# The signature _CHOICE was validated against, and only that signature.
+#
+# _CHOICE is a process global, so it outlives one sort. Two things make a
+# cached choice unsafe to reuse blindly on different inputs. Which block size
+# is bit-identical is SHAPE-dependent -- see the module docstring: at
+# production shapes BLOCK_M=128/warps=4 matches and 64 and 32 do not, and at
+# the unit tests' shapes the opposite. And _eligible's structural checks
+# (device, dtypes, the ns*nk and nC register budget) were only ever run on the
+# first call. A second run_kilosort() in one process, on an array with a
+# different channel count, would otherwise take the first array's block size
+# with no validation, and a CPU tensor would reach the Triton launch.
+_CHOICE_SIG = None
+
 
 if _HAVE_TRITON:
 
@@ -219,6 +232,14 @@ def _eligible(B, weigh, iC, As, imaxs, Amaxs):
     return True
 
 
+def _signature(B, weigh, iC, As, imaxs, Amaxs, nC2, Nfilt):
+    """Everything a validated choice depends on: shapes, dtypes, device."""
+    return (B.device, B.dtype, weigh.dtype, iC.dtype,
+            As.dtype, imaxs.dtype, Amaxs.dtype,
+            tuple(B.shape), tuple(weigh.shape), tuple(iC.shape),
+            tuple(As.shape), int(nC2), int(Nfilt))
+
+
 def try_fill(B, weigh, iC, iC2_flat, nC2, Nfilt, As, imaxs, Amaxs, stock_fill):
     """Fill the three peak buffers, fused if it is provably safe to.
 
@@ -229,7 +250,17 @@ def try_fill(B, weigh, iC, iC2_flat, nC2, Nfilt, As, imaxs, Amaxs, stock_fill):
     equal is kept for the rest of the sort. It returns True in that case too --
     the stock result is already in place and is the one used for this batch.
     """
-    global _CHOICE
+    global _CHOICE, _CHOICE_SIG
+
+    sig = _signature(B, weigh, iC, As, imaxs, Amaxs, nC2, Nfilt)
+    if sig != _CHOICE_SIG:
+        # Different shapes, dtypes or device from the ones that were checked.
+        # Nothing that was validated applies here, so validate again.
+        if _CHOICE is not None:
+            logger.info('fused detection: inputs changed shape or dtype, '
+                        're-validating against the stock loop')
+        _CHOICE = None
+        _CHOICE_SIG = sig
 
     if _CHOICE is False:
         return False

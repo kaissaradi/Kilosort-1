@@ -69,9 +69,12 @@ def reset_choice():
     """_CHOICE is process-global and sticky by design; tests must not inherit
     each other's verdict."""
     saved = fused_detect._CHOICE
+    saved_sig = fused_detect._CHOICE_SIG
     fused_detect._CHOICE = None
+    fused_detect._CHOICE_SIG = None
     yield
     fused_detect._CHOICE = saved
+    fused_detect._CHOICE_SIG = saved_sig
 
 
 def test_gate_result_matches_stock_on_the_validated_batch():
@@ -136,6 +139,68 @@ def test_ineligible_dtypes_fall_back():
         B, weigh, iC, iC2_flat, NC2, NFILT, As, imaxs64, Amaxs,
         lambda: pytest.fail('stock_fill must not run during eligibility check'))
     assert filled is False
+
+
+def test_a_cached_choice_is_not_reused_on_different_shapes():
+    """_CHOICE outlives one sort, and which config is bit-identical is
+    shape-dependent. A second run_kilosort() in the same process, on an array
+    with a different channel count, must not inherit the first array's block
+    size without checking it."""
+    B, weigh, iC, iC2_flat = make_problem(3)
+    As, imaxs, Amaxs = buffers()
+    fused_detect.try_fill(
+        B, weigh, iC, iC2_flat, NC2, NFILT, As, imaxs, Amaxs,
+        lambda: stock(B, weigh, iC, iC2_flat, As, imaxs, Amaxs))
+    if not fused_detect._CHOICE:
+        pytest.skip('no bit-identical config on this device; stock is used')
+
+    # Same problem with a different NT. Real second sorts differ by more, but
+    # one changed dimension is enough to invalidate a validated block size.
+    dev = torch.device('cuda')
+    g = torch.Generator(device='cpu').manual_seed(11)
+    nt2 = NT // 2
+    B2 = torch.randn(NCHAN, NK, nt2, generator=g).to(dev)
+    A2 = torch.empty((NFILT, nt2), device=dev)
+    I2 = torch.empty((NFILT, nt2), dtype=torch.int32, device=dev)
+    M2 = torch.empty((NFILT, nt2), device=dev)
+
+    revalidated = []
+    fused_detect.try_fill(
+        B2, weigh, iC, iC2_flat, NC2, NFILT, A2, I2, M2,
+        lambda: (revalidated.append(1),
+                 stock(B2, weigh, iC, iC2_flat, A2, I2, M2))[1])
+    assert revalidated, ('a new shape must be validated against the stock '
+                         'loop, not run on the previous shape\'s config')
+
+    r2A, r2I, r2M = (torch.empty_like(A2), torch.empty_like(I2),
+                     torch.empty_like(M2))
+    stock(B2, weigh, iC, iC2_flat, r2A, r2I, r2M)
+    assert torch.equal(A2, r2A)
+    assert torch.equal(I2, r2I)
+    assert torch.equal(M2, r2M)
+
+
+def test_a_cached_choice_does_not_send_a_cpu_tensor_to_the_kernel():
+    """_eligible used to run only on the first call, so a CPU B reaching a
+    process that had already chosen a config went straight to the Triton
+    launch."""
+    B, weigh, iC, iC2_flat = make_problem(4)
+    As, imaxs, Amaxs = buffers()
+    fused_detect.try_fill(
+        B, weigh, iC, iC2_flat, NC2, NFILT, As, imaxs, Amaxs,
+        lambda: stock(B, weigh, iC, iC2_flat, As, imaxs, Amaxs))
+    if not fused_detect._CHOICE:
+        pytest.skip('no bit-identical config on this device; stock is used')
+
+    cpu = dict(B=B.cpu(), weigh=weigh.cpu(), iC=iC.cpu(),
+               iC2=iC2_flat.cpu(), As=As.cpu(), imaxs=imaxs.cpu(),
+               Amaxs=Amaxs.cpu())
+    filled = fused_detect.try_fill(
+        cpu['B'], cpu['weigh'], cpu['iC'], cpu['iC2'], NC2, NFILT,
+        cpu['As'], cpu['imaxs'], cpu['Amaxs'],
+        lambda: pytest.fail('stock_fill must not run during an eligibility '
+                            'check'))
+    assert filled is False, 'a CPU input must fall back to the stock loop'
 
 
 def test_next_pow2():

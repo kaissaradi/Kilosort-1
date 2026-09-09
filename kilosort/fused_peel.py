@@ -268,17 +268,27 @@ def _get_tile_lut(src, block_r=None):
     base = src._base if src._base is not None else src
     key = id(base)
     ent = _LUT_CACHE.get(key)
-    shape, stride = tuple(src.shape), tuple(src.stride())
+    # storage_offset and block_r belong in this signature, not shape and
+    # stride alone. Two views of one base can share a shape and a stride and
+    # still cover different rows -- ctc[0:5] and ctc[5:10] -- and a table
+    # built for one tile size is wrong for another. Leaving them out does not
+    # return a stale table, it returns a table for the wrong tiles.
+    sig = (tuple(src.shape), tuple(src.stride()), src.storage_offset(),
+           int(block_r))
     if ent is not None:
-        ref, ver, sh, st, lut = ent
+        ref, ver, ent_sig, lut = ent
         # data_ptr/id can be recycled after a free, so confirm identity and
         # that nothing has written to the tensor since the LUT was built.
-        if ref() is base and ver == base._version and sh == shape \
-                and st == stride:
+        if ref() is base and ver == base._version and ent_sig == sig:
             return lut
     lut = _build_tile_lut(src, block_r)
     try:
-        _LUT_CACHE[key] = (weakref.ref(base), base._version, shape, stride, lut)
+        _LUT_CACHE[key] = (weakref.ref(base), base._version, sig, lut)
+        # The entry holds `lut` strongly and only a weakref to `base`, so
+        # without this the tables outlive their source for the life of the
+        # process: nothing else ever evicts. On CUDA that is retained device
+        # memory, one table set per tensor that ever reached here.
+        weakref.finalize(base, _LUT_CACHE.pop, key, None)
     except TypeError:                  # pragma: no cover - non-weakref-able
         pass
     return lut
