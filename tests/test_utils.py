@@ -79,3 +79,48 @@ def test_buffer_capacity_helpers_bounds():
     assert get_spike_buffer_capacity(200) == 10**6
     assert get_clip_buffer_capacity(1, nskip=25) == 10_000
     assert get_clip_buffer_capacity(10_000, nskip=25) == 500_000
+
+
+def test_cuda_guard_reads_the_device_not_the_host():
+    """A cpu run on a cuda MACHINE must not enter a torch.cuda call.
+
+    This is the bug that took the whole CPU path down. Every memory-diagnostic
+    call site guarded on `torch.cuda.is_available()`, which reports whether the
+    HOST has a GPU. On this machine that is True, so a run with `device='cpu'`
+    passed the guard and `torch.cuda.memory_stats('cpu')` raised
+    `ValueError: Expected a cuda device, but got: cpu`.
+
+    The test is written so the wrong guard fails it REGARDLESS of whether the
+    machine running it has a GPU, because the whole point is that the two
+    conditions are not the same condition.
+    """
+    import torch
+
+    from kilosort.utils import cuda_memory_stats, is_cuda_device
+
+    cpu = torch.device('cpu')
+    assert is_cuda_device(cpu) is False
+    assert cuda_memory_stats(cpu) is None, \
+        'a cpu device must return None, not raise and not report host stats'
+    # None means "no device given", which is also not a cuda run.
+    assert is_cuda_device(None) is False
+    assert cuda_memory_stats(None) is None
+    # A string is accepted, since call sites are not guaranteed to hold a
+    # torch.device.
+    assert is_cuda_device('cpu') is False
+    # Nonsense must be False rather than an exception: this is a diagnostic,
+    # and it must never be the thing that fails a sort.
+    assert is_cuda_device('not-a-device') is False
+    assert is_cuda_device(object()) is False
+
+    if torch.cuda.is_available():
+        # 'cuda' and 'cuda:0' must BOTH read as cuda. The old
+        # `device == torch.device('cuda')` form said no to 'cuda:0', which is
+        # what a real run actually holds, so it silently never fired.
+        assert is_cuda_device(torch.device('cuda')) is True
+        assert is_cuda_device(torch.device('cuda:0')) is True
+        assert cuda_memory_stats(torch.device('cuda:0')) is not None
+    else:
+        # Without a GPU, asking for cuda is still not a cuda run.
+        assert is_cuda_device(torch.device('cuda')) is False
+        assert cuda_memory_stats(torch.device('cuda')) is None

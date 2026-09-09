@@ -16,7 +16,8 @@ from kilosort import (preprocessing, datashift, template_matching, clustering_qr
 from kilosort.parameters import DEFAULT_SETTINGS
 from kilosort.utils import (
     log_performance, log_cuda_details, probe_as_string, ops_as_string,
-    get_performance, log_sorting_summary, log_thread_count
+    get_performance, log_sorting_summary, log_thread_count,
+    cuda_memory_stats, is_cuda_device
     )
 import kilosort.plots as kplots
 
@@ -372,8 +373,9 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
                 skip_dat_path=(file_object is not None),
                 save_pc_features=save_pc_features,
                 )
-        if torch.cuda.is_available():
-            ops['cuda_postproc'] = torch.cuda.memory_stats(device)
+        stats = cuda_memory_stats(device)
+        if stats is not None:
+            ops['cuda_postproc'] = stats
 
         log_thread_count(logger)
 
@@ -783,8 +785,9 @@ def compute_drift_correction(ops, device, tic0=np.nan, progress_bar=None,
     total = time.time() - tic0
     ops['runtime_drift'] = elapsed
     ops['usage_drift'] = get_performance()
-    if torch.cuda.is_available():
-        ops['cuda_drift'] = torch.cuda.memory_stats()
+    stats = cuda_memory_stats(device)
+    if stats is not None:
+        ops['cuda_drift'] = stats
     logger.info(f'drift computed in {elapsed:.2f}s; total {total:.2f}s')
 
     if st is not None:
@@ -862,8 +865,9 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
     total = time.time() - tic0
     ops['runtime_st0'] = elapsed
     ops['usage_st0'] = get_performance()
-    if torch.cuda.is_available():
-        ops['cuda_st0'] = torch.cuda.memory_stats(device)
+    stats = cuda_memory_stats(device)
+    if stats is not None:
+        ops['cuda_st0'] = stats
     logger.info(f'{len(st0)} spikes extracted in {elapsed:.2f}s; ' + 
                 f'total {total:.2f}s')
     logger.debug(f'st0 shape: {st0.shape}')
@@ -899,8 +903,9 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
     total = time.time() - tic0
     ops['runtime_clu0'] = elapsed
     ops['usage_clu0'] = get_performance()
-    if torch.cuda.is_available():
-        ops['cuda_clu0'] = torch.cuda.memory_stats(device)
+    stats = cuda_memory_stats(device)
+    if stats is not None:
+        ops['cuda_clu0'] = stats
     logger.info(f'{clu.max()+1} clusters found, in {elapsed:.2f}s; ' +
                 f'total {total:.2f}s')
     logger.debug(f'clu shape: {clu.shape}')
@@ -925,8 +930,9 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
     total = time.time() - tic0
     ops['runtime_st'] = elapsed
     ops['usage_st'] = get_performance()
-    if torch.cuda.is_available():
-        ops['cuda_st'] = torch.cuda.memory_stats(device)
+    stats = cuda_memory_stats(device)
+    if stats is not None:
+        ops['cuda_st'] = stats
     logger.info(f'{len(st)} spikes extracted in {elapsed:.2f}s; ' +
                 f'total {total:.2f}s')
     logger.debug(f'st shape: {st.shape}')
@@ -992,8 +998,9 @@ def cluster_spikes(st, tF, ops, device, bfile, tic0=np.nan, progress_bar=None,
     total = time.time() - tic0
     ops['runtime_clu'] = elapsed
     ops['usage_clu'] = get_performance()
-    if torch.cuda.is_available():
-        ops['cuda_clu'] = torch.cuda.memory_stats(device)
+    stats = cuda_memory_stats(device)
+    if stats is not None:
+        ops['cuda_clu'] = stats
     logger.info(f'{clu.max()+1} clusters found, in {elapsed:.2f}s; ' + 
                 f'total {total:.2f}s')
     logger.debug(f'clu shape: {clu.shape}')
@@ -1013,8 +1020,9 @@ def cluster_spikes(st, tF, ops, device, bfile, tic0=np.nan, progress_bar=None,
     total = time.time() - tic0
     ops['runtime_merge'] = elapsed
     ops['usage_merge'] = get_performance()
-    if torch.cuda.is_available():
-        ops['cuda_merge'] = torch.cuda.memory_stats(device)
+    stats = cuda_memory_stats(device)
+    if stats is not None:
+        ops['cuda_merge'] = stats
     logger.info(f'{clu.max()+1} units found, in {elapsed:.2f}s; ' + 
                 f'total {total:.2f}s')
     logger.debug(f'clu shape: {clu.shape}')

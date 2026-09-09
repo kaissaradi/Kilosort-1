@@ -13,7 +13,8 @@ import faiss
 from tqdm import tqdm 
 
 from kilosort import fast_kpp, hierarchical, swarmsplitter
-from kilosort.utils import group_indices_by_label, log_performance
+from kilosort.utils import (group_indices_by_label, log_performance,
+                            is_cuda_device)
 
 logger = logging.getLogger(__name__)
 
@@ -792,7 +793,13 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                 logger.debug(f'Center {ii} | Xd shape: {Xd.shape} | ntemp: {ntemp}')
                 if verbose and Xd.nelement() > 10**8:
                     logger.info(f'Resetting cuda memory stats for Center {ii}')
-                    if device == torch.device('cuda'):
+                    # `device == torch.device('cuda')` is False for a real
+                    # device, which is `cuda:0`, so that form never fired.
+                    # Guard on the device TYPE, and never on
+                    # torch.cuda.is_available() -- that reports the host, not
+                    # the run, and passing a cpu device to a torch.cuda call
+                    # raises. See kilosort.utils.is_cuda_device.
+                    if is_cuda_device(device):
                         torch.cuda.reset_peak_memory_stats(device)
                     v = True
                 if Xd.shape[0] < 1000:

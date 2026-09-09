@@ -171,6 +171,39 @@ def download_url_to_file(url, dst, progress=True):
             os.remove(f.name)
 
 
+def is_cuda_device(device):
+    """True only when `device` is a cuda device AND cuda is usable.
+
+    `torch.cuda.is_available()` is the WRONG guard for a per-run cuda call: it
+    reports whether the HOST has a GPU, not whether this run uses one. On a
+    CUDA machine a run with `device='cpu'` still passed that guard, and then
+    `torch.cuda.memory_stats('cpu')` raised
+    `ValueError: Expected a cuda device, but got: cpu`, which took the entire
+    CPU path down. See tests/test_full_pipeline.py.
+
+    Also note `device == torch.device('cuda')` is not this test: a real device
+    is `cuda:0`, which compares unequal, so that form silently never fires.
+    """
+    if device is None:
+        return False
+    try:
+        d = device if isinstance(device, torch.device) else torch.device(device)
+    except (TypeError, RuntimeError, ValueError):
+        return False
+    return d.type == 'cuda' and torch.cuda.is_available()
+
+
+def cuda_memory_stats(device):
+    """`torch.cuda.memory_stats(device)` when that is legal, else None.
+
+    Diagnostic only. Returning None on a CPU run keeps the key out of `ops`
+    rather than storing a misleading host-wide figure.
+    """
+    if not is_cuda_device(device):
+        return None
+    return torch.cuda.memory_stats(device)
+
+
 def get_performance():
     """Get resource usage information.
 
