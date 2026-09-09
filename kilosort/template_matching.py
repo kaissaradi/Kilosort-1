@@ -16,8 +16,34 @@ from kilosort.utils import (
 logger = logging.getLogger(__name__)
 
 
+def _parse_batch_spec(spec):
+    """'150' | '150-179' | '0,150-159' -> a sorted set of batch indices.
+
+    A range exists because one batch of 10122 samples holds a median of 8
+    spikes per unit, and an 8-spike average sits only sqrt(8)=2.8x above the
+    single-sample noise. Thirty batches take that to ~240 spikes and ~15x.
+    """
+    out = set()
+    for part in spec.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        lo, sep, hi = part.partition('-')
+        if sep:
+            a, b = int(lo), int(hi)
+            if b < a:
+                raise ValueError(
+                    f'KS4_DUMP_RESIDUAL: range {part!r} runs backwards')
+            out.update(range(a, b + 1))
+        else:
+            out.add(int(part))
+    if not out:
+        raise ValueError('KS4_DUMP_RESIDUAL: no batch index in the spec')
+    return out
+
+
 def _residual_dump_request():
-    """Parse KS4_DUMP_RESIDUAL, which is 'directory:batch_index'.
+    """Parse KS4_DUMP_RESIDUAL, which is 'directory:batches'.
 
     Diagnostic only, and OFF unless the variable is set. The peel subtracts a
     template that covers a median of 13 of 519 channels and leaves 17.6-23.0%
@@ -28,18 +54,19 @@ def _residual_dump_request():
 
     Byte identity: when the variable is unset this returns None, no batch is
     ever selected, and the pre-peel clone below is never taken. The only cost
-    on a normal run is one integer comparison per batch.
+    on a normal run is one set membership test per batch.
     """
     spec = os.environ.get('KS4_DUMP_RESIDUAL')
     if not spec:
         return None
-    path, _, batch = spec.rpartition(':')
+    path, _, batches = spec.rpartition(':')
     if not path:
         raise ValueError(
-            "KS4_DUMP_RESIDUAL must be 'directory:batch_index', got "
+            "KS4_DUMP_RESIDUAL must be 'directory:batches', got "
             f"{spec!r}")
+    want = _parse_batch_spec(batches)
     os.makedirs(path, exist_ok=True)
-    return path, int(batch)
+    return path, want
 
 
 def _to_numpy(v):
@@ -195,7 +222,7 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None,
             # run_matching peels IN PLACE on X, so a pre-peel copy has to be
             # taken before the call, not after. Only when dumping.
             X_pre = X.clone() if (dump is not None
-                                  and ibatch == dump[1]) else None
+                                  and int(ibatch) in dump[1]) else None
             stt, amps, th_amps, Xres = run_matching(
                 ops, X, U, ctc, device=device, unit_cache=match_cache
             )

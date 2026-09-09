@@ -609,6 +609,50 @@ def test_residual_dump_rejects_a_spec_with_no_directory():
             os.environ['KS4_DUMP_RESIDUAL'] = old
 
 
+def test_residual_dump_accepts_a_batch_range():
+    """A single batch is not enough n, so the spec has to take a set.
+
+    One batch of 10122 samples holds a median of 8 spikes per unit. The noise
+    on an 8-spike average is only sqrt(8) below the single-sample noise, which
+    is not enough to call a residual flat. The three accepted forms are one
+    index, an inclusive range, and a comma list of either.
+    """
+    import os
+    import tempfile
+
+    from kilosort.template_matching import (_parse_batch_spec,
+                                            _residual_dump_request)
+
+    assert _parse_batch_spec('150') == {150}
+    # Inclusive at BOTH ends. An exclusive upper bound would silently drop the
+    # last batch and quietly change n.
+    assert _parse_batch_spec('150-152') == {150, 151, 152}
+    assert _parse_batch_spec('0,150-152') == {0, 150, 151, 152}
+    assert _parse_batch_spec(' 4 , 4 ') == {4}, 'duplicates must collapse'
+
+    for bad in ('179-150', '', ','):
+        raised = False
+        try:
+            _parse_batch_spec(bad)
+        except ValueError:
+            raised = True
+        assert raised, f'{bad!r} must raise, not dump nothing in silence'
+
+    # The request has to return the SET, not one integer, or the call site's
+    # membership test is against an int and dumps a single batch.
+    old = os.environ.get('KS4_DUMP_RESIDUAL')
+    with tempfile.TemporaryDirectory() as d:
+        os.environ['KS4_DUMP_RESIDUAL'] = f'{d}:150-152'
+        try:
+            path, want = _residual_dump_request()
+            assert path == d
+            assert 151 in want and 149 not in want
+        finally:
+            os.environ.pop('KS4_DUMP_RESIDUAL', None)
+            if old is not None:
+                os.environ['KS4_DUMP_RESIDUAL'] = old
+
+
 def test_residual_dump_writes_what_the_analysis_needs():
     """The dump must carry Wrot, because a whitened channel is not a location.
 
