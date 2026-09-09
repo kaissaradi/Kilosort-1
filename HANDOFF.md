@@ -395,8 +395,58 @@ the same state ... so downstream code cannot tell which ran", measured as
 generator would have to replace all three at once, with that proof redone.
 Codex wrote the change against a tree that had no `fast_kpp`.
 
-Worth taking after testing: the four new test files and the `test_mea_fork.py`
-additions, and `62e222b`'s `save_to_phy` input validation -- but note that one
-adds a "spike times must be nondecreasing" check over 11 M spikes on every
-export, which would fail hard on any legitimate path that produces unsorted
-times.
+### What was taken from codex, and what was refused
+
+Settled 2026-09-09. Every "taken" row landed with a deterministic slice300
+byte compare; every "refused" row has a reason that is not taste.
+
+| Item | Verdict |
+|---|---|
+| `test_cluster_invariants.py` | **Taken** (`19f02f3`). 5 passed, 2 xfailed, 1 failed here -- the failure was a real defect. |
+| `kmeans_plusplus` global-RNG side effect | **Fixed, but not codex's way** (`19f02f3`). Save and restore around the call instead of a local Generator. |
+| `final_merge_union_acg_veto` | **Taken** (`29c6068`). Opt-in, default False. Aimed at the merge-two-distinct-cells failure. |
+| `KS4_ROBUST_COV` robust whitening covariance | **Taken as a knob, do NOT enable** (`f48f405`). Measured: no effect on the quantity it targets. |
+| `62e222b` + `c2286a9` export validation | **Taken** (`a3d2535`). The nondecreasing-times check does not false-positive: 772,339 real spikes, all sorted. |
+| `replay.py` + `test_replay.py` | **Refused.** See below. |
+| `686445b` clustering hot paths | Not evaluated. Predates 59 commits of clustering work here. |
+
+`19f02f3`'s RNG note is above. Two of the taken rows are worth re-reading:
+
+**`KS4_ROBUST_COV` is a negative result.** It downweights high-amplitude
+samples before they enter the whitening covariance, to stop busy channels
+being whitened down harder than dead ones. With the flag on, on slice300, the
+per-channel row norm of the whitening matrix -- the quantity that sets the
+noise floor, and the whole point -- does not move: p90/p10 spread 1.5055 both
+ways, row-norm correlation 1.000000, largest per-channel change 0.47% of the
+median. Individual elements move (median 0.21%, p99 20.8%), so the
+off-diagonal structure shifts while the channel scaling stays put. The sort
+drifts slightly as a result (-0.18% spikes, 590 -> 592 clusters, 480 -> 478
+good), which with unchanged channel gains is chaotic sensitivity, not an
+improvement. Its own comment says synthetic-only validation, and it records
+the retraction of `KS4_MADW`, an earlier attempt at this defect that looked
+right and failed on real GT three ways. A verdict needs the MEA repo's
+`sorter_qa` gates.
+
+**Why `replay.py` is refused.** It is a useful idea -- capture one cluster
+centre to disk with a hash manifest, replay it without running a sort, which
+is exactly what the clustering block needs. But `replay_center` **mirrors**
+`clustering_qr.run`'s centre-local branch instead of calling it: the
+`Xd.shape[0] < 1000` fast path, `cluster`, `hierarchical.maketree`,
+`swarmsplitter.split`, `new_clusters`, `mean_cluster_templates`, all
+reimplemented. That is a second copy of the postprocess, and it has **already
+drifted**: `c311f70` moved all of it into the `_postprocess` closure inside
+`run`, and codex wrote against the code before that.
+
+The drift would be silent -- a replay disagreeing with the sorter and nothing
+saying so. It already disagrees on one setting: `replay_center` passes
+`refrac_veto=bool(settings.get("refractory_merge_veto", True))`, defaulting to
+`True` and ignoring `KS4_REFRAC_VETO`, while the real path goes through
+`_veto_on(ops)`. `_veto_on`'s own docstring exists because a "veto off" arm
+and a "veto on" arm were once the same run, and "that failure was silent,
+which is the only reason it survived a whole sweep".
+
+**What would make it takeable:** lift `_postprocess` out of `run` to module
+level, taking its config explicitly, so the sorter and a replay harness call
+one implementation. That is a real refactor of a hot path, so it needs its own
+commit and its own byte compare. It was not done here -- it is enabling work
+for a tool nobody has asked for yet.
