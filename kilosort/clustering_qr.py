@@ -334,10 +334,32 @@ def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'),
     def stock():
         return _kmeans_plusplus_stock(Xg, niter, seed, device, verbose)
 
-    fast = fast_kpp.try_run(Xg, niter, seed, device, stock)
-    if fast is not None:
-        return fast
-    return stock()
+    # Both paths below call torch.manual_seed(seed) and np.random.seed(seed),
+    # which reseed the PROCESS generators -- once per cluster centre, so a few
+    # hundred times per sort. Stock does that, and the fast paths reproduce it
+    # deliberately: fast_kpp's bit-identity argument is stated in terms of the
+    # global stream, so the stream INSIDE this call must not change. Do not
+    # swap in a local torch.Generator here; that is a different stream and it
+    # would invalidate that argument in three places at once.
+    #
+    # What can change is what the CALLER sees. Reseeding a process generator
+    # from inside a library call is a silent side effect on everything else
+    # that draws from it. So save the state, let the body reseed exactly as it
+    # always has, and hand the caller's state back on the way out.
+    torch_state = torch.random.get_rng_state()
+    numpy_state = np.random.get_state()
+    cuda_states = (torch.cuda.get_rng_state_all()
+                   if torch.cuda.is_available() else None)
+    try:
+        fast = fast_kpp.try_run(Xg, niter, seed, device, stock)
+        if fast is not None:
+            return fast
+        return stock()
+    finally:
+        torch.random.set_rng_state(torch_state)
+        np.random.set_state(numpy_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
 
 
 def _kmeans_plusplus_stock(Xg, niter=200, seed=1, device=torch.device('cuda'),
