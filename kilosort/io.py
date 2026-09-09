@@ -400,15 +400,15 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
     if save_extra_vars:
         # Save tF first since it gets updated in-place
         np.save(results_dir / 'tF.npy', tF.cpu().numpy())
-    # This will momentarily copy tF which is pretty large, but it's on CPU
-    # so the extra memory hopefully won't be an issue.
-    tF = tF[kept_spikes]
     # `pc_features.npy` is only read by Phy's feature views. The MEA pipeline
     # deletes it immediately after the sort (utilities/pipeline.sh and
     # mea/transfer.py both list it as an intermediate), so computing it costs
     # make_pc_features plus a multi-GB write whose only consumer is `rm`.
     # Default stays True so stock Kilosort behaviour is unchanged.
     if save_pc_features:
+        # This will momentarily copy tF which is pretty large, but it's on CPU
+        # so the extra memory hopefully won't be an issue.
+        tF = tF[kept_spikes]
         pc_features, pc_feature_ind = make_pc_features(
             ops, spike_templates, spike_clusters, tF
             )
@@ -417,7 +417,15 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
         log_performance(logger, level='debug', header='save_to_phy, pc features',
                         reset=True)
     else:
+        # Every other output in this directory is being overwritten right now.
+        # Leaving a pc_features.npy from an earlier sort makes Phy show feature
+        # views that belong to different spikes than spike_times.npy holds.
         logger.info('skipping pc_features (save_pc_features=False)')
+        for stale in ('pc_features.npy', 'pc_feature_ind.npy'):
+            p = results_dir / stale
+            if p.exists():
+                logger.info(f'removing stale {stale} from a previous sort')
+                p.unlink()
 
     # contamination ratio
     acg_threshold = ops['settings']['acg_threshold']

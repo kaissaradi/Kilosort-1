@@ -275,8 +275,29 @@ def _graph_loop(Xg, niter, seed, device):
 
     g = torch.cuda.CUDAGraph()
     with torch.cuda.stream(_CAPTURE_STREAM):
-        g.capture_begin(_POOL)
-        body()
+        # capture_error_mode: the default is 'global', which errors on a CUDA
+        # action in ANY thread while this capture is open -- including the
+        # allocator free that another thread triggers when it drops the last
+        # reference to a device tensor. clustering_qr.run keeps a worker thread
+        # alive across this call, so 'global' turns an unrelated thread into a
+        # capture failure. 'thread_local' errors only on actions in THIS
+        # thread, which is the thread whose work is being recorded.
+        g.capture_begin(_POOL, capture_error_mode='thread_local')
+        try:
+            body()
+        except BaseException:
+            # capture_end MUST run. A capture left open puts the stream in
+            # capture mode for the life of the process, and every later CUDA
+            # call anywhere then fails with "operation not permitted when
+            # stream is capturing" -- including the ungraphed fallback that
+            # try_run reaches for, and stock kmeans_plusplus after it. Without
+            # this the caller's "drop to the ungraphed loop" recovery cannot
+            # work, because the thing it recovers from is still in effect.
+            try:
+                g.capture_end()
+            except BaseException as end_err:      # pragma: no cover
+                logger.debug(f'capture_end after a failed capture: {end_err}')
+            raise
         g.capture_end()
     # Only now is it safe to drop the previous graph: _POOL needs a live user
     # at capture_begin. See MEMORY above.

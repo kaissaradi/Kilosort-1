@@ -209,7 +209,7 @@ def _counts_into(buf, idx_flat, ones, pen_row, pen_col, scale):
 _SNAP_ITERS = (0, 1, 2, 3, 5, 7, 10, 15, 25, 50, 100)
 
 
-def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
+def cluster(Xd, iclust=None, kn=None, M=None, nskip=1, n_neigh=10, max_sub=25000,
             nclust=200, seed=1, niter=200, lam=0, device=torch.device('cuda'),
             verbose=False, snapshots=None):
     # Numerically exact rewrite of the alternating-assignment loop:
@@ -226,6 +226,15 @@ def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
         kn, M = neigh_mat(
             Xd, nskip=nskip, n_neigh=n_neigh, max_sub=max_sub, device=device
         )
+    elif M is None:
+        # neigh_mat returns kn and M together and Mstats needs M, so a caller
+        # that supplies precomputed neighbours must supply both. Without this
+        # the next line raised UnboundLocalError, which named neither the
+        # cause nor the fix. Upstream has the same hole; no in-tree caller
+        # passes kn, so this path has never run in production.
+        raise ValueError(
+            'cluster(kn=...) also needs M=..., the adjacency matrix that '
+            'neigh_mat returns alongside kn.')
     m, ki, kj = Mstats(M, device=device)
 
     if verbose:
@@ -678,16 +687,22 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
     refrac_veto_alpha = float(ops['settings'].get(
         'refractory_veto_alpha', swarmsplitter.REFRAC_VETO_ALPHA))
 
-    def _postprocess(Xd, iclust, iclust0, M, st0, snaps, iclust_init,
-                     igood, ichan, v_flag):
-        """Tree build + split + relabel + templates for one center (CPU)."""
+    def _postprocess(Xd, iclust, iclust0, M, st0, snaps, iclust_init_np,
+                     igood, ichan):
+        """Tree build + split + relabel + templates for one center.
+
+        This runs on a worker thread while the main thread holds the GPU, so
+        it must not touch CUDA at all. `kmeans_plusplus` captures a CUDA graph
+        per center, and during a capture no other thread may issue a CUDA
+        call -- not even the allocator free that dropping the last reference
+        to a CUDA tensor triggers. Every argument here is a CPU tensor, a
+        numpy array, or a scipy matrix. Keep it that way, and keep
+        `log_performance` out: it reads `torch.cuda.memory_allocated`.
+        """
         if snaps is not None:
             swarmsplitter.write_trace_stats(st0, snaps, iclust)
-        if st0 is not None and os.environ.get('KS4_SPLIT_STATS'):
-            swarmsplitter.write_init_stats(
-                st0, iclust,
-                iclust_init.cpu().numpy()
-                if hasattr(iclust_init, 'cpu') else np.asarray(iclust_init))
+        if iclust_init_np is not None:
+            swarmsplitter.write_init_stats(st0, iclust, iclust_init_np)
 
         xtree, tstat, my_clus = hierarchical.maketree(M, iclust, iclust0)
         xtree, tstat = swarmsplitter.split(
@@ -702,9 +717,6 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
             swarmsplitter.write_post_stats(st0, iclust)
 
         wall_part = mean_cluster_templates(Xd, iclust, ichan, Nchan, n_pcs)
-
-        if v_flag:
-            log_performance(logger, header='clustering_qr.run, after iclust')
 
         return iclust, igood, wall_part
 
@@ -742,10 +754,11 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                     if verbose:
                         v = True
 
-                if pending is not None:
-                    _collect_pending(pending)
-                    pending = None
-
+                # The join for the previous center is NOT here. Joining before
+                # this center's GPU work made the pool serial: the submit sat
+                # at the bottom of the loop body and the join at the top, with
+                # only bookkeeping between them, so nothing overlapped. Each
+                # branch below joins immediately before it needs `nmax`.
                 Xd, igood, ichan = get_data_cpu(
                     ops, xy, iC, iclust_template_t, tF, ycent[kk], xcent[jj],
                     dmin=dmin, dminx=dminx, ix=ix,
@@ -761,6 +774,12 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                         torch.cuda.reset_peak_memory_stats(device)
                     v = True
                 if Xd.shape[0] < 1000:
+                    # This branch reads and advances nmax itself, so the
+                    # previous center must be applied first or the cluster
+                    # ids come out in a different order.
+                    if pending is not None:
+                        _collect_pending(pending)
+                        pending = None
                     iclust = np.zeros(Xd.shape[0], dtype=np.int32)
                     clu[igood] = iclust + nmax
                     Nfilt = int(iclust.max() + 1)
@@ -781,6 +800,26 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                         niter=CLUSTER_ITERS, snapshots=snaps
                         )
 
+                    # iclust_init is on the GPU. The worker thread must never
+                    # hold it: dropping the last reference frees it through
+                    # the caching allocator, and that is a CUDA call. Read it
+                    # here, on the main thread, and only when it gets used.
+                    iclust_init_np = None
+                    if st0 is not None and os.environ.get('KS4_SPLIT_STATS'):
+                        iclust_init_np = (
+                            iclust_init.cpu().numpy()
+                            if hasattr(iclust_init, 'cpu')
+                            else np.asarray(iclust_init))
+                    iclust_init = None
+
+                    # The previous center's CPU postprocess ran while
+                    # get_data_cpu and cluster held the GPU. Join it now, in
+                    # center order, so clu / nmax / wall_parts are built in
+                    # exactly the order the serial version built them.
+                    if pending is not None:
+                        _collect_pending(pending)
+                        pending = None
+
                     if clear_cache:
                         if v:
                             log_performance(logger, header='clustering_qr before gc')
@@ -793,7 +832,11 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
 
                     pending = cpu_pool.submit(
                         _postprocess, Xd, iclust, iclust0, M, st0,
-                        snaps, iclust_init, igood, ichan, v)
+                        snaps, iclust_init_np, igood, ichan)
+                    if v:
+                        # On the main thread: this reads CUDA memory stats.
+                        log_performance(
+                            logger, header='clustering_qr.run, after iclust')
 
                 if progress_bar is not None:
                     progress_bar.emit(int((kk+1) / len(ycent) * 100))
