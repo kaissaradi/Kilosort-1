@@ -174,7 +174,8 @@ def _next_pow2(n):
     return p
 
 
-def _run(B, weigh, iC, iC2_flat, nC2, Nfilt, As, imaxs, Amaxs, cfg):
+def _run(B, weigh, iC, iC2_flat, nC2, Nfilt, As, imaxs, Amaxs, cfg,
+         compute_amax=True):
     """Fill As / imaxs / Amaxs in place from the full-width B. One launch each
     -- the fused body needs no column tiling, since output column m reads only
     B[:, :, m]."""
@@ -192,9 +193,10 @@ def _run(B, weigh, iC, iC2_flat, nC2, Nfilt, As, imaxs, Amaxs, cfg):
         As.stride(0), As.stride(1),
         NK=nk, NC=nC, NIL=nil, NIL_P=_next_pow2(nil), BLOCK_M=block_m,
         num_warps=num_warps, num_stages=1)
-    _amax_kernel[grid](
-        As, iC2_flat, Amaxs, NT, Nfilt, As.stride(0), As.stride(1),
-        NC2=nC2, BLOCK_M=block_m, num_warps=num_warps, num_stages=1)
+    if compute_amax:
+        _amax_kernel[grid](
+            As, iC2_flat, Amaxs, NT, Nfilt, As.stride(0), As.stride(1),
+            NC2=nC2, BLOCK_M=block_m, num_warps=num_warps, num_stages=1)
 
 
 def _eligible(B, weigh, iC, As, imaxs, Amaxs):
@@ -219,7 +221,8 @@ def _eligible(B, weigh, iC, As, imaxs, Amaxs):
     return True
 
 
-def try_fill(B, weigh, iC, iC2_flat, nC2, Nfilt, As, imaxs, Amaxs, stock_fill):
+def try_fill(B, weigh, iC, iC2_flat, nC2, Nfilt, As, imaxs, Amaxs, stock_fill,
+             *, compute_amax=True):
     """Fill the three peak buffers, fused if it is provably safe to.
 
     Returns True if the buffers are filled and the caller should do nothing
@@ -228,13 +231,22 @@ def try_fill(B, weigh, iC, iC2_flat, nC2, Nfilt, As, imaxs, Amaxs, stock_fill):
     comparing all three element by element; the fastest config that is exactly
     equal is kept for the rest of the sort. It returns True in that case too --
     the stock result is already in place and is the one used for this batch.
+
+    compute_amax=False skips only the spatial maximum AFTER kernel validation.
+    As/imaxs use the same kernel and arithmetic. Amaxs is unspecified in this
+    mode; the caller must compute suppression independently. Validation always
+    computes and compares all three original buffers.
     """
     global _CHOICE
 
     if _CHOICE is False:
         return False
     if _CHOICE is not None:
-        _run(B, weigh, iC, iC2_flat, nC2, Nfilt, As, imaxs, Amaxs, _CHOICE)
+        if compute_amax:
+            _run(B, weigh, iC, iC2_flat, nC2, Nfilt, As, imaxs, Amaxs, _CHOICE)
+        else:
+            _run(B, weigh, iC, iC2_flat, nC2, Nfilt, As, imaxs, Amaxs, _CHOICE,
+                 compute_amax=False)
         return True
 
     if not _eligible(B, weigh, iC, As, imaxs, Amaxs):

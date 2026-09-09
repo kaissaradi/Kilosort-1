@@ -48,7 +48,7 @@ from kilosort.run_kilosort import run_kilosort   # noqa: E402
 
 SWITCHES = ['KILOSORT_NO_FUSED_DETECT', 'KILOSORT_NO_FUSED_PEEL',
             'KILOSORT_NO_FUSED_PEAKS', 'KILOSORT_NO_FAST_KPP',
-            'KILOSORT_NO_KPP_GRAPH']
+            'KILOSORT_NO_KPP_GRAPH', 'KILOSORT_REORDERED_SUPPRESSION']
 
 
 def main():

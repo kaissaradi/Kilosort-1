@@ -12,7 +12,7 @@ from sklearn.cluster import KMeans
 from sklearn.decomposition import TruncatedSVD
 from tqdm import tqdm
 
-from kilosort import fused_detect, fused_peaks
+from kilosort import fused_detect, fused_peaks, reordered_suppression
 from kilosort.utils import (
     get_clip_buffer_capacity,
     get_spike_buffer_capacity,
@@ -488,8 +488,24 @@ def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda'),
     # element-by-element on the first batch of every sort and returns False
     # for the rest of the run if it does not match exactly -- see
     # fused_detect.py for why that check is not optional.
+    # Opt-in experiment. This pass's scratch owns the validation state;
+    # another pass, neighborhood, shape or mask setting must revalidate.
+    reorder_mode = os.environ.get('KILOSORT_REORDERED_SUPPRESSION', '')
+    reorder = reorder_mode in ('1', 'check')
+    state = None
+    if reorder:
+        state = scratch.setdefault('reordered_suppression', {}) if scratch is not None else {}
+        signature = (tuple(As.shape), As.dtype, As.device, nt, nt0,
+                     float(ops['Th_universal']), iC2._version)
+        if state.get('neighbors') is not iC2 or state.get('signature') != signature:
+            state.clear()
+            state.update(neighbors=iC2, signature=signature)
+        if state.get('verified') is False and reorder_mode != 'check':
+            reorder = False
+    skip_amax = reorder and state.get('verified') is True and reorder_mode != 'check'
+    fill_options = {'compute_amax': False} if skip_amax else {}
     if not fused_detect.try_fill(B, weigh, iC, iC2_flat, nC2, Nfilt,
-                                 As, imaxs, Amaxs, stock_fill):
+                                 As, imaxs, Amaxs, stock_fill, **fill_options):
         stock_fill()
 
     # Fused peak selection: one kernel for the edge zeroing, the sliding max,
@@ -500,12 +516,31 @@ def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda'),
     # is no accumulation order to reproduce. try_mask still checks the whole
     # result against the stock statements on the first batch of every sort and
     # returns None for the rest of the run if it does not match exactly.
-    mask = fused_peaks.try_mask(As, Amaxs, nt, nt0, ops['Th_universal'])
-    if mask is None:
-        Amaxs[:,:nt] = 0
-        Amaxs[:,-nt:] = 0
-        Amaxs  = max_pool1d(Amaxs.unsqueeze(0), (2*nt0+1), stride = 1, padding = nt0).squeeze(0)
-        mask = torch.logical_and(Amaxs==As, As > ops['Th_universal'])
+    mask = None
+    if not skip_amax:
+        mask = fused_peaks.try_mask(As, Amaxs, nt, nt0, ops['Th_universal'])
+        if mask is None:
+            Amaxs[:,:nt] = 0
+            Amaxs[:,-nt:] = 0
+            pooled = max_pool1d(Amaxs.unsqueeze(0), (2*nt0+1), stride=1, padding=nt0).squeeze(0)
+            mask = torch.logical_and(pooled == As, As > ops['Th_universal'])
+            del pooled
+    if reorder:
+        candidate_mask = reordered_suppression.mask(
+            As, iC2, nt, nt0, ops['Th_universal'], workspace=Amaxs)
+        if skip_amax:
+            mask = candidate_mask
+        else:
+            matches = torch.equal(mask, candidate_mask)
+            state['verified'] = matches
+            if reorder_mode == 'check' and not matches:
+                raise RuntimeError('Reordered suppression differs from the original mask')
+            if not matches:
+                logger.warning('Reordered suppression disabled: mask validation failed')
+            elif not state.get('logged'):
+                logger.info('Reordered suppression validated; mode=%s (experimental)', reorder_mode)
+                state['logged'] = True
+            # Keep the reference mask on validation batches, even on success.
     xy = mask.nonzero()
     imax = imaxs[xy[:,0], xy[:,1]]
     amp = As[xy[:,0], xy[:,1]]
