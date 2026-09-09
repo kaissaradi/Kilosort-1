@@ -67,12 +67,16 @@ with open("README.md", "r") as fh:
     long_description = fh.read()
 
 setup(
+    # The distribution name is deliberately unchanged, so `import kilosort`
+    # and every downstream pipeline keep working. But the version this branch
+    # tags (4.5.0) does NOT exist upstream, so the description has to say what
+    # this build is. Do not let a wheel claim to be upstream's release.
     name="kilosort",
     python_requires='>=3.9',
     license="BSD",
     author="Marius Pachitariu",
     author_email="pachitarium@janelia.hhmi.org",
-    description="spike sorting pipeline",
+    description="spike sorting pipeline - MEA-fieldlab fork of Kilosort4",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/MouseLand/kilosort",
