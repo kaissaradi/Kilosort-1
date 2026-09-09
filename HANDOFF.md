@@ -320,14 +320,83 @@ scratchpad under `/tmp` and will not survive a reboot.
 `test_fused_detect.py`, `test_fused_peel.py`, `test_fast_kpp.py`,
 `test_fused_peaks.py`, `test_fused_peel_cond.py`, `test_fused_peel_store.py`.
 
-**There is no pytest in any conda env on this machine.** `tools/run_tests.py`
-installs a minimal shim and runs the real files anyway — `python
-tools/run_tests.py`, currently **102 passed, 0 failed, 0 skipped, 0 errored**
-across 7 files (`fused_detect` 5, `fused_peel` 20, `fused_peel_cond` 11,
-`fused_peel_store` 9, `fused_peaks` 12, `fast_kpp` 11, `mea_fork` 34).
-Before it existed the gate tests were driven by throwaway scripts under `/tmp`
-that *re-implemented* the assertions, so the committed test files had never
-actually been executed. Run this before trusting a change.
+**pytest works now.** In the `kilosort1` env,
+`~/anaconda3/envs/kilosort1/bin/python -m pytest tests -q` gives **240 passed,
+1 skipped in 13 s** (2026-09-08). Run it before trusting a change.
+
+`tools/run_tests.py` predates that and still works: it installs a minimal shim
+and runs the real files without pytest. It exists because no conda env on this
+machine had pytest, which is no longer true, so the older line here saying
+"there is no pytest in any conda env" was stale. Before it existed the gate
+tests were driven by throwaway scripts under `/tmp` that *re-implemented* the
+assertions, so the committed test files had never actually been executed.
 
 Every optimization sits behind a `KILOSORT_NO_*` env switch and a runtime gate
 that validates against the stock path once per process. Keep that pattern.
+
+---
+
+## Eight defects fixed 2026-09-08 (commits `c311f70`, `1b27c81`)
+
+Seven came from a review, one was found while fixing the second. All eight are
+in the gate and cache machinery rather than the kernels, and none of them
+changed a byte of output: `compare_sorts` on the deterministic slice300 pair
+gives 24 files byte-identical, 0 differ, for both commits.
+
+| # | Defect | Reachable today? |
+|---|---|---|
+| 1 | `fast_kpp._graph_loop` left the CUDA capture open on failure | Only via 3 |
+| 2 | `capture_error_mode` was `'global'`, so any thread's CUDA action killed the capture | Yes |
+| 3 | `clustering_qr.run`'s "overlap" was serial: submit at the bottom, join at the top | Yes, it simply did nothing |
+| 4 | The pool worker was not CUDA-free (held `iclust_init`, called `log_performance`) | Only once 3 was fixed |
+| 5 | `save_to_phy` copied `tF[kept_spikes]` even with `save_pc_features=False` | Yes |
+| 6 | A stale `pc_features.npy` survived beside fresh spike outputs | Yes |
+| 7 | `fused_detect.try_fill` skipped `_eligible` for a cached config | Second sort in one process |
+| 8 | `fused_peel._get_tile_lut`'s key omitted `storage_offset` and `block_r`; nothing evicted | Second sort, and memory always |
+
+**The one that matters most is 1.** A capture left open puts the stream in
+capture mode for the life of the process, so every later CUDA call anywhere
+fails. `try_run`'s recovery -- catch, disable the graph, fall back to the
+ungraphed loop -- could not work, because the fallback issues CUDA calls into
+the still-open capture, and so does stock `kmeans_plusplus` after it. The error
+surfaced three fallbacks downstream, on the main thread, in
+`_kmeans_plusplus_stock`, naming neither the cause nor the thread that caused
+it.
+
+**Fixing 3 needed 1, 2 and 4 first.** The overlap and the CUDA graph are
+incompatible under global capture mode, and making the worker CUDA-free is not
+sufficient on its own: Python can free a device tensor on any thread at any
+allocation. With all four fixed, slice300 goes 44.68/44.23 s -> 42.38/42.19 s
+core (4.9%), and 54.33 -> 47.60 s deterministic (12.4%). The deterministic arm
+gains more because it slows the GPU side, so more CPU work hides under it.
+
+Both 7 and 8 were mutation-checked: with the fix reverted, the new tests fail
+with `ValueError: Pointer argument (at 0) cannot be accessed from Triton (cpu
+tensor?)` and with dead-weakref cache entries still holding `cuda:0` tensors.
+
+### The codex branches, assessed and NOT merged
+
+`codex/reordered-universal-suppression` is current (based on `70e5c1b`) and
+adds an opt-in `compute_amax=False` path plus `reordered_suppression.py`. It
+is an experiment, not a fix: it reorders detection, so a byte compare cannot
+validate it. It needs its own accuracy argument.
+
+`codex/full-run-candidate` forked 59 commits ago at `3f0483b` and touches
+`clustering_qr.py` and `io.py`. Do not merge it whole.
+
+**Do not take `9fca485` "Use local RNG for reproducible k-means++" as a
+cherry-pick.** The global side effect it removes is real -- stock's
+`torch.manual_seed(seed)` resets the process generator on every call -- but
+this branch's identity argument is stated in terms of that global generator.
+`fast_kpp`'s module docstring says so explicitly: "either path leaves it in
+the same state ... so downstream code cannot tell which ran", measured as
+"generator state identical in all 32". The seeding appears in three places
+(`clustering_qr.py:362`, `fast_kpp.py:119`, `fast_kpp.py:226`) and a local
+generator would have to replace all three at once, with that proof redone.
+Codex wrote the change against a tree that had no `fast_kpp`.
+
+Worth taking after testing: the four new test files and the `test_mea_fork.py`
+additions, and `62e222b`'s `save_to_phy` input validation -- but note that one
+adds a "spike times must be nondecreasing" check over 11 M spikes on every
+export, which would fail hard on any legitimate path that produces unsorted
+times.
