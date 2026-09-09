@@ -9,6 +9,21 @@ from kilosort.io import load_probe
 from kilosort.utils import PROBE_DIR
 
 
+def test_final_merge_union_acg_veto_is_registered_with_default_and_provenance():
+    from kilosort.parameters import DEFAULT_SETTINGS, EXTRA_PARAMETERS, compare_settings
+    from kilosort.run_kilosort import RECOGNIZED_SETTINGS
+
+    parameter = EXTRA_PARAMETERS['final_merge_union_acg_veto']
+    assert parameter['type'] is bool
+    assert parameter['default'] is False
+    assert parameter['step'] == 'postprocessing'
+    assert DEFAULT_SETTINGS['final_merge_union_acg_veto'] is False
+    assert 'final_merge_union_acg_veto' in RECOGNIZED_SETTINGS
+    assert compare_settings({'final_merge_union_acg_veto': True})[0] == {
+        'final_merge_union_acg_veto': True
+    }
+
+
 def test_dmin():
     settings = {'dmin': None, 'dminx': 32}
     ops = {'xc': np.array([10, 20, 30]), 'yc': np.array([40, 40, 60]),

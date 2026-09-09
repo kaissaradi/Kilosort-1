@@ -412,6 +412,20 @@ EXTRA_PARAMETERS = {
             """
     },
 
+    'final_merge_union_acg_veto': {
+        'gui_name': 'final merge union ACG veto', 'type': bool, 'min': None,
+        'max': None, 'exclude': [], 'default': False, 'step': 'postprocessing',
+        'description':
+            """
+            In the final CCG-mode clustering merge stage, refuse a candidate
+            merge when the prospective union spike train is not refractory.
+            The union is checked after applying the same template-alignment
+            shift that the merge would commit. This is separate from
+            `refractory_merge_veto`, which applies earlier during hierarchical
+            clustering and uses different behavior.
+            """
+    },
+
     'refractory_veto_ratio': {
         'gui_name': 'refractory veto ratio', 'type': float, 'min': 0.0,
         'max': 2.0, 'exclude': [], 'default': 0.35, 'step': 'clustering',

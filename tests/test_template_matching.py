@@ -3,6 +3,7 @@ import numpy as np
 import torch
 from torch.nn.functional import conv1d
 
+from kilosort import CCG
 from kilosort.template_matching import (
     _matching_unit_cache,
     merging_function,
@@ -204,6 +205,127 @@ def _synthetic_merge_case(seed=0, n_spikes=400, n_units=8):
         'fs': 20_000.0,
     }
     return ops, Wall, clu, st, tF, device
+
+
+def _two_cluster_ccg_case(aligned=False):
+    """Small deterministic CCG merge case with an optional template offset."""
+    fs = 1000.0
+    n_spikes = 40
+    a = np.arange(n_spikes, dtype=np.float64) * 10.0
+    b = a + 5.0
+    st = np.zeros((2 * n_spikes, 2), dtype=np.float64)
+    st[:, 0] = np.concatenate((a, b))
+    clu = np.concatenate((np.zeros(n_spikes), np.ones(n_spikes))).astype(np.int32)
+    st[:, 1] = clu
+
+    if aligned:
+        # The two templates produce dt=4 below, so the committed merge shifts
+        # cluster 0 by four samples and makes the prospective union non-
+        # refractory even though the pre-alignment union is clean.
+        W = torch.tensor([
+            [1., 0, 0, 0, 0, 0, 0],
+            [0, 0, 0, 0, 1, 0, 0],
+        ])
+        Wall = torch.eye(2).reshape(2, 1, 2)
+    else:
+        W = torch.ones(1, 3)
+        Wall = torch.ones(2, 1, 1)
+
+    ops = {
+        'settings': {
+            'acg_threshold': 0.2,
+            'ccg_threshold': 0.25,
+        },
+        'nt': W.shape[1],
+        'wPCA': W,
+        'fs': fs,
+    }
+    tF = torch.zeros((st.shape[0], Wall.shape[1], Wall.shape[2]))
+    return ops, Wall, clu, st, tF, torch.device('cpu')
+
+
+def _assert_merge_outputs_equal(got, expected):
+    Ww_g, clu_g, ref_g, st_g, tF_g = got
+    Ww_e, clu_e, ref_e, st_e, tF_e = expected
+    if ref_g is None or ref_e is None:
+        assert ref_g is None and ref_e is None
+    else:
+        np.testing.assert_array_equal(ref_g, ref_e)
+    assert torch.equal(Ww_g, Ww_e)
+    np.testing.assert_array_equal(clu_g, clu_e)
+    np.testing.assert_array_equal(st_g, st_e)
+    assert torch.equal(tF_g, tF_e)
+
+
+def test_final_union_acg_veto_default_off_matches_missing_setting_and_template_mode():
+    ops, Wall, clu, st, tF, device = _two_cluster_ccg_case(aligned=False)
+    missing = merging_function(
+        ops, Wall.clone(), clu.copy(), st.copy(), tF.clone(),
+        r_thresh=0.5, mode='ccg', check_dt=True, device=device
+    )
+    ops['settings']['final_merge_union_acg_veto'] = False
+    explicit_off = merging_function(
+        ops, Wall.clone(), clu.copy(), st.copy(), tF.clone(),
+        r_thresh=0.5, mode='ccg', check_dt=True, device=device
+    )
+    _assert_merge_outputs_equal(explicit_off, missing)
+
+    # The setting is deliberately scoped out of template-mode merging.
+    ops['settings']['final_merge_union_acg_veto'] = True
+    template_on = merging_function(
+        ops, Wall.clone(), clu.copy(), st.copy(), tF.clone(),
+        r_thresh=0.5, mode='template', check_dt=True, device=device
+    )
+    ops['settings']['final_merge_union_acg_veto'] = False
+    template_off = merging_function(
+        ops, Wall.clone(), clu.copy(), st.copy(), tF.clone(),
+        r_thresh=0.5, mode='template', check_dt=True, device=device
+    )
+    _assert_merge_outputs_equal(template_on, template_off)
+
+
+def test_final_union_acg_veto_rejects_a_bad_union():
+    ops, Wall, clu, st, tF, device = _two_cluster_ccg_case(aligned=False)
+    # Keep cluster 0 refractory, but put sub-refractory pairs in cluster 1.
+    st[40:, 0] = np.sort(np.concatenate((
+        np.arange(20, dtype=np.float64) * 20.0 + 2.0,
+        np.arange(20, dtype=np.float64) * 20.0 + 2.5,
+    )))
+    ops['settings']['final_merge_union_acg_veto'] = True
+    vetoed = merging_function(
+        ops, Wall, clu.copy(), st.copy(), tF, r_thresh=0.5,
+        mode='ccg', check_dt=True, device=device
+    )
+    assert ops['final_merge_union_acg_veto_count'] >= 1
+    assert vetoed[0].shape[0] == 2
+    order = np.argsort(st[:, 0])
+    np.testing.assert_array_equal(vetoed[1], clu[order])
+
+
+def test_final_union_acg_veto_checks_after_dt_alignment():
+    ops, Wall, clu, st, tF, device = _two_cluster_ccg_case(aligned=True)
+    fs = ops['fs']
+    assert bool(CCG.check_CCG(np.sort(st[:, 0] / fs))[0])
+
+    # Without the veto the merge commits dt=4 and shifts cluster 0. The same
+    # prospective union is not refractory, so the opt-in gate must reject it.
+    ops['settings']['final_merge_union_acg_veto'] = False
+    merged = merging_function(
+        ops, Wall.clone(), clu.copy(), st.copy(), tF.clone(),
+        r_thresh=0.5, mode='ccg', check_dt=True, device=device
+    )
+    assert merged[0].shape[0] == 1
+    np.testing.assert_array_equal(merged[3][:, 0], np.sort(np.r_[st[:40, 0] - 4, st[40:, 0]]))
+    assert not bool(CCG.check_CCG(merged[3][:, 0] / fs)[0])
+
+    ops['settings']['final_merge_union_acg_veto'] = True
+    vetoed = merging_function(
+        ops, Wall.clone(), clu.copy(), st.copy(), tF.clone(),
+        r_thresh=0.5, mode='ccg', check_dt=True, device=device
+    )
+    assert ops['final_merge_union_acg_veto_count'] >= 1
+    assert vetoed[0].shape[0] == 2
+    np.testing.assert_array_equal(vetoed[3], st[np.argsort(st[:, 0])])
 
 
 def test_merging_function_zero_energy_templates_no_nan_dmu():
