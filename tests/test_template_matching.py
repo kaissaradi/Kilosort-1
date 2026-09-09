@@ -557,3 +557,171 @@ def test_merging_function_ccg_mode_matches_reference():
     np.testing.assert_allclose(st_g, st_e, rtol=0, atol=0)
     assert torch.allclose(Ww_g, Ww_e, rtol=1e-5, atol=1e-5)
     assert torch.allclose(tF_g, tF_e, rtol=1e-5, atol=1e-5)
+
+
+# --------------------------------------------------------------------------
+# KS4_DUMP_RESIDUAL -- the diagnostic that answers whether the peel's
+# arithmetic truncation reaches the output.
+# --------------------------------------------------------------------------
+
+def test_residual_dump_is_off_unless_asked():
+    """Unset must mean None, so a normal sort never clones a batch.
+
+    The clone is the whole cost of this feature. run_matching peels IN PLACE,
+    so the pre-peel copy has to be taken before the call, and taking it
+    unconditionally would add a 519 x 60000 float32 clone -- 125 MiB -- to
+    every batch of every sort. Byte identity is unaffected either way, but the
+    memory is not.
+    """
+    import os
+
+    from kilosort.template_matching import _residual_dump_request
+
+    old = os.environ.pop('KS4_DUMP_RESIDUAL', None)
+    try:
+        assert _residual_dump_request() is None
+        os.environ['KS4_DUMP_RESIDUAL'] = ''
+        assert _residual_dump_request() is None, 'empty must behave as unset'
+    finally:
+        os.environ.pop('KS4_DUMP_RESIDUAL', None)
+        if old is not None:
+            os.environ['KS4_DUMP_RESIDUAL'] = old
+
+
+def test_residual_dump_rejects_a_spec_with_no_directory():
+    """'5' alone is ambiguous, so it must raise instead of guessing a path."""
+    import os
+
+    from kilosort.template_matching import _residual_dump_request
+
+    old = os.environ.get('KS4_DUMP_RESIDUAL')
+    os.environ['KS4_DUMP_RESIDUAL'] = '5'
+    try:
+        raised = False
+        try:
+            _residual_dump_request()
+        except ValueError as e:
+            raised = 'KS4_DUMP_RESIDUAL' in str(e)
+        assert raised, 'a spec with no directory must raise ValueError'
+    finally:
+        os.environ.pop('KS4_DUMP_RESIDUAL', None)
+        if old is not None:
+            os.environ['KS4_DUMP_RESIDUAL'] = old
+
+
+def test_residual_dump_writes_what_the_analysis_needs():
+    """The dump must carry Wrot, because a whitened channel is not a location.
+
+    Whitening mixes channels, so the residual arrives in a space where
+    "channel 7" is a linear combination of electrodes. Without Wrot the
+    analysis cannot say whether the leftover energy sits on the distal
+    channels the template never reached, which is the entire question.
+    """
+    import os
+    import tempfile
+
+    from kilosort.template_matching import _write_residual_dump
+
+    n_chan, n_time, nt, n_pcs = 6, 40, 11, 3
+    X_pre = torch.randn(n_chan, n_time)
+    Xres = X_pre * 0.25
+    # stt MUST be a torch tensor here, not numpy. run_matching returns it as a
+    # CUDA tensor, and an earlier version of this test passed numpy -- so it
+    # passed while a real sort died on `np.asarray(cuda_tensor)`. A unit test
+    # whose input type differs from production tests nothing about production.
+    stt = torch.tensor([[10, 0], [20, 1]], dtype=torch.int64)
+    U = torch.randn(2, n_chan, n_pcs)
+    ops = {
+        'nt': nt, 'nt0min': 4,
+        'settings': {'n_pcs': n_pcs, 'nearest_chans': 4, 'fs': 20000.0},
+        'Wrot': torch.eye(n_chan),
+        'wPCA': torch.randn(n_pcs, nt),
+        'xc': np.arange(n_chan, dtype=np.float32),
+        'yc': np.zeros(n_chan, dtype=np.float32),
+    }
+    with tempfile.TemporaryDirectory() as d:
+        _write_residual_dump(d, 7, X_pre, Xres, stt, U, ops)
+        sub = os.path.join(d, 'batch00007')
+        for name in ('pre', 'residual', 'stt', 'U', 'Wrot', 'wPCA', 'xc',
+                     'yc'):
+            p = os.path.join(sub, name + '.npy')
+            assert os.path.exists(p), f'{name}.npy missing from the dump'
+
+        pre = np.load(os.path.join(sub, 'pre.npy'))
+        res = np.load(os.path.join(sub, 'residual.npy'))
+        assert pre.shape == (n_chan, n_time)
+        assert pre.dtype == np.float16, 'big arrays are float16 by design'
+        # The residual must be the post-peel array, not a second copy of the
+        # input. Getting these two backwards would silently invert every
+        # conclusion drawn from the dump.
+        assert np.abs(res).max() < np.abs(pre).max(), (
+            'residual is not smaller than pre -- the two may be swapped')
+        assert np.allclose(res.astype(np.float32),
+                           pre.astype(np.float32) * 0.25, atol=1e-2)
+
+        saved_stt = np.load(os.path.join(sub, 'stt.npy'))
+        assert saved_stt.tolist() == [[10, 0], [20, 1]], saved_stt.tolist()
+
+        meta = np.load(os.path.join(sub, 'meta.npy'),
+                       allow_pickle=True).item()
+        assert meta['ibatch'] == 7 and meta['nearest_chans'] == 4
+        assert meta['shape_pre'] == [n_chan, n_time]
+
+
+def test_residual_dump_handles_a_device_resident_array():
+    """The dump must not call np.asarray on a device tensor.
+
+    This is the bug the CPU test above cannot catch. np.asarray works fine on a
+    CPU tensor and raises only on a CUDA one, so the first version of this
+    dump passed every unit test and then killed a real sort with
+    "can't convert cuda:0 device type tensor to numpy".
+
+    There is no GPU in the test environment, so the CONTRACT is stubbed
+    instead of the hardware: an object that raises on __array__ and offers
+    detach().cpu().numpy(), which is exactly what a CUDA tensor is to this
+    code. That makes the guard real without requiring a device.
+    """
+    import os
+    import tempfile
+
+    from kilosort.template_matching import _to_numpy, _write_residual_dump
+
+    class DeviceResident:
+        """Behaves like a CUDA tensor for the two paths that matter."""
+
+        def __init__(self, arr):
+            self._arr = np.asarray(arr)
+
+        def __array__(self, *a, **k):
+            raise TypeError("can't convert cuda:0 device type tensor to numpy")
+
+        def detach(self):
+            return self
+
+        def cpu(self):
+            return self
+
+        def numpy(self):
+            return self._arr
+
+    stub = DeviceResident([[10, 0], [20, 1]])
+    assert _to_numpy(stub).tolist() == [[10, 0], [20, 1]]
+
+    n_chan, n_time, nt, n_pcs = 6, 40, 11, 3
+    ops = {
+        'nt': nt, 'nt0min': 4,
+        'settings': {'n_pcs': n_pcs, 'nearest_chans': 4, 'fs': 20000.0},
+        'Wrot': DeviceResident(np.eye(n_chan)),
+        'wPCA': DeviceResident(np.zeros((n_pcs, nt))),
+        'xc': np.arange(n_chan, dtype=np.float32),
+        'yc': np.zeros(n_chan, dtype=np.float32),
+    }
+    with tempfile.TemporaryDirectory() as d:
+        # Must not raise. Every device-resident input has to survive the dump.
+        _write_residual_dump(d, 3, torch.randn(n_chan, n_time),
+                             torch.randn(n_chan, n_time), stub,
+                             torch.randn(2, n_chan, n_pcs), ops)
+        sub = os.path.join(d, 'batch00003')
+        assert np.load(os.path.join(sub, 'stt.npy')).tolist() == [[10, 0],
+                                                                 [20, 1]]
+        assert np.load(os.path.join(sub, 'Wrot.npy')).shape == (n_chan, n_chan)

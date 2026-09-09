@@ -1,7 +1,8 @@
 import logging
+import os
 
 import numpy as np
-import torch 
+import torch
 from torch.nn.functional import conv1d, max_pool2d, max_pool1d
 from tqdm import tqdm
 
@@ -13,6 +14,84 @@ from kilosort.utils import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _residual_dump_request():
+    """Parse KS4_DUMP_RESIDUAL, which is 'directory:batch_index'.
+
+    Diagnostic only, and OFF unless the variable is set. The peel subtracts a
+    template that covers a median of 13 of 519 channels and leaves 17.6-23.0%
+    of each cell's signal energy on channels it never touches
+    (src/utilities/AXONAL_AND_PEEL_TRUNCATION.md §1). Whether that arithmetic
+    gap reaches the OUTPUT is a separate question, and answering it needs the
+    residual, which kilosort does not otherwise save.
+
+    Byte identity: when the variable is unset this returns None, no batch is
+    ever selected, and the pre-peel clone below is never taken. The only cost
+    on a normal run is one integer comparison per batch.
+    """
+    spec = os.environ.get('KS4_DUMP_RESIDUAL')
+    if not spec:
+        return None
+    path, _, batch = spec.rpartition(':')
+    if not path:
+        raise ValueError(
+            "KS4_DUMP_RESIDUAL must be 'directory:batch_index', got "
+            f"{spec!r}")
+    os.makedirs(path, exist_ok=True)
+    return path, int(batch)
+
+
+def _to_numpy(v):
+    """Anything the dump might hold -> a host numpy array.
+
+    Every array in ops or returned by run_matching may be a CUDA tensor, a CPU
+    tensor, or already numpy, and np.asarray raises on the first of those.
+    """
+    if hasattr(v, 'detach'):
+        return v.detach().cpu().numpy()
+    return np.asarray(v)
+
+
+def _write_residual_dump(path, ibatch, X_pre, Xres, stt, U, ops):
+    """Save one batch's pre-peel data, post-peel residual, and its spikes.
+
+    Everything is in the WHITENED, FILTERED space the peel works in, which is
+    the space that matters for re-detection: a residual only becomes a spurious
+    spike if it survives there. `Wrot` is saved alongside so the analysis can
+    map back to raw channels, because whitening MIXES channels and a whitened
+    channel is not a location.
+
+    Written as float16 for the two big arrays. They are diagnostics, and at
+    519 x 60000 float32 a pair costs 250 MB per batch. float16 keeps ~3 decimal
+    digits, which is far more than a shape comparison needs, and the analysis
+    that reads these files does not feed any sorter output.
+    """
+    d = os.path.join(path, f'batch{ibatch:05d}')
+    os.makedirs(d, exist_ok=True)
+    np.save(os.path.join(d, 'pre.npy'),
+            X_pre.detach().to(torch.float16).cpu().numpy())
+    np.save(os.path.join(d, 'residual.npy'),
+            Xres.detach().to(torch.float16).cpu().numpy())
+    # stt columns are (time_in_batch, template_index, ...) as run_matching
+    # builds them; saved raw so the analysis does not depend on my reading.
+    # run_matching returns it as a CUDA tensor, so np.asarray alone raises.
+    np.save(os.path.join(d, 'stt.npy'), _to_numpy(stt))
+    np.save(os.path.join(d, 'U.npy'),
+            U.detach().to(torch.float32).cpu().numpy())
+    meta = {'ibatch': int(ibatch), 'nt': int(ops['nt']),
+            'nt0min': int(ops['nt0min']),
+            'n_pcs': int(ops['settings']['n_pcs']),
+            'nearest_chans': int(ops['settings']['nearest_chans']),
+            'fs': float(ops['settings']['fs']),
+            'shape_pre': list(X_pre.shape)}
+    for key in ('Wrot', 'wPCA', 'xc', 'yc'):
+        v = ops.get(key)
+        if v is None:
+            continue
+        np.save(os.path.join(d, f'{key}.npy'), _to_numpy(v))
+    np.save(os.path.join(d, 'meta.npy'), meta, allow_pickle=True)
+    logger.info(f'KS4_DUMP_RESIDUAL: wrote batch {ibatch} to {d}')
 
 
 def prepare_extract(xc, yc, U, nC, position_limit, device=torch.device('cuda')):
@@ -88,6 +167,7 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None,
     # U is fixed for the whole extract pass: scale, time-domain waveforms, and
     # ctc are batch-invariant. Build both in one pass over U.
     ctc, match_cache = prepare_matching(ops, U, return_cache=True)
+    dump = _residual_dump_request()
     spike_capacity = get_spike_buffer_capacity(bfile.n_batches)
     # Learned extract often finds a similar spike count to universal detect;
     # size the buffer from that hint so we avoid a mid-pass 2× realloc of tF.
@@ -112,9 +192,16 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None,
                 log_performance(logger, 'debug', f'Batch {ibatch}')
 
             X = next(batches)
+            # run_matching peels IN PLACE on X, so a pre-peel copy has to be
+            # taken before the call, not after. Only when dumping.
+            X_pre = X.clone() if (dump is not None
+                                  and ibatch == dump[1]) else None
             stt, amps, th_amps, Xres = run_matching(
                 ops, X, U, ctc, device=device, unit_cache=match_cache
             )
+            if X_pre is not None:
+                _write_residual_dump(dump[0], ibatch, X_pre, Xres, stt, U, ops)
+                X_pre = None
             nsp = len(stt)
             if nsp == 0:
                 if progress_bar is not None:
