@@ -6,11 +6,50 @@ from torch.nn.functional import conv1d
 from kilosort import CCG
 from kilosort.template_matching import (
     _matching_unit_cache,
+    extract_residual_spikes,
     merging_function,
     prepare_matching,
     roll_features,
     run_matching,
 )
+
+
+def test_residual_probe_does_not_mutate_extraction_ops(monkeypatch):
+    """Residual discovery must not poison the following learned extraction."""
+    import kilosort.template_matching as tm
+
+    class FakeBFile:
+        n_batches = 0
+
+        def iter_batches(self, ops):
+            return iter(())
+
+    settings = {'nearest_chans': 2, 'n_pcs': 1}
+    wtemp = np.zeros((1, 2, 3), dtype=np.float32)
+    ops = {
+        'iC': np.zeros((2, 1), dtype=np.int64),
+        'iC2': np.zeros((2, 1), dtype=np.int64),
+        'weigh': np.ones((2, 1), dtype=np.float32),
+        'wTEMP': wtemp,
+        'settings': settings,
+        'nt': 3,
+        'wPCA': torch.zeros((1, 3)),
+        'yc': np.zeros(2, dtype=np.float32),
+        'batch_size': 10,
+        'fs': 20_000,
+    }
+    monkeypatch.setattr(tm, 'prepare_matching',
+                        lambda *args, **kwargs: (None, None))
+    monkeypatch.setattr(tm, 'get_spike_buffer_capacity', lambda _: 1)
+
+    got = extract_residual_spikes(
+        ops, FakeBFile(), torch.zeros((1, 2, 1)),
+        device=torch.device('cpu'), residual_Th=7)
+
+    assert got[0].shape[0] == 0
+    assert ops['wTEMP'] is wtemp
+    assert ops['settings'] is settings
+    assert 'Th_universal' not in ops
 
 
 def test_roll_features_large_dt_no_index_error():
@@ -557,6 +596,215 @@ def test_merging_function_ccg_mode_matches_reference():
     np.testing.assert_allclose(st_g, st_e, rtol=0, atol=0)
     assert torch.allclose(Ww_g, Ww_e, rtol=1e-5, atol=1e-5)
     assert torch.allclose(tF_g, tF_e, rtol=1e-5, atol=1e-5)
+
+
+# --------------------------------------------------------------------------
+# COINCIDENCE MERGE
+# --------------------------------------------------------------------------
+
+def _refractory_train(rng, rate_hz, duration_s, fs, refractory_s=0.003):
+    """Generate a spike train with a hard refractory period."""
+    n_expected = int(rate_hz * duration_s * 1.5)
+    isi = rng.exponential(1.0 / rate_hz, size=n_expected)
+    isi = np.maximum(isi, refractory_s)
+    times = np.cumsum(isi)
+    times = times[times < duration_s]
+    return (times * fs).astype(np.int64)
+
+
+def test_coincidence_merge_joins_split_clusters():
+    """Two clusters that share 50% of spikes at a non-zero lag are merged."""
+    from kilosort.template_matching import coincidence_merge
+
+    rng = np.random.default_rng(77)
+    fs = 20000.0
+
+    # Base spike train: ~11 Hz with 3ms refractory period
+    base_times = _refractory_train(rng, 11.0, 180.0, fs)
+
+    # Cluster 0: base times + some unique spikes (also refractory)
+    extra_0 = _refractory_train(rng, 3.0, 180.0, fs)
+    st_0 = np.sort(np.concatenate([base_times, extra_0]))
+
+    # Cluster 1: base times shifted by 6 samples (0.3ms) + some unique spikes
+    dt_samples = 6
+    extra_1 = _refractory_train(rng, 3.0, 180.0, fs)
+    st_1 = np.sort(np.concatenate([base_times + dt_samples, extra_1]))
+
+    n_total = len(st_0) + len(st_1)
+    st = np.zeros((n_total, 3), dtype=np.float64)
+    clu = np.zeros(n_total, dtype=np.int32)
+
+    idx_0 = np.arange(len(st_0))
+    idx_1 = np.arange(len(st_0), n_total)
+    st[idx_0, 0] = st_0
+    st[idx_1, 0] = st_1
+    clu[idx_0] = 0
+    clu[idx_1] = 1
+
+    order = np.argsort(st[:, 0])
+    st = st[order]
+    clu = clu[order]
+
+    ops = {'fs': fs, 'settings': {
+        'acg_threshold': 0.2, 'ccg_threshold': 0.25,
+        'isi_threshold': 0.01, 'isi_min_spikes': 500,
+    }, 'wPCA': torch.eye(6)}
+    Wall = torch.zeros(2, 10, 6)
+    tF = torch.zeros(n_total, 10, 6)
+
+    Wall_out, clu_out, _, st_out, tF_out = coincidence_merge(
+        ops, Wall, clu, st, tF, frac_thresh=0.20)
+
+    assert clu_out.max() == 0, (
+        f'expected 1 cluster after merge, got {clu_out.max() + 1}')
+    assert ops.get('coincidence_merge_count', 0) == 1
+
+
+def test_coincidence_merge_does_not_join_independent_clusters():
+    """Two independent clusters stay separate."""
+    from kilosort.template_matching import coincidence_merge
+
+    rng = np.random.default_rng(78)
+    fs = 20000.0
+
+    st_0 = _refractory_train(rng, 6.0, 180.0, fs)
+    st_1 = _refractory_train(rng, 6.0, 180.0, fs)
+
+    n_total = len(st_0) + len(st_1)
+    st = np.zeros((n_total, 3), dtype=np.float64)
+    clu = np.zeros(n_total, dtype=np.int32)
+    st[:len(st_0), 0] = st_0
+    st[len(st_0):, 0] = st_1
+    clu[:len(st_0)] = 0
+    clu[len(st_0):] = 1
+
+    order = np.argsort(st[:, 0])
+    st = st[order]
+    clu = clu[order]
+
+    ops = {'fs': fs, 'settings': {
+        'acg_threshold': 0.2, 'ccg_threshold': 0.25,
+        'isi_threshold': 0.01, 'isi_min_spikes': 500,
+    }}
+    Wall = torch.zeros(2, 10, 6)
+    tF = torch.zeros(n_total, 10, 6)
+
+    Wall_out, clu_out, _, st_out, tF_out = coincidence_merge(
+        ops, Wall, clu, st, tF, frac_thresh=0.20)
+
+    assert clu_out.max() == 1, 'independent clusters should stay separate'
+    assert ops.get('coincidence_merge_count', 0) == 0
+
+
+def test_coincidence_merge_collapses_a_duplicate_chain():
+    """One target can absorb more than one shifted copy in one pass."""
+    from kilosort.template_matching import coincidence_merge
+
+    rng = np.random.default_rng(79)
+    fs = 20000.0
+    base = _refractory_train(rng, 11.0, 180.0, fs)
+    trains = [base, base + 6, base + 12]
+    st = np.zeros((sum(map(len, trains)), 3), dtype=np.float64)
+    clu = np.concatenate([
+        np.full(len(train), k, dtype=np.int32)
+        for k, train in enumerate(trains)
+    ])
+    cursor = 0
+    for train in trains:
+        st[cursor:cursor + len(train), 0] = train
+        cursor += len(train)
+    order = np.argsort(st[:, 0])
+    st, clu = st[order], clu[order]
+    ops = {'fs': fs, 'wPCA': torch.eye(6), 'settings': {
+        'acg_threshold': 0.2, 'ccg_threshold': 0.25,
+        'isi_threshold': 0.01, 'isi_min_spikes': 500,
+    }}
+    Wall = torch.zeros(3, 10, 6)
+    tF = torch.zeros(len(st), 10, 6)
+
+    _, clu_out, _, _, _ = coincidence_merge(
+        ops, Wall, clu, st, tF, frac_thresh=0.20)
+
+    assert clu_out.max() == 0
+    assert ops['coincidence_merge_count'] == 2
+
+
+def test_coincidence_merge_disabled_when_thresh_zero():
+    """frac_thresh=0 skips the pass entirely."""
+    from kilosort.template_matching import coincidence_merge
+
+    ops = {'fs': 20000.0, 'settings': {
+        'acg_threshold': 0.2, 'ccg_threshold': 0.25,
+    }}
+    st = np.zeros((100, 3))
+    st[:, 0] = np.arange(100) * 100.0
+    clu = np.zeros(100, dtype=np.int32)
+    clu[50:] = 1
+    Wall = torch.zeros(2, 10, 6)
+    tF = torch.zeros(100, 10, 6)
+
+    _, clu_out, _, _, _ = coincidence_merge(
+        ops, Wall, clu, st, tF, frac_thresh=0)
+
+    np.testing.assert_array_equal(clu_out, clu)
+
+
+def test_peak_shared_fraction_is_one_to_one():
+    """Dense bursts cannot create a shared fraction greater than one."""
+    from kilosort.template_matching import _peak_shared_fraction
+
+    a = np.array([0, 1, 2], dtype=np.int64)
+    b = np.array([0, 1, 2], dtype=np.int64)
+    frac, lag = _peak_shared_fraction(a, b, fs=20_000.0)
+
+    assert frac == 1.0
+    assert abs(lag) < 0.001
+
+
+def test_peak_shared_fraction_uses_full_peak_bin():
+    """Coincidences on a histogram-bin edge are still counted."""
+    from kilosort.template_matching import _peak_shared_fraction
+
+    a = np.array([1000, 3000, 5000], dtype=np.int64)
+    for offset in (-1, 10):
+        frac, _ = _peak_shared_fraction(a, a + offset, fs=20_000.0)
+        assert frac == 1.0
+
+
+def test_residual_snr_aligns_local_features_to_probe_channels():
+    """Equivalent waveforms in different local channel orders stay coherent."""
+    from kilosort.run_kilosort import _aligned_cluster_feature_snr
+
+    ops = {
+        'Nchan': 2,
+        'iC': np.array([[0, 1], [1, 0]], dtype=np.int64),
+    }
+    st = np.zeros((4, 6), dtype=np.float64)
+    st[:, 5] = [0, 1, 0, 1]
+    tF = torch.tensor([[[1.], [2.]], [[2.], [1.]],
+                       [[1.], [2.]], [[2.], [1.]]])
+    snr = _aligned_cluster_feature_snr(
+        ops, st, tF, np.zeros(4, dtype=np.int32))
+
+    assert np.isinf(snr[0])
+
+
+def test_residual_detection_templates_preserve_channel_maps():
+    """Residual virtual templates point at their real universal channels."""
+    from kilosort.run_kilosort import _register_residual_detection_templates
+
+    ops = {
+        'iC': torch.tensor([[2, 3], [3, 2]]),
+        'iCC': torch.tensor([[0, 1], [1, 0]]),
+        'iCC_mask': torch.ones((2, 2), dtype=torch.bool),
+        'iU': torch.tensor([0, 1]),
+    }
+    offset = _register_residual_detection_templates(ops)
+
+    assert offset == 2
+    assert ops['iU'].tolist() == [0, 1, 2, 3]
+    assert ops['iCC'][:, 2:].tolist() == [[2, 3], [3, 2]]
 
 
 # --------------------------------------------------------------------------

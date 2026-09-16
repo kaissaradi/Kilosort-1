@@ -132,8 +132,40 @@ def similarity(Wall, W, nt=61):
     similar_templates = similar_templates.amax(dim=-1).cpu().numpy()
     return similar_templates
 
-def refract(iclust2, st0, acg_threshold=0.2, ccg_threshold=0.25):
+def isi_violation_rate(st_sec, refractory_s=0.0015):
+    """Fraction of spikes that violate the refractory period.
+
+    Parameters
+    ----------
+    st_sec : np.ndarray
+        Sorted spike times in seconds.
+    refractory_s : float
+        Refractory period in seconds (default 1.5 ms).
+
+    Returns
+    -------
+    float
+        Fraction of spikes with an ISI shorter than ``refractory_s``.
+    """
+    if len(st_sec) < 2:
+        return 0.0
+    isi = np.diff(st_sec)
+    return float(np.sum(isi < refractory_s)) / len(st_sec)
+
+
+def refract(iclust2, st0, acg_threshold=0.2, ccg_threshold=0.25,
+            isi_threshold=0.01, isi_min_spikes=500):
     """Estimate refractory labels and contamination for every cluster.
+
+    A cluster is labeled "good" (refractory) when EITHER criterion passes:
+      1. The ACG test: R12 < acg_threshold AND Q12 < 0.2  (original rule).
+      2. The ISI fallback: fewer than ``isi_threshold`` of its spikes violate
+         the 1.5 ms refractory period, AND it has at least ``isi_min_spikes``
+         spikes.
+
+    The ACG shape (R12) is noisy for sparse or bursty cells. The ISI fallback
+    rescues single units whose ACG shape is borderline but whose spike-train
+    purity is high. Set ``isi_threshold=0`` to disable the fallback.
 
     Kilosort's export path supplies spike times in chronological order. Grouping
     clusters with a stable sort preserves that order, avoiding both a full
@@ -164,7 +196,8 @@ def refract(iclust2, st0, acg_threshold=0.2, ccg_threshold=0.25):
 
     for kk in range(Nfilt):
         start, stop = offsets[kk], offsets[kk + 1]
-        if stop - start <= 10:
+        n_spikes = stop - start
+        if n_spikes <= 10:
             continue
         st1 = st0[order[start:stop]]
 
@@ -173,6 +206,11 @@ def refract(iclust2, st0, acg_threshold=0.2, ccg_threshold=0.25):
                 st1, acg_threshold=acg_threshold,
                 ccg_threshold=ccg_threshold, assume_sorted=assume_sorted
             )
+
+        if not is_refractory[kk] and isi_threshold > 0 and n_spikes >= isi_min_spikes:
+            st_sorted = st1 if assume_sorted else np.sort(st1)
+            if isi_violation_rate(st_sorted) < isi_threshold:
+                is_refractory[kk] = True
 
     # When labels were non-negative and dense, Nfilt == max+1 as before.
     # With an offset, index 0 is min_lab; callers that index by raw label and

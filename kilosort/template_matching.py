@@ -7,6 +7,7 @@ from torch.nn.functional import conv1d, max_pool2d, max_pool1d
 from tqdm import tqdm
 
 from kilosort import CCG, fused_peel, fused_peel_cond, fused_peel_store
+from kilosort.postprocessing import remove_duplicates
 from kilosort.utils import (
     get_spike_buffer_capacity,
     group_indices_by_label,
@@ -404,6 +405,14 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=None):
     # monotonic on the reduced axis the max over units commutes with both.
     # The peel loop therefore reduces B directly and applies relu/square on
     # the (NT,) result instead of materialising a (n_units, NT) tensor.
+    #
+    # When lam > 0, the peel uses the ks2.5 amplitude-regularised score:
+    #   a = 1 + lam
+    #   b = relu(B[i,t]) + lam * mu[i]
+    #   Cf[i,t] = b^2/a - lam * mu[i]^2
+    # where mu[i] = 1/s[i] is the template norm. The prior centred on mu
+    # boosts detection of spikes whose spatial projection is weak but whose
+    # amplitude matches the template.
     Th = ops['Th_learned']
     nt = ops['nt']
     max_peels = ops['max_peels']
@@ -422,8 +431,17 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=None):
         unit_cache['trange'] = trange
         unit_cache['tiwave'] = tiwave
 
+    lam = float(ops.get('lam', 0))
+    use_lam = lam > 0
+
     B = conv1d(X.unsqueeze(1), W.unsqueeze(1), padding=nt//2)
     B = torch.einsum('ijk, kjl -> il', Us, B)
+
+    if use_lam:
+        mu = 1.0 / s
+        mu_col = mu.unsqueeze(1)
+        a_inv = 1.0 / (1.0 + lam)
+        lam_mu2 = lam * mu_col * mu_col
 
     # Growable peel buffer. Cap at historical 1e5; start smaller so quiet
     # batches do not reserve a full 100k×(2+1+1) int64/float slab up front.
@@ -445,17 +463,23 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=None):
     # passed to the kernel.
     ctc_p = ctc.permute(1, 0, 2)
     for t in range(max_peels):
-        # Reduce first, then apply relu/square on the (NT,) result.
-        # In-place square avoids a full (NT,) temporary per peel.
-        Cfmax, imax = torch.max(B, 0)
-        # relu -> square -> zero the two nt-wide edges -> max_pool1d -> two
-        # comparisons -> and, in one kernel. That is ~10 launches on a (NT,)
-        # array of 40 KB, so the block is launch-bound rather than
-        # bandwidth-bound, and it runs ~48x per batch. `nonzero` stays outside:
-        # its length is data-dependent and its row ORDER is load-bearing for
-        # the st/amps writes below. See fused_peel_cond.py; falls back to the
-        # stock statements unless it proves bit-identical on the first peel.
-        cmax, cnd = fused_peel_cond.peak_condition(Cfmax, nt, Th2)
+        if use_lam:
+            b = torch.clamp(B, min=0) + lam * mu_col
+            Cf = b * b * a_inv - lam_mu2
+            Cfmax, imax = torch.max(Cf, 0)
+            Cf_det = Cfmax.clone()
+            Cf_det[:nt] = 0
+            Cf_det[-nt:] = 0
+            cmax = max_pool1d(
+                Cf_det.view(1, 1, -1), 2 * nt + 1, stride=1, padding=nt
+            )[0, 0]
+            cnd = (cmax > Th2) & (torch.abs(cmax - Cf_det) < 1e-9)
+        else:
+            # Reduce first, then apply relu/square on the (NT,) result.
+            Cfmax, imax = torch.max(B, 0)
+            # relu -> square -> zero the two nt-wide edges -> max_pool1d -> two
+            # comparisons -> and, in one kernel.
+            cmax, cnd = fused_peel_cond.peak_condition(Cfmax, nt, Th2)
         xs = torch.nonzero(cnd)
 
         if len(xs)==0:
@@ -533,13 +557,17 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
 
     acg_threshold = ops['settings']['acg_threshold']
     ccg_threshold = ops['settings']['ccg_threshold']
+    isi_threshold = ops['settings'].get('isi_threshold', 0.01)
+    isi_min_spikes = ops['settings'].get('isi_min_spikes', 500)
     final_merge_union_acg_veto = False
     if mode == 'ccg':
         final_merge_union_acg_veto = bool(ops['settings'].get(
             'final_merge_union_acg_veto', False))
         is_ref, est_contam_rate = CCG.refract(clu, st[:,0]/ops['fs'],
                                               acg_threshold=acg_threshold,
-                                              ccg_threshold=ccg_threshold)
+                                              ccg_threshold=ccg_threshold,
+                                              isi_threshold=isi_threshold,
+                                              isi_min_spikes=isi_min_spikes)
         # refract returns length max(label)+1; pad/truncate to NN for empty tails
         if len(is_ref) < NN:
             pad = np.zeros(NN - len(is_ref), dtype=is_ref.dtype)
@@ -768,6 +796,335 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
     tF = tF[tensor_idx]
 
     return Ww.cpu(), clu2, is_ref, st, tF
+
+
+def _peak_shared_fraction(st_a, st_b, fs, maxlag_s=0.002, halfbin_s=0.00025):
+    """Fraction of the smaller train sharing spikes at the CCG peak lag.
+
+    Searches all lags within ±maxlag_s and returns the highest bin count
+    divided by min(len(a), len(b)). The final count is one-to-one: a spike
+    from either train can contribute at most once. Spike times are in SAMPLES
+    (int64).
+    """
+    if len(st_a) == 0 or len(st_b) == 0:
+        return 0.0, 0.0
+    maxlag = int(maxlag_s * fs)
+    halfbin = int(halfbin_s * fs)
+    lo = np.searchsorted(st_b, st_a - maxlag - halfbin, 'left')
+    hi = np.searchsorted(st_b, st_a + maxlag + halfbin, 'right')
+    dts = []
+    for x, l, h in zip(st_a, lo, hi):
+        if h > l:
+            dts.append(st_b[l:h] - x)
+    if not dts:
+        return 0.0, 0.0
+    dts = np.concatenate(dts)
+    edges = np.arange(-maxlag - halfbin, maxlag + halfbin + 1, 2 * halfbin + 1)
+    cnt, _ = np.histogram(dts, bins=edges)
+    k = int(np.argmax(cnt))
+    lag_s = float((edges[k] + edges[k + 1]) / 2 / fs)
+    # The histogram is only used to locate the peak. Counting all pairs in a
+    # bin can exceed one match per spike for bursty trains, yielding an
+    # impossible "shared fraction" and making the merge over-aggressive.
+    # Greedily match sorted spikes within the *selected bin's exact bounds*,
+    # consuming each spike in b once. Using the bin bounds matters at the
+    # edges: the centre +/- halfbin interval is narrower by one sample.
+    lag_lo = int(edges[k])
+    lag_hi = int(edges[k + 1])
+    last_bin = k == len(cnt) - 1
+    j = 0
+    matched = 0
+    for a in st_a:
+        while j < len(st_b) and st_b[j] - a < lag_lo:
+            j += 1
+        if (j < len(st_b)
+                and (st_b[j] - a < lag_hi
+                     or (last_bin and st_b[j] - a <= lag_hi))):
+            matched += 1
+            j += 1
+    frac = matched / max(min(len(st_a), len(st_b)), 1)
+    return float(frac), lag_s
+
+
+def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
+                      acg_threshold=0.2, ccg_threshold=0.25,
+                      isi_threshold=0.01, isi_min_spikes=500):
+    """Merge clusters that share spike-time coincidences above a threshold.
+
+    This pass catches splits that the template-similarity merge misses: the
+    same cell detected at different channels produces templates with low
+    waveform correlation but high spike-time overlap at a non-zero lag (axonal
+    propagation). The CCG peak-lag method finds them.
+
+    Safety gates:
+      - The target (larger) cluster must already be refractory (``is_ref``).
+      - The union (after deduplicating coincident spikes within 15 samples)
+        must pass the ACG or ISI fallback.
+
+    Parameters
+    ----------
+    frac_thresh : float
+        Minimum fraction of the smaller cluster's spikes that must coincide
+        at the CCG peak lag for a merge. Default 0.20 (same as the lab's
+        dup_collapse_figure.py).
+
+    Returns the same tuple as merging_function.
+    """
+    logger = logging.getLogger(__name__)
+
+    if frac_thresh <= 0:
+        return Wall, clu, None, st, tF
+
+    clu2 = clu.copy()
+    fs = ops['fs']
+    n_clusters = int(clu2.max()) + 1
+
+    # Quality labels from the preceding merge step (with ISI fallback)
+    is_ref, _ = CCG.refract(clu2, st[:, 0] / fs,
+                            acg_threshold=acg_threshold,
+                            ccg_threshold=ccg_threshold,
+                            isi_threshold=isi_threshold,
+                            isi_min_spikes=isi_min_spikes)
+    if len(is_ref) < n_clusters:
+        is_ref = np.concatenate([is_ref,
+                                 np.zeros(n_clusters - len(is_ref), dtype=bool)])
+
+    spike_idx = group_indices_by_label(clu2)
+    is_merged = np.zeros(n_clusters, dtype=bool)
+
+    # Count spikes per cluster, sort descending
+    ns = np.bincount(clu2.astype(np.int64), minlength=n_clusters).astype(np.float64)
+    isort = np.argsort(ns)[::-1]
+
+    # Precompute sorted spike times per cluster (in samples)
+    cluster_times = {}
+    for kid in spike_idx:
+        cluster_times[kid] = np.sort(st[spike_idx[kid], 0].astype(np.int64))
+
+    nmerge = 0
+    nveto = 0
+    dup_dt = int(ops.get('duplicate_spike_bins', 15))
+
+    # Only check clusters with enough spikes to be meaningful
+    candidates = [int(isort[i]) for i in range(n_clusters)
+                  if ns[int(isort[i])] >= 100 and not is_merged[int(isort[i])]]
+
+    for i, kk in enumerate(candidates):
+        if is_merged[kk] or kk not in cluster_times:
+            continue
+        if not is_ref[kk]:
+            continue
+        st_a = cluster_times[kk]
+        if len(st_a) < 100:
+            continue
+
+        for j in range(i + 1, len(candidates)):
+            jj = candidates[j]
+            if is_merged[jj] or jj not in cluster_times:
+                continue
+            st_b = cluster_times[jj]
+            if len(st_b) < 100:
+                continue
+
+            frac, lag = _peak_shared_fraction(st_a, st_b, fs)
+            if frac < frac_thresh:
+                continue
+
+            dt_samples = int(round(lag * fs))
+
+            # Use the exact exporter deduplication rule for the prospective
+            # union. A hand-written adjacent-difference check disagrees when
+            # a rejected spike lies between two retained spikes.
+            st_union = np.sort(np.concatenate([st_a, st_b - dt_samples]))
+            union_clusters = np.zeros(len(st_union), dtype=np.int32)
+            st_union, _, _ = remove_duplicates(
+                st_union.astype(np.int64), union_clusters, dt=dup_dt)
+            st_union_sec = st_union / fs
+
+            is_union_ref, _, _ = CCG.check_CCG(
+                st_union_sec, acg_threshold=acg_threshold,
+                ccg_threshold=ccg_threshold, assume_sorted=True)
+            if not is_union_ref and isi_threshold > 0:
+                n_union = len(st_union_sec)
+                if (n_union >= isi_min_spikes
+                        and CCG.isi_violation_rate(st_union_sec) < isi_threshold):
+                    is_union_ref = True
+
+            if not is_union_ref:
+                nveto += 1
+                continue
+
+            # Merge jj into kk
+            is_merged[jj] = True
+            idx_jj = spike_idx.get(jj, np.zeros(0, dtype=np.int64))
+            if idx_jj.size:
+                if dt_samples != 0:
+                    # The timestamp shift changes the waveform's reference
+                    # time too. Keep features and the averaged template in
+                    # the same frame as the committed spike times.
+                    tF, Wall = roll_features(
+                        ops['wPCA'], tF, Wall, idx_jj, jj, dt_samples)
+                    st[idx_jj, 0] -= dt_samples
+                clu2[idx_jj] = kk
+                prev = spike_idx.get(kk, np.zeros(0, dtype=np.int64))
+                spike_idx[kk] = np.sort(np.concatenate((prev, idx_jj)))
+                spike_idx.pop(jj, None)
+                cluster_times[kk] = np.sort(st[spike_idx[kk], 0].astype(np.int64))
+
+            # Weighted average of Wall templates
+            n_jj = ns[jj]
+            ns[kk] += n_jj
+            ns[jj] = 0
+            denom = ns[kk]
+            if denom > 0 and Wall is not None:
+                old_kk = denom - n_jj
+                Wall[kk] = (old_kk / denom) * Wall[kk] + (n_jj / denom) * Wall[jj]
+                Wall[jj] = 0
+
+            nmerge += 1
+            logger.debug(
+                f'coincidence merge: {jj} → {kk} (frac={frac:.2f}, '
+                f'lag={lag*1000:.2f}ms)')
+            # Keep scanning this target. Its refreshed time cache and size
+            # should be used for the remaining candidates; stopping here
+            # leaves duplicate chains only partially collapsed.
+
+    ops['coincidence_merge_count'] = nmerge
+    ops['coincidence_merge_veto_count'] = nveto
+    logger.info(f'coincidence merge: {nmerge} merges, {nveto} vetoed by ACG')
+
+    if nmerge == 0:
+        return Wall, clu2, None, st, tF
+
+    # Renumber clusters to fill gaps
+    imap = np.cumsum((~is_merged).astype('int32')) - 1
+    if imap.size > 0:
+        clu2 = imap[clu2]
+    Wall = Wall[~is_merged]
+
+    # Re-sort by time
+    sorted_idx = np.argsort(st[:, 0])
+    st = np.take_along_axis(st, sorted_idx[..., np.newaxis], axis=0)
+    clu2 = clu2[sorted_idx]
+    tensor_idx = torch.from_numpy(sorted_idx)
+    tF = tF[tensor_idx]
+
+    return Wall, clu2, None, st, tF
+
+
+def extract_residual_spikes(ops, bfile, Wall, device=torch.device('cuda'),
+                            progress_bar=None, residual_Th=4):
+    """Detect spikes in the residual after peeling the main sort's templates.
+
+    For each batch: peel with Wall, then run universal detect on what remains.
+    Returns (st_res, tF_res) in the same format as spikedetect.run.
+    """
+    from kilosort import spikedetect
+
+    # Residual discovery is diagnostic/augmenting work.  Keep all device
+    # conversions and threshold changes in a shallow private copy: the
+    # caller immediately reuses `ops` for the learned extraction, and a
+    # residual pass must not change that extraction's contract.
+    ops_res = dict(ops)
+    if isinstance(ops.get('settings'), dict):
+        ops_res['settings'] = dict(ops['settings'])
+    ops_res['Th_universal'] = residual_Th
+
+    iC = ops_res['iC']
+    iC2 = ops_res.get('iC2')
+    weigh = ops_res.get('weigh')
+    if iC2 is None or weigh is None:
+        raise RuntimeError('residual pass requires iC2/weigh from universal detect')
+
+    if not isinstance(iC, torch.Tensor):
+        iC = torch.as_tensor(iC, device=device).long()
+    if not isinstance(iC2, torch.Tensor):
+        iC2 = torch.as_tensor(iC2, device=device).long()
+    if not isinstance(weigh, torch.Tensor):
+        weigh = torch.as_tensor(weigh, device=device).float()
+    wTEMP = ops_res['wTEMP']
+    if not isinstance(wTEMP, torch.Tensor):
+        wTEMP = torch.as_tensor(wTEMP, device=device).float()
+    elif wTEMP.device != device:
+        wTEMP = wTEMP.to(device)
+    ops_res['wTEMP'] = wTEMP
+
+    nC = ops_res['settings']['nearest_chans']
+    nt = ops_res['nt']
+    tarange = torch.arange(-(nt // 2), nt // 2 + 1, device=device)
+    wPCA_T = ops_res['wPCA'].T.contiguous()
+    yc = ops_res['yc']
+    yc_t = torch.as_tensor(yc, device=device)
+
+    ctc, match_cache = prepare_matching(ops_res, Wall, return_cache=True)
+
+    spike_capacity = get_spike_buffer_capacity(bfile.n_batches)
+    st = np.zeros((spike_capacity, 6), 'float64')
+    tF = np.zeros((spike_capacity, nC, ops_res['settings']['n_pcs']), 'float32')
+    k = 0
+
+    tm_scratch = {}
+    batches = bfile.iter_batches(ops_res)
+    prog = tqdm(np.arange(bfile.n_batches, dtype=np.int64),
+                miniters=200 if progress_bar else None,
+                mininterval=60 if progress_bar else None)
+
+    ibatch = -1
+    try:
+        for ibatch in prog:
+            X = next(batches)
+            # Peel the main sort's templates from this batch
+            _, _, _, Xres = run_matching(
+                ops_res, X, Wall, ctc, device=device, unit_cache=match_cache)
+
+            # Run universal detect on the residual at lower threshold
+            xy, imax, amp, adist = spikedetect.template_match(
+                Xres, ops_res, iC, iC2, weigh, device=device,
+                scratch=tm_scratch)
+            nsp = len(xy)
+            if nsp == 0:
+                continue
+
+            yct = spikedetect.yweighted(yc, iC, adist, xy, device=device,
+                                        yc_t=yc_t)
+
+            if k + nsp > st.shape[0]:
+                new_cap = max(k + nsp, st.shape[0] * 2)
+                st2 = np.zeros((new_cap, st.shape[1]), dtype=st.dtype)
+                st2[:k] = st[:k]
+                st = st2
+                tF2 = np.zeros((new_cap,) + tF.shape[1:], dtype=tF.dtype)
+                tF2[:k] = tF[:k]
+                tF = tF2
+
+            xsub = Xres[iC[:, xy[:, :1]], xy[:, 1:2] + tarange]
+            xfeat = xsub @ wPCA_T
+            tF[k:k + nsp] = xfeat.transpose(0, 1).cpu().numpy()
+
+            t_shift = ibatch * bfile.batch_downsampling * (
+                ops_res['batch_size'] / ops_res['fs'])
+            col1 = xy[:, 1].double()
+            cols = torch.stack(
+                (col1, yct.double(), amp.double(), imax.double(),
+                 torch.full_like(col1, ibatch), xy[:, 0].double()), dim=1)
+            cols = cols.cpu().numpy()
+            cols[:, 0] = (cols[:, 0] - nt) / ops_res['fs'] + t_shift
+            st[k:k + nsp] = cols
+
+            k += nsp
+
+            if progress_bar is not None:
+                progress_bar.emit(
+                    int((ibatch + 1) / bfile.n_batches * 100))
+    except Exception:
+        logger.exception(
+            f'Error in extract_residual_spikes on batch {ibatch}')
+        raise
+
+    st = st[:k]
+    tF = tF[:k]
+    logger.info(f'Residual detect: {k} spikes at Th={residual_Th}')
+    return st, tF
 
 
 def roll_features(wPCA, tF, Wall, spike_idx, clust_idx, dt):

@@ -476,9 +476,13 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
     # contamination ratio
     acg_threshold = ops['settings']['acg_threshold']
     ccg_threshold = ops['settings']['ccg_threshold']
+    isi_threshold = ops['settings'].get('isi_threshold', 0.01)
+    isi_min_spikes = ops['settings'].get('isi_min_spikes', 500)
     is_ref, est_contam_rate = CCG.refract(spike_clusters, spike_times / ops['fs'],
                                           acg_threshold=acg_threshold,
-                                          ccg_threshold=ccg_threshold)
+                                          ccg_threshold=ccg_threshold,
+                                          isi_threshold=isi_threshold,
+                                          isi_min_spikes=isi_min_spikes)
     log_performance(logger, level='debug', header='save_to_phy, est contam',
                     reset=True)
 

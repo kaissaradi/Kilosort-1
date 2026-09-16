@@ -78,7 +78,8 @@ def patched_export_dependencies(monkeypatch):
     monkeypatch.setattr(
         io.CCG,
         'refract',
-        lambda clusters, times, acg_threshold, ccg_threshold: (
+        lambda clusters, times, acg_threshold=0.2, ccg_threshold=0.25,
+               isi_threshold=0.01, isi_min_spikes=500: (
             np.ones(2, dtype=bool),
             np.zeros(2),
         ),

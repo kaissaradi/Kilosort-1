@@ -365,6 +365,16 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
 
         log_thread_count(logger)
 
+        # Residual re-clustering: detect spikes missed by the main sort
+        residual_Th = ops['settings'].get('residual_Th', 0)
+        if residual_Th > 0:
+            clu, Wall, st, tF = residual_recluster(
+                ops, bfile, Wall, clu, st, tF, device=device,
+                residual_Th=residual_Th, tic0=tic0,
+                progress_bar=progress_bar,
+                clear_cache=clear_cache, verbose=verbose_log,
+                )
+
         ops, similar_templates, is_ref, est_contam_rate, kept_spikes = \
             save_sorting(
                 ops, results_dir, st, clu, tF, Wall, bfile.imin, tic0,
@@ -812,6 +822,168 @@ def compute_drift_correction(ops, device, tic0=np.nan, progress_bar=None,
     return ops, bfile, st
 
 
+def discover_templates(ops, bfile, Wall3, device=torch.device('cuda'),
+                       progress_bar=None, clear_cache=False, verbose=False,
+                       tic0=np.nan):
+    """Find new templates from the residual after first clustering.
+
+    Peels Wall3 from the raw data, runs universal detection on the residual,
+    clusters the new spikes, quality-filters them, and appends the surviving
+    templates to Wall3. Returns the augmented Wall3.
+    """
+    tic = time.time()
+    logger.info(' ')
+    logger.info('Template discovery from residual')
+    logger.info('-' * 40)
+
+    n_existing = Wall3.shape[0]
+
+    # Wall3 is (n_units, n_pcs, n_channels) — the format extract expects.
+    # extract_residual_spikes also expects this format.
+    st_res, tF_res = template_matching.extract_residual_spikes(
+        ops, bfile, Wall3, device=device, progress_bar=progress_bar,
+        residual_Th=ops['settings'].get('Th_universal', 8),
+    )
+
+    if len(st_res) == 0:
+        logger.info('No residual spikes found for template discovery.')
+        return Wall3
+
+
+    tF_res = torch.from_numpy(tF_res)
+    logger.info(f'{len(st_res)} residual spikes detected')
+
+    # Cluster the residual spikes
+    clu_res, Wall_res = clustering_qr.run(
+        ops, st_res, tF_res, mode='spikes', device=device,
+        progress_bar=progress_bar, clear_cache=clear_cache, verbose=verbose,
+    )
+    n_res = int(clu_res.max()) + 1
+    logger.info(f'{n_res} residual clusters found')
+
+    if n_res == 0:
+        return Wall3
+
+    # Quality filter: reject tiny clusters and those with bad refractory periods
+    fs = ops['fs']
+    acg_threshold = ops['settings']['acg_threshold']
+    ccg_threshold = ops['settings']['ccg_threshold']
+    isi_threshold = ops['settings'].get('isi_threshold', 0.01)
+    isi_min_spikes = ops['settings'].get('isi_min_spikes', 500)
+
+    keep = np.ones(n_res, dtype=bool)
+    for kid in range(n_res):
+        n_k = int((clu_res == kid).sum())
+        if n_k < 300:
+            keep[kid] = False
+
+    is_ref_res, _ = CCG.refract(
+        clu_res, st_res[:, 0], acg_threshold=acg_threshold,
+        ccg_threshold=ccg_threshold, isi_threshold=isi_threshold,
+        isi_min_spikes=isi_min_spikes,
+    )
+    for kid in range(n_res):
+        if kid < len(is_ref_res) and not is_ref_res[kid]:
+            keep[kid] = False
+
+    # Waveform SNR gate, after resolving each local feature slot to its
+    # physical probe channel.
+    snr = _aligned_cluster_feature_snr(ops, st_res, tF_res, clu_res)
+    keep &= snr >= 1.5
+
+    n_kept = int(keep.sum())
+    logger.info(f'{n_kept} new templates discovered, {n_res - n_kept} rejected')
+
+    if n_kept == 0:
+        return Wall3
+
+    # Align and postprocess the new templates, then append to Wall3.
+    # Wall_res is (n_res, n_channels, n_pcs) from clustering_qr.
+    # We need (n_kept, n_pcs, n_channels) to match Wall3.
+    Wall_new = Wall_res[keep].to(device)
+    Wall_new_aligned, _ = template_matching.align_U(
+        Wall_new, ops, device=device,
+    )
+    # align_U returns (n, n_pcs, n_channels) after the einsum path
+    Wall3_aug = torch.cat([Wall3, Wall_new_aligned], dim=0)
+
+    elapsed = time.time() - tic
+    total = time.time() - tic0
+    logger.info(f'Template set: {n_existing} -> {Wall3_aug.shape[0]} '
+                f'(+{n_kept}), in {elapsed:.2f}s; total {total:.2f}s')
+
+    return Wall3_aug
+
+
+def _aligned_cluster_feature_snr(ops, st, tF, clu):
+    """Compute feature SNR after placing local features on probe channels.
+
+    Universal-detection features are stored in nearest-channel order around
+    each detection template. Averaging those local slots directly mixes
+    different physical electrodes and can reject a consistent waveform.
+    """
+    clu = np.asarray(clu, dtype=np.int64)
+    if clu.size == 0:
+        return np.zeros(0, dtype=np.float64)
+    st = np.asarray(st)
+    iC = torch.as_tensor(ops['iC'], dtype=torch.long, device='cpu')
+    templates = st[:, 5].astype(np.int64, copy=False)
+    if templates.min() < 0 or templates.max() >= iC.shape[1]:
+        raise ValueError('residual detection template index is out of range')
+    channels = iC[:, torch.as_tensor(templates)].T.contiguous()
+    features = torch.as_tensor(tF, dtype=torch.float32, device='cpu')
+    if features.ndim != 3 or features.shape[:2] != channels.shape:
+        raise ValueError('residual features and channel map have incompatible shapes')
+
+    n_clusters = int(clu.max()) + 1
+    n_chan = int(ops['Nchan'])
+    n_pcs = int(features.shape[2])
+    flat_sum = torch.zeros((n_clusters * n_chan, n_pcs), dtype=torch.float32)
+    flat_sq = torch.zeros_like(flat_sum)
+    flat_count = torch.zeros(n_clusters * n_chan, dtype=torch.float32)
+    for lo in range(0, len(clu), 100_000):
+        hi = min(lo + 100_000, len(clu))
+        key = (torch.as_tensor(clu[lo:hi])[:, None] * n_chan
+               + channels[lo:hi]).reshape(-1)
+        value = features[lo:hi].reshape(-1, n_pcs)
+        flat_sum.index_add_(0, key, value)
+        flat_sq.index_add_(0, key, value * value)
+        flat_count.index_add_(0, key, torch.ones_like(key, dtype=torch.float32))
+
+    count = flat_count.clamp_min(1).unsqueeze(1)
+    mean = flat_sum / count
+    variance = (flat_sq / count - mean * mean).clamp_min(0)
+    mean_norm = mean.reshape(n_clusters, n_chan, n_pcs).norm(dim=(1, 2))
+    std_norm = variance.sqrt().reshape(n_clusters, n_chan, n_pcs).norm(dim=(1, 2))
+    return torch.where(std_norm > 0, mean_norm / std_norm,
+                       torch.full_like(mean_norm, float('inf'))).numpy()
+
+
+def _register_residual_detection_templates(ops):
+    """Add universal detection channel maps to the learned export namespace."""
+    if '_residual_template_offset' in ops:
+        return int(ops['_residual_template_offset'])
+    iC = torch.as_tensor(ops['iC'], dtype=torch.long)
+    iCC = torch.as_tensor(ops['iCC'], dtype=torch.long)
+    iCC_mask = torch.as_tensor(ops['iCC_mask'], dtype=torch.bool)
+    iU = torch.as_tensor(ops['iU'], dtype=torch.long)
+    if iC.shape[0] != iCC.shape[0]:
+        raise ValueError('residual and learned channel maps have different widths')
+    device = iCC.device
+    iC = iC.to(device)
+    n_old_columns = iCC.shape[1]
+    n_universal = iC.shape[1]
+    ops['iCC'] = torch.cat((iCC, iC), dim=1)
+    ops['iCC_mask'] = torch.cat(
+        (iCC_mask, torch.ones((iC.shape[0], n_universal),
+                              dtype=torch.bool, device=device)), dim=1)
+    ops['iU'] = torch.cat(
+        (iU, torch.arange(n_old_columns, n_old_columns + n_universal,
+                          dtype=torch.long, device=device)))
+    ops['_residual_template_offset'] = int(iU.shape[0])
+    return int(iU.shape[0])
+
+
 def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
                   clear_cache=False, verbose=False):
     """Detect spikes via template deconvolution.
@@ -868,7 +1040,7 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
     stats = cuda_memory_stats(device)
     if stats is not None:
         ops['cuda_st0'] = stats
-    logger.info(f'{len(st0)} spikes extracted in {elapsed:.2f}s; ' + 
+    logger.info(f'{len(st0)} universal detections extracted in {elapsed:.2f}s; ' +
                 f'total {total:.2f}s')
     logger.debug(f'st0 shape: {st0.shape}')
     logger.debug(f'tF shape: {tF.shape}')
@@ -915,6 +1087,14 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
    
     log_thread_count(logger)
 
+    # Template discovery: detect spikes in the residual and add new templates
+    if ops['settings'].get('discover_templates', False):
+        Wall3 = discover_templates(
+            ops, bfile, Wall3, device=device,
+            progress_bar=progress_bar, clear_cache=clear_cache,
+            verbose=verbose, tic0=tic0,
+        )
+
     tic = time.time()
     logger.info(' ')
     logger.info('Extracting spikes using cluster waveforms')
@@ -933,7 +1113,7 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
     stats = cuda_memory_stats(device)
     if stats is not None:
         ops['cuda_st'] = stats
-    logger.info(f'{len(st)} spikes extracted in {elapsed:.2f}s; ' +
+    logger.info(f'{len(st)} learned-template spikes extracted in {elapsed:.2f}s; ' +
                 f'total {total:.2f}s')
     logger.debug(f'st shape: {st.shape}')
     logger.debug(f'tF shape: {tF.shape}')
@@ -1023,16 +1203,225 @@ def cluster_spikes(st, tF, ops, device, bfile, tic0=np.nan, progress_bar=None,
     stats = cuda_memory_stats(device)
     if stats is not None:
         ops['cuda_merge'] = stats
-    logger.info(f'{clu.max()+1} units found, in {elapsed:.2f}s; ' + 
+    logger.info(f'{clu.max()+1} units found, in {elapsed:.2f}s; ' +
                 f'total {total:.2f}s')
     logger.debug(f'clu shape: {clu.shape}')
     logger.debug(f'Wall shape: {Wall.shape}')
+
+    # Coincidence merge: catch splits the template merge misses
+    # Spike-time coincidence alone is not an identity proof. Keep this
+    # experimental merge disabled unless the caller explicitly opts in.
+    frac_thresh = ops['settings'].get('coincidence_frac_thresh', 0.0)
+    if frac_thresh > 0:
+        tic2 = time.time()
+        logger.info(' ')
+        logger.info('Coincidence merge (spike-time overlap)')
+        logger.info('-'*40)
+        isi_threshold = ops['settings'].get('isi_threshold', 0.01)
+        isi_min_spikes = ops['settings'].get('isi_min_spikes', 500)
+        acg_threshold = ops['settings']['acg_threshold']
+        ccg_threshold = ops['settings']['ccg_threshold']
+        Wall, clu, _, st, tF = template_matching.coincidence_merge(
+            ops, Wall, clu, st, tF, frac_thresh=frac_thresh,
+            acg_threshold=acg_threshold, ccg_threshold=ccg_threshold,
+            isi_threshold=isi_threshold, isi_min_spikes=isi_min_spikes)
+        clu = clu.astype('int32')
+        elapsed2 = time.time() - tic2
+        ops['runtime_coincidence_merge'] = elapsed2
+        logger.info(f'{clu.max()+1} units after coincidence merge, '
+                    f'in {elapsed2:.2f}s')
 
     log_cuda_details(logger)
     log_performance(logger, 'info', 'Resource usage after clustering',
                     reset=True)
 
     return clu, Wall, st, tF
+
+
+def residual_recluster(ops, bfile, Wall, clu, st, tF, device=torch.device('cuda'),
+                       residual_Th=4, tic0=np.nan, progress_bar=None,
+                       clear_cache=False, verbose=False):
+    """Detect and cluster spikes in the residual after the main sort.
+
+    Peels the main sort's templates from the raw data, then runs universal
+    detection at a lower threshold on the residual. New clusters are appended
+    to the main sort's output after quality checks.
+    """
+    tic = time.time()
+    logger.info(' ')
+    logger.info(f'Residual re-clustering (Th={residual_Th})')
+    logger.info('-' * 40)
+
+    n_main = int(clu.max()) + 1
+
+    # Step 1: detect spikes in the residual
+    # Wall from cluster_spikes has shape [n_clusters, n_channels, n_pcs].
+    # prepare_matching expects [n_units, n_pcs, n_channels].
+    Wall_peel = Wall.to(device).transpose(1, 2).contiguous()
+    st_res, tF_res = template_matching.extract_residual_spikes(
+        ops, bfile, Wall_peel, device=device, progress_bar=progress_bar,
+        residual_Th=residual_Th)
+
+    if len(st_res) == 0:
+        logger.info('No residual spikes found.')
+        return clu, Wall, st, tF
+
+    tF_res = torch.from_numpy(tF_res)
+    logger.info(f'{len(st_res)} residual spikes detected')
+
+    # Step 2: cluster the residual spikes
+    clu_res, Wall_res = clustering_qr.run(
+        ops, st_res, tF_res, mode='spikes', device=device,
+        progress_bar=progress_bar, clear_cache=clear_cache, verbose=verbose)
+
+    n_res_clusters = int(clu_res.max()) + 1
+    logger.info(f'{n_res_clusters} residual clusters found')
+
+    if n_res_clusters == 0:
+        return clu, Wall, st, tF
+
+    # Step 3: reject peel artifacts and tiny clusters
+    # A peel artifact has most of its spikes time-locked to ONE main cluster.
+    # Check per-cluster overlap: for each residual cluster, find the main
+    # cluster that shares the most spikes (within ±5 samples). If that best
+    # match captures >30% of the residual cluster, it is a peel artifact.
+    fs = ops['fs']
+    acg_threshold = ops['settings']['acg_threshold']
+    ccg_threshold = ops['settings']['ccg_threshold']
+    isi_threshold = ops['settings'].get('isi_threshold', 0.01)
+    isi_min_spikes = ops['settings'].get('isi_min_spikes', 500)
+
+    st_res_samples = (st_res[:, 0] * fs).astype(np.int64)
+    st_main_samples = st[:, 0].astype(np.int64)
+    main_order = np.argsort(st_main_samples)
+    st_main_s = st_main_samples[main_order]
+    clu_main_s = clu[main_order]
+
+    keep_cluster = np.ones(n_res_clusters, dtype=bool)
+    OVERLAP_WINDOW = 5
+
+    for kid in range(n_res_clusters):
+        mask_k = clu_res == kid
+        spikes_k = st_res_samples[mask_k]
+        n_k = len(spikes_k)
+        if n_k < 100:
+            keep_cluster[kid] = False
+            continue
+
+        lo = np.searchsorted(st_main_s, spikes_k - OVERLAP_WINDOW, side='left')
+        hi = np.searchsorted(st_main_s, spikes_k + OVERLAP_WINDOW, side='right')
+        has_match = hi > lo
+        if not has_match.any():
+            continue
+        # For spikes with matches, take the nearest main spike's cluster
+        # (first match in the window — adequate for per-cluster voting).
+        first_match_idx = lo[has_match]
+        first_match_idx = np.clip(first_match_idx, 0, len(clu_main_s) - 1)
+        matched_clu = clu_main_s[first_match_idx]
+        votes = np.bincount(matched_clu.astype(np.int64), minlength=n_main)
+        best_frac = votes.max() / n_k
+        if best_frac > 0.30:
+            keep_cluster[kid] = False
+            best_clu = votes.argmax()
+            logger.debug(
+                f'residual cluster {kid}: rejected '
+                f'(overlap={best_frac:.2f} with main {best_clu})')
+
+    # Step 4: quality check — ACG / ISI
+    is_ref_res, _ = CCG.refract(
+        clu_res, st_res[:, 0], acg_threshold=acg_threshold,
+        ccg_threshold=ccg_threshold, isi_threshold=isi_threshold,
+        isi_min_spikes=isi_min_spikes)
+    for kid in range(n_res_clusters):
+        if kid < len(is_ref_res) and not is_ref_res[kid]:
+            keep_cluster[kid] = False
+
+    # Step 4b: waveform-SNR gate, with local features aligned to physical
+    # channels before the cluster mean and variance are computed.
+    SNR_RATIO_MIN = 1.5
+    snr = _aligned_cluster_feature_snr(ops, st_res, tF_res, clu_res)
+    keep_cluster &= snr >= SNR_RATIO_MIN
+
+    n_kept = int(keep_cluster.sum())
+    n_rejected = n_res_clusters - n_kept
+    logger.info(f'{n_kept} residual clusters kept, {n_rejected} rejected '
+                f'(overlap/quality/SNR)')
+
+    if n_kept == 0:
+        return clu, Wall, st, tF
+
+    # Step 5: append kept clusters to the main sort
+    # Renumber kept residual clusters starting from n_main
+    remap = np.full(n_res_clusters, -1, dtype=np.int32)
+    new_id = n_main
+    for kid in range(n_res_clusters):
+        if keep_cluster[kid]:
+            remap[kid] = new_id
+            new_id += 1
+
+    # Filter to kept spikes and remap cluster IDs
+    kept_mask = keep_cluster[clu_res]
+    clu_res_kept = remap[clu_res[kept_mask]].astype(np.int32)
+    st_res_kept = st_res[kept_mask]
+    tF_res_kept = tF_res[kept_mask]
+
+    # Convert residual st from (time_sec, ...) format to match main st format
+    # Main st has columns: (time_samples, template_id, threshold_amp)
+    # Residual st from spikedetect has 6 columns: (time_sec, y, amp, imax, batch, template)
+    # We need to convert to the 3-column format used by cluster_spikes output
+    residual_template_offset = _register_residual_detection_templates(ops)
+    st_res_3col = np.zeros((len(st_res_kept), st.shape[1]), dtype=st.dtype)
+    st_res_3col[:, 0] = np.round(st_res_kept[:, 0] * fs)  # integer samples
+    if st.shape[1] > 1:
+        # Residual template IDs are in the appended virtual-template namespace
+        # registered above. Their iCC columns are exactly the universal iC
+        # channel maps used to compute tF_res, so exported positions remain
+        # tied to the actual detection channels.
+        st_res_3col[:, 1] = (
+            residual_template_offset + st_res_kept[:, 5].astype(np.int64))
+    if st.shape[1] > 2:
+        st_res_3col[:, 2] = st_res_kept[:, 2] if st_res_kept.shape[1] > 2 else 0
+
+    # Pad tF_res to match main tF dimensions
+    if tF_res_kept.shape[1:] != tF.shape[1:]:
+        tF_pad = torch.zeros((len(tF_res_kept),) + tF.shape[1:],
+                             dtype=tF.dtype)
+        nc = min(tF_res_kept.shape[1], tF.shape[1])
+        np_c = min(tF_res_kept.shape[2], tF.shape[2])
+        tF_pad[:, :nc, :np_c] = tF_res_kept[:, :nc, :np_c]
+        tF_res_kept = tF_pad
+
+    # Concatenate
+    clu_out = np.concatenate([clu, clu_res_kept])
+    st_out = np.concatenate([st, st_res_3col])
+    tF_out = torch.cat([tF, tF_res_kept], dim=0)
+
+    # Pad Wall
+    Wall_res_kept = Wall_res[keep_cluster]
+    if Wall_res_kept.shape[1:] != Wall.shape[1:]:
+        Wall_pad = torch.zeros((n_kept,) + Wall.shape[1:], dtype=Wall.dtype)
+        nc = min(Wall_res_kept.shape[1], Wall.shape[1])
+        np_c = min(Wall_res_kept.shape[2], Wall.shape[2])
+        Wall_pad[:, :nc, :np_c] = Wall_res_kept[:, :nc, :np_c]
+        Wall_res_kept = Wall_pad
+    Wall_out = torch.cat([Wall, Wall_res_kept], dim=0)
+
+    # Re-sort by time
+    order = np.argsort(st_out[:, 0])
+    st_out = st_out[order]
+    clu_out = clu_out[order]
+    tF_out = tF_out[order]
+
+    elapsed = time.time() - tic
+    total = time.time() - tic0
+    ops['runtime_residual'] = elapsed
+    ops['residual_clusters_found'] = n_res_clusters
+    ops['residual_clusters_kept'] = n_kept
+    logger.info(f'Residual re-clustering: {n_kept} new clusters in {elapsed:.2f}s; '
+                f'total {total:.2f}s')
+    logger.info(f'{int(clu_out.max()) + 1} total clusters')
+
+    return clu_out, Wall_out, st_out, tF_out
 
 
 def save_sorting(ops, results_dir, st, clu, tF, Wall, imin, tic0=np.nan,
@@ -1227,9 +1616,13 @@ def load_sorting(results_dir, device=None, load_extra_vars=False):
     kept_spikes = np.load(results_dir / 'kept_spikes.npy')
     acg_threshold = ops['settings']['acg_threshold']
     ccg_threshold = ops['settings']['ccg_threshold']
+    isi_threshold = ops['settings'].get('isi_threshold', 0.01)
+    isi_min_spikes = ops['settings'].get('isi_min_spikes', 500)
     is_ref, est_contam_rate = CCG.refract(clu, st / ops['fs'],
                                           acg_threshold=acg_threshold,
-                                          ccg_threshold=ccg_threshold)
+                                          ccg_threshold=ccg_threshold,
+                                          isi_threshold=isi_threshold,
+                                          isi_min_spikes=isi_min_spikes)
 
     results = [ops, st, clu, similar_templates, is_ref,
                est_contam_rate, kept_spikes]

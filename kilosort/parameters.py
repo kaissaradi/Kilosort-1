@@ -393,6 +393,93 @@ EXTRA_PARAMETERS = {
             """
     },
 
+    'isi_threshold': {
+        'gui_name': 'ISI threshold', 'type': float, 'min': 0, 'max': 1.0,
+        'exclude': [], 'default': 0.01, 'step': 'clustering',
+        'description':
+            """
+            ISI-based fallback for the quality classifier. A cluster that fails
+            the ACG test (R12 >= acg_threshold) is still labeled "good" when
+            fewer than this fraction of its spikes violate the 1.5 ms refractory
+            period and it has at least ``isi_min_spikes`` spikes. Set to 0 to
+            disable the fallback and use only the ACG test.
+            """
+    },
+
+    'isi_min_spikes': {
+        'gui_name': 'ISI min spikes', 'type': int, 'min': 0, 'max': np.inf,
+        'exclude': [], 'default': 500, 'step': 'clustering',
+        'description':
+            """
+            Minimum spike count required for the ISI fallback. Clusters with
+            fewer spikes cannot use the ISI criterion because the violation rate
+            estimate is too noisy.
+            """
+    },
+
+    'coincidence_frac_thresh': {
+        'gui_name': 'coincidence merge threshold', 'type': float,
+        'min': 0, 'max': 1.0, 'exclude': [], 'default': 0,
+        'step': 'postprocessing',
+        'description':
+            """
+            Minimum shared-spike fraction at the CCG peak lag for the
+            coincidence merge pass. Two clusters whose smaller train shares
+            at least this fraction of spikes with the larger are merged if the
+            union passes the ACG test. Catches splits where the same cell
+            lands on templates at different channels (axonal propagation).
+            Set above 0 only for an explicitly validated duplicate-collapse
+            experiment; the default is 0 because this pass has no EI gate.
+            """
+    },
+
+    'lam': {
+        'gui_name': 'amplitude prior', 'type': float, 'min': 0, 'max': 100,
+        'exclude': [], 'default': 0, 'step': 'template_matching',
+        'description':
+            """
+            Amplitude regularization strength for the template-matching
+            detection score, ported from Kilosort 2.5. When > 0, the peel
+            loop scores each template with a log-likelihood ratio that
+            combines the raw projection with a Gaussian prior centred on
+            the template's expected amplitude (mu). This boosts detection
+            of spikes whose spatial projection is weak but whose amplitude
+            matches the template. Set to 0 (default) for the stock ks4
+            score (relu(projection)**2). A value of 10 matches the ks2.5
+            default.
+            """
+    },
+
+    'discover_templates': {
+        'gui_name': 'discover templates', 'type': bool,
+        'min': 0, 'max': 1,
+        'exclude': [], 'default': False, 'step': 'template_matching',
+        'description':
+            """
+            After the first clustering, peel the learned templates from the
+            data and run universal detection on the residual to find cells
+            that the initial clustering missed. New templates are added to
+            the template set before the final extraction pass. Inspired by
+            Kilosort 2.5's learnTemplates residual discovery. Default False.
+            """
+    },
+
+    'residual_Th': {
+        'gui_name': 'residual threshold', 'type': float, 'min': 0, 'max': 20,
+        'exclude': [], 'default': 0, 'step': 'postprocessing',
+        'description':
+            """
+            Detection threshold for the residual re-clustering pass. After the
+            main sort, the raw data is re-read and the main templates are peeled
+            off. Universal detection runs on the residual at this threshold to
+            find cells too small for the main pass. New clusters that pass the
+            quality classifier are appended to the output. Set to 0 (default) to
+            disable the residual pass. A value of 7 is recommended; it sits
+            near the noise floor of the summed detection statistic and rejects
+            most subtraction artifacts while retaining real cells.
+            """
+    },
+
     'max_merge_sweeps': {
         'gui_name': 'max merge sweeps', 'type': int, 'min': -1, 'max': np.inf,
         'exclude': [], 'default': 10, 'step': 'postprocessing',

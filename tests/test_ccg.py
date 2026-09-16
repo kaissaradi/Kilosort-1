@@ -4,7 +4,8 @@ from kilosort import CCG
 
 
 def reference_refract(cluster_ids, spike_times, acg_threshold=0.2,
-                      ccg_threshold=0.25):
+                      ccg_threshold=0.25, isi_threshold=0.01,
+                      isi_min_spikes=500):
     n_clusters = cluster_ids.max() + 1
     is_refractory = np.zeros(n_clusters)
     contamination = np.zeros(n_clusters)
@@ -17,6 +18,11 @@ def reference_refract(cluster_ids, spike_times, acg_threshold=0.2,
                     unit_times, acg_threshold=acg_threshold,
                     ccg_threshold=ccg_threshold
                 )
+        if (not is_refractory[cluster_id] and isi_threshold > 0
+                and len(unit_times) >= isi_min_spikes):
+            st_sorted = np.sort(unit_times)
+            if CCG.isi_violation_rate(st_sorted) < isi_threshold:
+                is_refractory[cluster_id] = True
 
     return is_refractory.astype(bool), contamination
 
@@ -94,6 +100,63 @@ def test_refract_accepts_negative_cluster_ids():
     assert labels.dtype == bool
     assert labels.size == 2  # min=-1, max=0 → offset table length 2
     assert np.all(np.isfinite(contam))
+
+
+def test_isi_fallback_rescues_clean_units():
+    """A cluster with low ISI violations but borderline ACG gets rescued."""
+    rng = np.random.default_rng(99)
+    # Clean cell: 5000 spikes, ~28 Hz, no refractory violations
+    st_clean = np.sort(rng.uniform(0, 180, size=5000))
+    # Remove any ISI < 2ms
+    while True:
+        isi = np.diff(st_clean)
+        bad = np.where(isi < 0.002)[0]
+        if len(bad) == 0:
+            break
+        st_clean = np.delete(st_clean, bad + 1)
+    cluster_ids = np.zeros(len(st_clean), dtype=np.int64)
+
+    # Without ISI fallback
+    labels_old, _ = CCG.refract(cluster_ids, st_clean,
+                                isi_threshold=0)
+    # With ISI fallback
+    labels_new, _ = CCG.refract(cluster_ids, st_clean,
+                                isi_threshold=0.01, isi_min_spikes=500)
+
+    # If ACG already passes, both agree. If ACG fails, ISI should rescue.
+    if not labels_old[0]:
+        assert labels_new[0], (
+            'ISI fallback should rescue a clean unit that fails the ACG test')
+    else:
+        assert labels_new[0]
+
+
+def test_isi_fallback_does_not_rescue_contaminated_units():
+    """A contaminated cluster stays MUA even with the ISI fallback on."""
+    rng = np.random.default_rng(100)
+    clean = np.sort(rng.uniform(0, 180, size=2000))
+    # Add 5% ISI violations (spikes 0.5ms after each existing spike)
+    violations = clean[:100] + 0.0005
+    contaminated = np.sort(np.concatenate([clean, violations]))
+    cluster_ids = np.zeros(len(contaminated), dtype=np.int64)
+
+    labels, _ = CCG.refract(cluster_ids, contaminated,
+                            isi_threshold=0.01, isi_min_spikes=500)
+    assert not labels[0], 'contaminated unit should stay MUA'
+
+
+def test_isi_fallback_disabled_when_threshold_zero():
+    """isi_threshold=0 reproduces the old ACG-only behavior."""
+    rng = np.random.default_rng(42)
+    cluster_ids = rng.choice(np.array([0, 1, 3, 7]), size=2_000)
+    spike_times = np.sort(rng.uniform(0, 120, size=cluster_ids.size))
+
+    old_ref, old_contam = reference_refract(
+        cluster_ids, spike_times, isi_threshold=0)
+    labels, contam = CCG.refract(cluster_ids, spike_times, isi_threshold=0)
+
+    np.testing.assert_array_equal(labels, old_ref)
+    np.testing.assert_array_equal(contam, old_contam)
 
 
 def test_compute_ccg_empty_trains_no_crash():
