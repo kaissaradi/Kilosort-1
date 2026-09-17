@@ -959,6 +959,37 @@ def _aligned_cluster_feature_snr(ops, st, tF, clu):
                        torch.full_like(mean_norm, float('inf'))).numpy()
 
 
+def _nearest_one_to_one_overlap_votes(query_samples, main_samples,
+                                      main_clusters, window=5):
+    """Vote query events against distinct nearest main events.
+
+    This is an artifact-screening helper, not a cell-identity matcher.  A
+    main event can be used at most once; choosing the first event in a search
+    window allowed dense trains to manufacture a large overlap vote.
+    """
+    query = np.sort(np.asarray(query_samples, dtype=np.int64))
+    main = np.asarray(main_samples, dtype=np.int64)
+    clusters = np.asarray(main_clusters, dtype=np.int64)
+    if len(main) != len(clusters):
+        raise ValueError('main samples and clusters have different lengths')
+    used = np.zeros(len(main), dtype=bool)
+    votes = {}
+    for sample in query:
+        lo = int(np.searchsorted(main, sample - window, side='left'))
+        hi = int(np.searchsorted(main, sample + window, side='right'))
+        if hi <= lo:
+            continue
+        candidates = np.arange(lo, hi, dtype=np.int64)
+        candidates = candidates[~used[candidates]]
+        if len(candidates) == 0:
+            continue
+        best = int(candidates[np.argmin(np.abs(main[candidates] - sample))])
+        used[best] = True
+        label = int(clusters[best])
+        votes[label] = votes.get(label, 0) + 1
+    return votes
+
+
 def _register_residual_detection_templates(ops):
     """Add universal detection channel maps to the learned export namespace."""
     if '_residual_template_offset' in ops:
@@ -971,8 +1002,15 @@ def _register_residual_detection_templates(ops):
         raise ValueError('residual and learned channel maps have different widths')
     device = iCC.device
     iC = iC.to(device)
+    iU = iU.to(device)
+    xc = torch.as_tensor(ops['xc'], dtype=torch.float64, device=device)
+    yc = torch.as_tensor(ops['yc'], dtype=torch.float64, device=device)
+    if iU.numel() and int(iU.max()) >= len(xc):
+        raise ValueError('learned template center index exceeds probe coordinates')
     n_old_columns = iCC.shape[1]
     n_universal = iC.shape[1]
+    old_xy = torch.stack((xc[iU], yc[iU]), dim=0)
+    residual_xy = torch.stack((xc[:n_universal], yc[:n_universal]), dim=0)
     ops['iCC'] = torch.cat((iCC, iC), dim=1)
     ops['iCC_mask'] = torch.cat(
         (iCC_mask, torch.ones((iC.shape[0], n_universal),
@@ -980,6 +1018,10 @@ def _register_residual_detection_templates(ops):
     ops['iU'] = torch.cat(
         (iU, torch.arange(n_old_columns, n_old_columns + n_universal,
                           dtype=torch.long, device=device)))
+    # iU indexes columns in iCC after registration, whereas xc/yc index
+    # physical channels.  Keep virtual-template coordinates separately so
+    # PC-feature code cannot index xc/yc with virtual column numbers.
+    ops['_template_xy'] = torch.cat((old_xy, residual_xy), dim=1)
     ops['_residual_template_offset'] = int(iU.shape[0])
     return int(iU.shape[0])
 
@@ -1313,19 +1355,35 @@ def residual_recluster(ops, bfile, Wall, clu, st, tF, device=torch.device('cuda'
         has_match = hi > lo
         if not has_match.any():
             continue
-        # For spikes with matches, take the nearest main spike's cluster
-        # (first match in the window — adequate for per-cluster voting).
-        first_match_idx = lo[has_match]
-        first_match_idx = np.clip(first_match_idx, 0, len(clu_main_s) - 1)
-        matched_clu = clu_main_s[first_match_idx]
-        votes = np.bincount(matched_clu.astype(np.int64), minlength=n_main)
-        best_frac = votes.max() / n_k
-        if best_frac > 0.30:
+        votes = _nearest_one_to_one_overlap_votes(
+            spikes_k, st_main_s, clu_main_s, window=OVERLAP_WINDOW)
+        if not votes:
+            continue
+        best_clu, best_votes = max(votes.items(), key=lambda item: item[1])
+        best_frac = best_votes / n_k
+
+        # The narrow vote is only a cheap candidate filter.  The actual
+        # duplicate test searches the same +/-2 ms CCG peak-lag window used
+        # by coincidence_merge, so propagation delays are not missed.
+        candidate_clusters = [label for label, count in votes.items()
+                              if count / n_k >= 0.01]
+        peak_frac = 0.0
+        peak_clu = best_clu
+        for main_clu in candidate_clusters:
+            main_train = st_main_s[clu_main_s == main_clu]
+            frac, _ = template_matching._peak_shared_fraction(
+                np.sort(spikes_k), main_train, fs)
+            if frac > peak_frac:
+                peak_frac = frac
+                peak_clu = main_clu
+        if best_frac > 0.30 or peak_frac >= 0.20:
             keep_cluster[kid] = False
-            best_clu = votes.argmax()
+            ops['residual_clusters_rejected_overlap'] = (
+                int(ops.get('residual_clusters_rejected_overlap', 0)) + 1)
             logger.debug(
                 f'residual cluster {kid}: rejected '
-                f'(overlap={best_frac:.2f} with main {best_clu})')
+                f'(window={best_frac:.2f}, peak={peak_frac:.2f} '
+                f'with main {peak_clu})')
 
     # Step 4: quality check — ACG / ISI
     is_ref_res, _ = CCG.refract(
@@ -1382,28 +1440,25 @@ def residual_recluster(ops, bfile, Wall, clu, st, tF, device=torch.device('cuda'
     if st.shape[1] > 2:
         st_res_3col[:, 2] = st_res_kept[:, 2] if st_res_kept.shape[1] > 2 else 0
 
-    # Pad tF_res to match main tF dimensions
+    # Residual clustering must use the same feature contract as the learned
+    # path. Silent truncation/padding changes the waveform representation and
+    # can make an invalid residual unit look valid.
     if tF_res_kept.shape[1:] != tF.shape[1:]:
-        tF_pad = torch.zeros((len(tF_res_kept),) + tF.shape[1:],
-                             dtype=tF.dtype)
-        nc = min(tF_res_kept.shape[1], tF.shape[1])
-        np_c = min(tF_res_kept.shape[2], tF.shape[2])
-        tF_pad[:, :nc, :np_c] = tF_res_kept[:, :nc, :np_c]
-        tF_res_kept = tF_pad
+        raise ValueError(
+            'residual and learned features have incompatible shapes: '
+            f'{tuple(tF_res_kept.shape[1:])} vs {tuple(tF.shape[1:])}')
 
     # Concatenate
     clu_out = np.concatenate([clu, clu_res_kept])
     st_out = np.concatenate([st, st_res_3col])
     tF_out = torch.cat([tF, tF_res_kept], dim=0)
 
-    # Pad Wall
+    # Cluster templates must have the same channel/PC contract too.
     Wall_res_kept = Wall_res[keep_cluster]
     if Wall_res_kept.shape[1:] != Wall.shape[1:]:
-        Wall_pad = torch.zeros((n_kept,) + Wall.shape[1:], dtype=Wall.dtype)
-        nc = min(Wall_res_kept.shape[1], Wall.shape[1])
-        np_c = min(Wall_res_kept.shape[2], Wall.shape[2])
-        Wall_pad[:, :nc, :np_c] = Wall_res_kept[:, :nc, :np_c]
-        Wall_res_kept = Wall_pad
+        raise ValueError(
+            'residual and learned templates have incompatible shapes: '
+            f'{tuple(Wall_res_kept.shape[1:])} vs {tuple(Wall.shape[1:])}')
     Wall_out = torch.cat([Wall, Wall_res_kept], dim=0)
 
     # Re-sort by time

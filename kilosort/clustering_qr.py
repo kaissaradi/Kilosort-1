@@ -510,10 +510,17 @@ def subsample_idx(n1, n2):
 def xy_templates(ops):
     iU = ops['iU'].cpu().numpy()
     iC = ops['iCC'][:, ops['iU']]
-    #PID = st[:,5].long()
-    xcup, ycup = ops['xc'][iU], ops['yc'][iU]
-    xy = np.vstack((xcup, ycup))
-    xy = torch.from_numpy(xy)
+    # Normal templates use iU as physical-channel indices.  Residual
+    # templates append virtual iCC columns, so their iU values are no longer
+    # valid indices into xc/yc; registration stores the corresponding centers
+    # explicitly in _template_xy.
+    if '_template_xy' in ops:
+        xy = torch.as_tensor(ops['_template_xy'], dtype=torch.float64)
+    else:
+        xcup, ycup = ops['xc'][iU], ops['yc'][iU]
+        xy = torch.from_numpy(np.vstack((xcup, ycup)))
+    if xy.shape[1] != iC.shape[1]:
+        raise ValueError('template coordinates and channel maps have different counts')
 
     return xy, iC
 
@@ -1000,5 +1007,4 @@ def get_data_cpu(ops, xy, iC, PID, tF, ycenter, xcenter, dmin=20, dminx=32,
         Xd = dd
 
     return Xd, igood, ichan
-
 

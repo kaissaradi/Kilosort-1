@@ -7,7 +7,6 @@ from torch.nn.functional import conv1d, max_pool2d, max_pool1d
 from tqdm import tqdm
 
 from kilosort import CCG, fused_peel, fused_peel_cond, fused_peel_store
-from kilosort.postprocessing import remove_duplicates
 from kilosort.utils import (
     get_spike_buffer_capacity,
     group_indices_by_label,
@@ -798,7 +797,8 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
     return Ww.cpu(), clu2, is_ref, st, tF
 
 
-def _peak_shared_fraction(st_a, st_b, fs, maxlag_s=0.002, halfbin_s=0.00025):
+def _peak_shared_fraction_with_matches(st_a, st_b, fs, maxlag_s=0.002,
+                                       halfbin_s=0.00025):
     """Fraction of the smaller train sharing spikes at the CCG peak lag.
 
     Searches all lags within ±maxlag_s and returns the highest bin count
@@ -807,7 +807,7 @@ def _peak_shared_fraction(st_a, st_b, fs, maxlag_s=0.002, halfbin_s=0.00025):
     (int64).
     """
     if len(st_a) == 0 or len(st_b) == 0:
-        return 0.0, 0.0
+        return 0.0, 0.0, np.zeros(len(st_b), dtype=bool)
     maxlag = int(maxlag_s * fs)
     halfbin = int(halfbin_s * fs)
     lo = np.searchsorted(st_b, st_a - maxlag - halfbin, 'left')
@@ -817,23 +817,39 @@ def _peak_shared_fraction(st_a, st_b, fs, maxlag_s=0.002, halfbin_s=0.00025):
         if h > l:
             dts.append(st_b[l:h] - x)
     if not dts:
-        return 0.0, 0.0
+        return 0.0, 0.0, np.zeros(len(st_b), dtype=bool)
     dts = np.concatenate(dts)
     edges = np.arange(-maxlag - halfbin, maxlag + halfbin + 1, 2 * halfbin + 1)
     cnt, _ = np.histogram(dts, bins=edges)
     k = int(np.argmax(cnt))
-    lag_s = float((edges[k] + edges[k + 1]) / 2 / fs)
+    # The broad histogram bin is only a candidate-lag locator.  Commit to an
+    # integer sample lag by maximizing exact coincidences inside that bin.
+    # Returning the bin midpoint caused already aligned trains to be shifted
+    # by 4 or 5 samples, and made the residual/merge timestamp convention
+    # impossible to audit.
+    lag_lo = int(edges[k])
+    lag_hi = int(edges[k + 1])
+    lag_candidates = range(lag_lo, lag_hi + (1 if k == len(cnt) - 1 else 0))
+
+    def exact_count(lag):
+        target = st_a + int(lag)
+        pos = np.searchsorted(st_b, target, side='left')
+        valid = pos < len(st_b)
+        return int(np.count_nonzero(valid & (st_b[np.clip(pos, 0, len(st_b) - 1)] == target)))
+
+    exact = [(exact_count(lag), abs(lag - (lag_lo + lag_hi) / 2), lag)
+             for lag in lag_candidates]
+    _, _, best_lag = max(exact, key=lambda item: (item[0], -item[1], -abs(item[2])))
     # The histogram is only used to locate the peak. Counting all pairs in a
     # bin can exceed one match per spike for bursty trains, yielding an
     # impossible "shared fraction" and making the merge over-aggressive.
     # Greedily match sorted spikes within the *selected bin's exact bounds*,
     # consuming each spike in b once. Using the bin bounds matters at the
     # edges: the centre +/- halfbin interval is narrower by one sample.
-    lag_lo = int(edges[k])
-    lag_hi = int(edges[k + 1])
     last_bin = k == len(cnt) - 1
     j = 0
     matched = 0
+    matched_b = np.zeros(len(st_b), dtype=bool)
     for a in st_a:
         while j < len(st_b) and st_b[j] - a < lag_lo:
             j += 1
@@ -841,9 +857,22 @@ def _peak_shared_fraction(st_a, st_b, fs, maxlag_s=0.002, halfbin_s=0.00025):
                 and (st_b[j] - a < lag_hi
                      or (last_bin and st_b[j] - a <= lag_hi))):
             matched += 1
+            matched_b[j] = True
             j += 1
     frac = matched / max(min(len(st_a), len(st_b)), 1)
-    return float(frac), lag_s
+    return float(frac), float(best_lag / fs), matched_b
+
+
+def _peak_shared_fraction(st_a, st_b, fs, maxlag_s=0.002, halfbin_s=0.00025):
+    """Compatibility wrapper returning only fraction and lag."""
+    frac, lag, _ = _peak_shared_fraction_with_matches(
+        st_a, st_b, fs, maxlag_s=maxlag_s, halfbin_s=halfbin_s)
+    return frac, lag
+
+
+def residual_event_sample_reference(detector_samples, nt, nt0min):
+    """Convert detector-window positions to the learned spike-time reference."""
+    return np.asarray(detector_samples) - nt - nt // 2 + nt0min
 
 
 def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
@@ -858,8 +887,9 @@ def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
 
     Safety gates:
       - The target (larger) cluster must already be refractory (``is_ref``).
-      - The union (after deduplicating coincident spikes within 15 samples)
-        must pass the ACG or ISI fallback.
+      - The prospective union removes only the explicitly matched copy from
+        the smaller train; all unmatched and within-source events remain in
+        the refractory-quality check.
 
     Parameters
     ----------
@@ -878,6 +908,8 @@ def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
     clu2 = clu.copy()
     fs = ops['fs']
     n_clusters = int(clu2.max()) + 1
+    if Wall is not None:
+        n_clusters = max(n_clusters, int(Wall.shape[0]))
 
     # Quality labels from the preceding merge step (with ISI fallback)
     is_ref, _ = CCG.refract(clu2, st[:, 0] / fs,
@@ -903,7 +935,6 @@ def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
 
     nmerge = 0
     nveto = 0
-    dup_dt = int(ops.get('duplicate_spike_bins', 15))
 
     # Only check clusters with enough spikes to be meaningful
     candidates = [int(isort[i]) for i in range(n_clusters)
@@ -914,11 +945,13 @@ def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
             continue
         if not is_ref[kk]:
             continue
-        st_a = cluster_times[kk]
-        if len(st_a) < 100:
-            continue
-
         for j in range(i + 1, len(candidates)):
+            # The target grows after every accepted merge.  Read it here,
+            # inside the loop, so subsequent candidates are tested against
+            # the committed train rather than a stale pre-merge snapshot.
+            st_a = cluster_times.get(kk)
+            if st_a is None or len(st_a) < 100:
+                break
             jj = candidates[j]
             if is_merged[jj] or jj not in cluster_times:
                 continue
@@ -926,19 +959,19 @@ def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
             if len(st_b) < 100:
                 continue
 
-            frac, lag = _peak_shared_fraction(st_a, st_b, fs)
+            frac, lag, matched_b = _peak_shared_fraction_with_matches(
+                st_a, st_b, fs)
             if frac < frac_thresh:
                 continue
 
             dt_samples = int(round(lag * fs))
 
-            # Use the exact exporter deduplication rule for the prospective
-            # union. A hand-written adjacent-difference check disagrees when
-            # a rejected spike lies between two retained spikes.
-            st_union = np.sort(np.concatenate([st_a, st_b - dt_samples]))
-            union_clusters = np.zeros(len(st_union), dtype=np.int32)
-            st_union, _, _ = remove_duplicates(
-                st_union.astype(np.int64), union_clusters, dt=dup_dt)
+            # Do not run remove_duplicates here.  That would erase the very
+            # refractory violations used to decide whether this is a valid
+            # merge.  Only the one-to-one CCG matches are duplicates by
+            # evidence; every other event must remain visible to the gate.
+            st_union = np.sort(np.concatenate([
+                st_a, st_b[~matched_b] - dt_samples]))
             st_union_sec = st_union / fs
 
             is_union_ref, _, _ = CCG.check_CCG(
@@ -982,6 +1015,9 @@ def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
                 Wall[jj] = 0
 
             nmerge += 1
+            ops['coincidence_merge_deduped_spikes'] = (
+                int(ops.get('coincidence_merge_deduped_spikes', 0))
+                + int(matched_b.sum()))
             logger.debug(
                 f'coincidence merge: {jj} → {kk} (frac={frac:.2f}, '
                 f'lag={lag*1000:.2f}ms)')
@@ -1108,7 +1144,11 @@ def extract_residual_spikes(ops, bfile, Wall, device=torch.device('cuda'),
                 (col1, yct.double(), amp.double(), imax.double(),
                  torch.full_like(col1, ibatch), xy[:, 0].double()), dim=1)
             cols = cols.cpu().numpy()
-            cols[:, 0] = (cols[:, 0] - nt) / ops_res['fs'] + t_shift
+            # Match the learned extractor's event reference exactly.  The
+            # detector reports the window position, while exported spike
+            # times are referenced at nt//2 - nt0min samples in that window.
+            cols[:, 0] = residual_event_sample_reference(
+                cols[:, 0], nt, ops_res['nt0min']) / ops_res['fs'] + t_shift
             st[k:k + nsp] = cols
 
             k += nsp

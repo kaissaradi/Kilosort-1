@@ -622,14 +622,14 @@ def test_coincidence_merge_joins_split_clusters():
     # Base spike train: ~11 Hz with 3ms refractory period
     base_times = _refractory_train(rng, 11.0, 180.0, fs)
 
-    # Cluster 0: base times + some unique spikes (also refractory)
-    extra_0 = _refractory_train(rng, 3.0, 180.0, fs)
-    st_0 = np.sort(np.concatenate([base_times, extra_0]))
+    # Keep the fixture fully refractory after the explicitly matched copies
+    # are removed.  Adding unrelated random spikes here makes the prospective
+    # union genuinely violate the production ISI gate, which must veto it.
+    st_0 = base_times
 
-    # Cluster 1: base times shifted by 6 samples (0.3ms) + some unique spikes
+    # Cluster 1: the same train shifted by 6 samples (0.3ms).
     dt_samples = 6
-    extra_1 = _refractory_train(rng, 3.0, 180.0, fs)
-    st_1 = np.sort(np.concatenate([base_times + dt_samples, extra_1]))
+    st_1 = base_times + dt_samples
 
     n_total = len(st_0) + len(st_1)
     st = np.zeros((n_total, 3), dtype=np.float64)
@@ -695,6 +695,39 @@ def test_coincidence_merge_does_not_join_independent_clusters():
 
     assert clu_out.max() == 1, 'independent clusters should stay separate'
     assert ops.get('coincidence_merge_count', 0) == 0
+
+
+def test_coincidence_merge_does_not_launder_refractory_violations():
+    """Matched copies may be removed, but unmatched close events veto."""
+    from kilosort.template_matching import coincidence_merge
+
+    rng = np.random.default_rng(780)
+    fs = 20_000.0
+    base = _refractory_train(rng, 11.0, 180.0, fs)
+    st_0 = base
+    # The +6 copy is a duplicate candidate.  The +16 copy is not in the
+    # selected peak bin; after alignment it sits 10 samples from the target
+    # and must remain visible to the refractory gate.
+    st_1 = np.sort(np.concatenate([base + 6, base + 16]))
+
+    st = np.zeros((len(st_0) + len(st_1), 3), dtype=np.float64)
+    clu = np.zeros(len(st), dtype=np.int32)
+    st[:len(st_0), 0] = st_0
+    st[len(st_0):, 0] = st_1
+    clu[len(st_0):] = 1
+    order = np.argsort(st[:, 0])
+    st, clu = st[order], clu[order]
+    ops = {'fs': fs, 'wPCA': torch.eye(6), 'settings': {
+        'acg_threshold': 0.2, 'ccg_threshold': 0.25,
+        'isi_threshold': 0.01, 'isi_min_spikes': 500,
+    }}
+
+    _, clu_out, _, _, _ = coincidence_merge(
+        ops, torch.zeros(2, 10, 6), clu, st,
+        torch.zeros(len(st), 10, 6), frac_thresh=0.20)
+
+    assert clu_out.max() == 1
+    assert ops['coincidence_merge_count'] == 0
 
 
 def test_coincidence_merge_collapses_a_duplicate_chain():
@@ -772,6 +805,34 @@ def test_peak_shared_fraction_uses_full_peak_bin():
         assert frac == 1.0
 
 
+def test_peak_shared_fraction_returns_an_exact_sample_lag():
+    """A committed coincidence shift must not use a histogram midpoint."""
+    from kilosort.template_matching import _peak_shared_fraction
+
+    a = np.arange(100, 2100, 100, dtype=np.int64)
+    frac, lag = _peak_shared_fraction(a, a + 6, fs=20_000.0)
+
+    assert frac == 1.0
+    assert lag == 6 / 20_000.0
+
+
+def test_residual_event_reference_matches_learned_extraction():
+    """Residual and learned events use the same non-centered reference."""
+    from kilosort.template_matching import residual_event_sample_reference
+
+    assert residual_event_sample_reference([100], nt=81, nt0min=26).tolist() == [5]
+
+
+def test_residual_overlap_votes_are_nearest_and_one_to_one():
+    """A dense query train cannot vote the same main event repeatedly."""
+    from kilosort.run_kilosort import _nearest_one_to_one_overlap_votes
+
+    votes = _nearest_one_to_one_overlap_votes(
+        [100, 101, 102], [100, 200], [7, 8], window=5)
+
+    assert votes == {7: 1}
+
+
 def test_residual_snr_aligns_local_features_to_probe_channels():
     """Equivalent waveforms in different local channel orders stay coherent."""
     from kilosort.run_kilosort import _aligned_cluster_feature_snr
@@ -799,12 +860,20 @@ def test_residual_detection_templates_preserve_channel_maps():
         'iCC': torch.tensor([[0, 1], [1, 0]]),
         'iCC_mask': torch.ones((2, 2), dtype=torch.bool),
         'iU': torch.tensor([0, 1]),
+        'xc': np.array([0., 10., 20., 30.]),
+        'yc': np.array([0., 0., 10., 10.]),
     }
     offset = _register_residual_detection_templates(ops)
 
     assert offset == 2
     assert ops['iU'].tolist() == [0, 1, 2, 3]
     assert ops['iCC'][:, 2:].tolist() == [[2, 3], [3, 2]]
+
+    from kilosort.clustering_qr import xy_templates
+    xy, i_c = xy_templates(ops)
+    assert xy.shape == (2, 4)
+    assert xy[:, 2:].tolist() == [[0., 10.], [0., 0.]]
+    assert i_c.shape == (2, 4)
 
 
 # --------------------------------------------------------------------------
