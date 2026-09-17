@@ -131,9 +131,10 @@ def test_coincidence_merge_rechecks_a_target_after_aggregate_evidence_grows():
 def test_coincidence_prefilter_covers_reversed_and_last_lag_edges():
     """Candidate voting must cover exact-matcher orientation and endpoints."""
     base = np.arange(1_000, 101_000, 100, dtype=np.int64)
-    trains = {4: base, 9: base + 43}
-    assert (4, 9) in _coincidence_candidate_pairs(
-        trains, fs=20_000, frac_thresh=0.20)
+    for offset in (43, 44, 45, -44, -45):
+        trains = {4: base, 9: base + offset}
+        assert (4, 9) in _coincidence_candidate_pairs(
+            trains, fs=20_000, frac_thresh=0.20)
 
     alternating = base + np.where(np.arange(len(base)) % 2, 9, 10)
     frac_forward, _ = _peak_shared_fraction(base, alternating, fs=20_000)

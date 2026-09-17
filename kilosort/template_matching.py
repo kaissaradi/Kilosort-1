@@ -1,4 +1,5 @@
 import logging
+from collections import deque
 import os
 
 from numba import njit
@@ -811,57 +812,91 @@ def _peak_shared_fraction_with_matches(st_a, st_b, fs, maxlag_s=0.002,
         return 0.0, 0.0, np.zeros(len(st_b), dtype=bool)
     maxlag = int(maxlag_s * fs)
     halfbin = int(halfbin_s * fs)
-    lo = np.searchsorted(st_b, st_a - maxlag - halfbin, 'left')
-    hi = np.searchsorted(st_b, st_a + maxlag + halfbin, 'right')
-    dts = []
-    for x, l, h in zip(st_a, lo, hi):
-        if h > l:
-            dts.append(st_b[l:h] - x)
-    if not dts:
-        return 0.0, 0.0, np.zeros(len(st_b), dtype=bool)
-    dts = np.concatenate(dts)
-    edges = np.arange(-maxlag - halfbin, maxlag + halfbin + 1, 2 * halfbin + 1)
-    cnt, _ = np.histogram(dts, bins=edges)
-    k = int(np.argmax(cnt))
-    # The broad histogram bin is only a candidate-lag locator.  Commit to an
-    # integer sample lag by maximizing exact coincidences inside that bin.
-    # Returning the bin midpoint caused already aligned trains to be shifted
-    # by 4 or 5 samples, and made the residual/merge timestamp convention
-    # impossible to audit.
-    lag_lo = int(edges[k])
-    lag_hi = int(edges[k + 1])
-    lag_candidates = range(lag_lo, lag_hi + (1 if k == len(cnt) - 1 else 0))
+    frac, best_lag, matched_b = _peak_shared_fraction_kernel(
+        np.asarray(st_a, dtype=np.int64), np.asarray(st_b, dtype=np.int64),
+        maxlag, halfbin)
+    return float(frac), float(best_lag / fs), matched_b
 
-    def exact_count(lag):
-        target = st_a + int(lag)
-        pos = np.searchsorted(st_b, target, side='left')
-        valid = pos < len(st_b)
-        return int(np.count_nonzero(valid & (st_b[np.clip(pos, 0, len(st_b) - 1)] == target)))
 
-    exact = [(exact_count(lag), abs(lag - (lag_lo + lag_hi) / 2), lag)
-             for lag in lag_candidates]
-    _, _, best_lag = max(exact, key=lambda item: (item[0], -item[1], -abs(item[2])))
-    # The histogram is only used to locate the peak. Counting all pairs in a
-    # bin can exceed one match per spike for bursty trains, yielding an
-    # impossible "shared fraction" and making the merge over-aggressive.
-    # Greedily match sorted spikes within the *selected bin's exact bounds*,
-    # consuming each spike in b once. Using the bin bounds matters at the
-    # edges: the centre +/- halfbin interval is narrower by one sample.
-    last_bin = k == len(cnt) - 1
+@njit(cache=True)
+def _peak_shared_fraction_kernel(st_a, st_b, maxlag, halfbin):
+    """Numba implementation of the exact peak/matching contract above.
+
+    This deliberately keeps the old broad-bin and greedy one-to-one rules.
+    It removes only Python allocation and per-spike interpreter overhead from
+    the hot path; the returned lag and match mask remain the same.
+    """
+    width = 2 * halfbin + 1
+    lo_edge = -maxlag - halfbin
+    # Match np.arange(lo_edge, maxlag + halfbin + 1, width): the stop is
+    # exclusive, so the rightmost histogram edge may end below the stop.
+    n_bins = (maxlag + halfbin - lo_edge) // width
+    counts = np.zeros(n_bins, dtype=np.int64)
+    window = maxlag + halfbin
+    has_pairs = False
+    for a in st_a:
+        lo = np.searchsorted(st_b, a - window, side='left')
+        hi = np.searchsorted(st_b, a + window, side='right')
+        for j in range(lo, hi):
+            dt = st_b[j] - a
+            bin_index = (dt - lo_edge) // width
+            # np.histogram excludes values below the first edge and values
+            # above the last edge (except the right edge of the last bin).
+            if (bin_index == n_bins and
+                    dt == lo_edge + n_bins * width):
+                bin_index = n_bins - 1
+            if 0 <= bin_index < n_bins:
+                right_edge = lo_edge + (bin_index + 1) * width
+                if dt < right_edge or bin_index == n_bins - 1:
+                    counts[bin_index] += 1
+                    has_pairs = True
+
+    if not has_pairs:
+        return 0.0, 0, np.zeros(len(st_b), dtype=np.bool_)
+
+    k = 0
+    for i in range(1, n_bins):
+        if counts[i] > counts[k]:
+            k = i
+    lag_lo = lo_edge + k * width
+    lag_hi = lag_lo + width
+    last_bin = k == n_bins - 1
+
+    best_count = -1
+    best_lag = lag_lo
+    midpoint = (lag_lo + lag_hi) / 2.0
+    first_lag = lag_lo
+    last_lag = lag_hi + (1 if last_bin else 0)
+    for lag in range(first_lag, last_lag):
+        exact_count = 0
+        for a in st_a:
+            pos = np.searchsorted(st_b, a + lag, side='left')
+            if pos < len(st_b) and st_b[pos] == a + lag:
+                exact_count += 1
+        distance = abs(lag - midpoint)
+        best_distance = abs(best_lag - midpoint)
+        # Python max((count, -distance, -abs(lag), lag)) prefers the lower
+        # absolute lag only after count and distance are tied.
+        if (exact_count > best_count or
+                (exact_count == best_count and distance < best_distance) or
+                (exact_count == best_count and distance == best_distance and
+                 abs(lag) < abs(best_lag))):
+            best_count = exact_count
+            best_lag = lag
+
+    matched_b = np.zeros(len(st_b), dtype=np.bool_)
     j = 0
     matched = 0
-    matched_b = np.zeros(len(st_b), dtype=bool)
     for a in st_a:
         while j < len(st_b) and st_b[j] - a < lag_lo:
             j += 1
-        if (j < len(st_b)
-                and (st_b[j] - a < lag_hi
-                     or (last_bin and st_b[j] - a <= lag_hi))):
+        if (j < len(st_b) and
+                (st_b[j] - a < lag_hi or
+                 (last_bin and st_b[j] - a <= lag_hi))):
             matched += 1
             matched_b[j] = True
             j += 1
-    frac = matched / max(min(len(st_a), len(st_b)), 1)
-    return float(frac), float(best_lag / fs), matched_b
+    return matched / max(min(len(st_a), len(st_b)), 1), best_lag, matched_b
 
 
 def _peak_shared_fraction(st_a, st_b, fs, maxlag_s=0.002, halfbin_s=0.00025):
@@ -872,8 +907,8 @@ def _peak_shared_fraction(st_a, st_b, fs, maxlag_s=0.002, halfbin_s=0.00025):
 
 
 @njit(cache=True)
-def _coincidence_vote_counts(times, labels, n_labels, maxlag, halfbin,
-                             n_bins):
+def _coincidence_vote_counts(times, labels, cluster_sizes, n_labels,
+                             maxlag, halfbin, n_bins):
     """Count all cross-cluster event pairs in the broad CCG lag bins.
 
     ``times`` is globally sorted.  Numba keeps the local event sweep cheap;
@@ -900,11 +935,28 @@ def _coincidence_vote_counts(times, labels, n_labels, maxlag, halfbin,
                     a = lj
                     b = li
                     signed_lag = times[i] - times[j]
-                lag_bin = (signed_lag - lo_edge) // width
-                if lag_bin == n_bins and signed_lag == lo_edge + n_bins * width:
-                    lag_bin = n_bins - 1
-                if 0 <= lag_bin < n_bins:
-                    counts[a, b, lag_bin] += 1
+                # Orient votes toward the larger train, matching the exact
+                # adjudicator's target/absorbed ordering. Equal-size trains
+                # are allowed both orientations because the queue's tie
+                # order is not part of the identity contract.
+                if cluster_sizes[li] > cluster_sizes[lj]:
+                    first_lag = times[j] - times[i]
+                    n_votes = 1
+                elif cluster_sizes[lj] > cluster_sizes[li]:
+                    first_lag = times[i] - times[j]
+                    n_votes = 1
+                else:
+                    first_lag = signed_lag
+                    n_votes = 2
+                for vote_index in range(n_votes):
+                    vote_lag = (first_lag if vote_index == 0
+                                else -first_lag)
+                    lag_bin = (vote_lag - lo_edge) // width
+                    if (lag_bin == n_bins and
+                            vote_lag == lo_edge + n_bins * width):
+                        lag_bin = n_bins - 1
+                    if 0 <= lag_bin < n_bins:
+                        counts[a, b, lag_bin] += 1
             j += 1
     return counts
 
@@ -928,7 +980,8 @@ def _coincidence_target_vote_counts(target_times, other_times, other_labels,
             else:
                 signed_lag = target_time - other_times[j]
             lag_bin = (signed_lag - lo_edge) // width
-            if lag_bin == n_bins and signed_lag == lo_edge + n_bins * width:
+            if (lag_bin == n_bins and
+                    signed_lag == lo_edge + n_bins * width):
                 lag_bin = n_bins - 1
             if 0 <= lag_bin < n_bins:
                 counts[other_index, lag_bin] += 1
@@ -1018,11 +1071,15 @@ def _coincidence_candidate_pairs(cluster_times, fs, frac_thresh,
     all_labels = all_labels[order]
     label_values = np.asarray(labels, dtype=np.int64)
     label_indices = np.searchsorted(label_values, all_labels)
+    cluster_sizes = np.asarray([
+        min(len(cluster_times[k]), int(max_samples_per_cluster))
+        if max_samples_per_cluster is not None else len(cluster_times[k])
+        for k in labels], dtype=np.int64)
     edges = np.arange(-maxlag - halfbin, maxlag + halfbin + 1,
                       2 * halfbin + 1)
     counts = _coincidence_vote_counts(
-        all_times, label_indices, len(label_values), maxlag, halfbin,
-        len(edges) - 1)
+        all_times, label_indices, cluster_sizes, len(label_values), maxlag,
+        halfbin, len(edges) - 1)
 
     # The exact adjudicator includes the final histogram edge.  Treat that
     # edge the same way here, then also join neighboring bins when deciding
@@ -1191,9 +1248,9 @@ def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
     # Revisit a target after it grows. This handles aggregate evidence split
     # across several source clusters and partners that were earlier in the
     # original count ordering.
-    candidate_queue = list(candidates)
+    candidate_queue = deque(candidates)
     while candidate_queue:
-        kk = candidate_queue.pop(0)
+        kk = candidate_queue.popleft()
         if is_merged[kk] or kk not in cluster_times:
             continue
         if not is_ref[kk]:
