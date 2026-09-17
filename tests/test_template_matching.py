@@ -5,13 +5,213 @@ from torch.nn.functional import conv1d
 
 from kilosort import CCG
 from kilosort.template_matching import (
+    _coincidence_candidate_pairs,
     _matching_unit_cache,
+    _peak_shared_fraction,
+    coincidence_merge,
     extract_residual_spikes,
     merging_function,
     prepare_matching,
     roll_features,
     run_matching,
 )
+
+
+def test_coincidence_prefilter_keeps_shifted_duplicates_only():
+    """The cheap gate must retain a real shifted duplicate and reject noise."""
+    base = np.arange(100, 20_100, 100, dtype=np.int64)
+    trains = {
+        4: base,
+        9: base + 6,
+        12: base + 30_000,
+    }
+
+    pairs = _coincidence_candidate_pairs(
+        trains, fs=20_000, frac_thresh=0.20, max_samples_per_cluster=200)
+
+    assert (4, 9) in pairs
+    assert (4, 12) not in pairs
+
+
+def test_coincidence_prefilter_default_does_not_sample_away_a_duplicate():
+    """The exact candidate pass keeps overlap hidden between sample points."""
+    a = np.arange(1_000, dtype=np.int64) * 10_000
+    sample_positions = np.linspace(0, len(a) - 1, 200).round().astype(int)
+    shared_positions = np.setdiff1d(
+        np.arange(len(a)), sample_positions, assume_unique=True)[:200]
+    shared = np.zeros(len(a), dtype=bool)
+    shared[shared_positions] = True
+    b = a + np.where(shared, 6, 1_000)
+
+    trains = {4: a, 9: b}
+    assert (4, 9) in _coincidence_candidate_pairs(
+        trains, fs=20_000, frac_thresh=0.20)
+    assert (4, 9) not in _coincidence_candidate_pairs(
+        trains, fs=20_000, frac_thresh=0.20,
+        max_samples_per_cluster=200)
+
+
+def test_coincidence_merge_scatter_maps_retained_features_to_global_channels():
+    """Retained local features must update Wall in physical-channel order."""
+    target = np.arange(1_000, 801_000, 1_000, dtype=np.int64)
+    source = np.concatenate((target[:200],
+                             np.arange(2_000_000, 2_400_000, 1_000)))
+    n = len(target) + len(source)
+    st = np.zeros((n, 6), dtype=np.float64)
+    st[:, 0] = np.concatenate((target, source))
+    st[len(target):, 5] = 1
+    clu = np.concatenate((np.zeros(len(target), dtype=np.int32),
+                          np.ones(len(source), dtype=np.int32)))
+    ops = {
+        'fs': 20_000,
+        'iCC': torch.tensor([[3, 4], [4, 3]]),
+        'iU': torch.tensor([0, 1]),
+        'iC': torch.tensor([[3, 4], [4, 3]]),
+        'wPCA': torch.zeros((1, 81)),
+        'settings': {
+            'acg_threshold': 0.2,
+            'ccg_threshold': 0.25,
+            'isi_threshold': 0.01,
+            'isi_min_spikes': 500,
+        },
+    }
+    Wall = torch.zeros((2, 6, 1))
+    Wall[0, 3:5, 0] = 1.0
+    Wall[1, 3:5, 0] = 100.0
+    tF = torch.cat((torch.ones((len(target), 2, 1)),
+                    torch.full((len(source), 2, 1), 2.0)))
+
+    Wall2, _, _, st2, tF2 = coincidence_merge(
+        ops, Wall, clu, st, tF, frac_thresh=0.20)
+
+    expected = (len(target) + 2 * (len(source) - 200)) / len(st2)
+    assert ops['coincidence_merge_count'] == 1
+    assert torch.allclose(Wall2[0, 3:5, 0],
+                          torch.full((2,), expected))
+    assert torch.equal(Wall2[0, :3], torch.zeros((3, 1)))
+    assert torch.equal(Wall2[0, 5:], torch.zeros((1, 1)))
+    assert len(st2) == len(tF2)
+
+
+def test_coincidence_merge_rechecks_a_target_after_aggregate_evidence_grows():
+    """A merged pair can reveal a third duplicate only after aggregation."""
+    common = np.arange(1_000, 201_000, 1_000, dtype=np.int64)
+    a_only = np.arange(1_000_000, 1_800_000, 1_000, dtype=np.int64)
+    b_only = np.arange(2_000_000, 2_800_000, 1_000, dtype=np.int64)
+    c_only = np.arange(3_000_000, 3_800_000, 1_000, dtype=np.int64)
+    trains = [
+        np.concatenate((common, a_only)),
+        np.concatenate((common + 6, b_only)),
+        np.concatenate((a_only[:100] + 6, b_only[:100], c_only)),
+    ]
+    st = np.zeros((sum(map(len, trains)), 3), dtype=np.float64)
+    clu = []
+    cursor = 0
+    for label, train in enumerate(trains):
+        st[cursor:cursor + len(train), 0] = train
+        clu.extend([label] * len(train))
+        cursor += len(train)
+    order = np.argsort(st[:, 0])
+    st = st[order]
+    clu = np.asarray(clu, dtype=np.int32)[order]
+    ops = {'fs': 20_000.0, 'wPCA': torch.zeros((1, 1, 1)), 'settings': {
+        'acg_threshold': 0.2, 'ccg_threshold': 0.25,
+        'isi_threshold': 0.01, 'isi_min_spikes': 500,
+    }}
+
+    _, clu2, _, st2, _ = coincidence_merge(
+        ops, torch.zeros((3, 1, 1)), clu, st,
+        torch.zeros((len(st), 1, 1)), frac_thresh=0.20)
+
+    assert ops['coincidence_merge_count'] == 2
+    assert np.unique(clu2).size == 1
+    assert len(st2) == 2_600
+
+
+def test_coincidence_prefilter_covers_reversed_and_last_lag_edges():
+    """Candidate voting must cover exact-matcher orientation and endpoints."""
+    base = np.arange(1_000, 101_000, 100, dtype=np.int64)
+    trains = {4: base, 9: base + 43}
+    assert (4, 9) in _coincidence_candidate_pairs(
+        trains, fs=20_000, frac_thresh=0.20)
+
+    alternating = base + np.where(np.arange(len(base)) % 2, 9, 10)
+    frac_forward, _ = _peak_shared_fraction(base, alternating, fs=20_000)
+    assert frac_forward >= 0.20
+    assert (4, 9) in _coincidence_candidate_pairs(
+        {4: base, 9: alternating}, fs=20_000, frac_thresh=0.20)
+
+
+def test_coincidence_merge_commits_the_validated_deduplicated_train():
+    """Matched copies must be removed, not merely counted as deduplicated."""
+    base = np.arange(1_000, 1_001_000, 1_000, dtype=np.int64)
+    st = np.column_stack((
+        np.concatenate((base, base + 6)),
+        np.zeros(2 * len(base), dtype=np.int64),
+        np.ones(2 * len(base), dtype=np.float32),
+    ))
+    clu = np.concatenate((np.zeros(len(base), dtype=np.int32),
+                          np.ones(len(base), dtype=np.int32)))
+    ops = {
+        'fs': 20_000,
+        'wPCA': torch.zeros((1, 81)),
+        'settings': {
+            'acg_threshold': 0.2,
+            'ccg_threshold': 0.25,
+            'isi_threshold': 0.01,
+            'isi_min_spikes': 500,
+        },
+    }
+    Wall = torch.zeros((2, 1, 1))
+    tF = torch.zeros((len(st), 1, 1))
+
+    Wall2, clu2, _, st2, tF2 = coincidence_merge(
+        ops, Wall, clu, st, tF, frac_thresh=0.2)
+
+    assert ops['coincidence_merge_count'] == 1
+    assert ops['coincidence_merge_deduped_spikes'] == len(base)
+    assert len(st2) == len(base)
+    assert len(np.unique(st2[:, 0])) == len(base)
+    assert len(np.unique(clu2)) == 1
+    assert tF2.shape[0] == len(base)
+
+
+def test_coincidence_merge_weights_only_retained_source_features():
+    """A source template must not retain the mean of deleted spike rows."""
+    target = np.arange(1_000, 801_000, 1_000, dtype=np.int64)
+    source = np.concatenate((target[:200],
+                             np.arange(2_000_000, 2_400_000, 1_000)))
+    st = np.column_stack((
+        np.concatenate((target, source)),
+        np.zeros(len(target) + len(source), dtype=np.int64),
+        np.ones(len(target) + len(source), dtype=np.float32),
+    ))
+    clu = np.concatenate((np.zeros(len(target), dtype=np.int32),
+                          np.ones(len(source), dtype=np.int32)))
+    ops = {
+        'fs': 20_000,
+        'wPCA': torch.zeros((1, 81)),
+        'settings': {
+            'acg_threshold': 0.2,
+            'ccg_threshold': 0.25,
+            'isi_threshold': 0.01,
+            'isi_min_spikes': 500,
+        },
+    }
+    # The source Wall is intentionally stale and extreme.  Its retained
+    # feature rows are the actual contribution that should be used.
+    Wall = torch.tensor([[[1.0]], [[100.0]]])
+    tF = torch.cat((torch.ones((len(target), 1, 1)),
+                    torch.full((len(source), 1, 1), 2.0)))
+
+    Wall2, clu2, _, st2, tF2 = coincidence_merge(
+        ops, Wall, clu, st, tF, frac_thresh=0.2)
+
+    assert ops['coincidence_merge_count'] == 1
+    assert len(st2) == len(target) + len(source) - 200
+    expected = (len(target) * 1.0 + (len(source) - 200) * 2.0) / len(st2)
+    assert torch.allclose(Wall2[0], torch.full_like(Wall2[0], expected))
+    assert tF2.shape[0] == len(st2)
 
 
 def test_residual_probe_does_not_mutate_extraction_ops(monkeypatch):

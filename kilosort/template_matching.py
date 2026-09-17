@@ -1,6 +1,7 @@
 import logging
 import os
 
+from numba import njit
 import numpy as np
 import torch
 from torch.nn.functional import conv1d, max_pool2d, max_pool1d
@@ -870,6 +871,244 @@ def _peak_shared_fraction(st_a, st_b, fs, maxlag_s=0.002, halfbin_s=0.00025):
     return frac, lag
 
 
+@njit(cache=True)
+def _coincidence_vote_counts(times, labels, n_labels, maxlag, halfbin,
+                             n_bins):
+    """Count all cross-cluster event pairs in the broad CCG lag bins.
+
+    ``times`` is globally sorted.  Numba keeps the local event sweep cheap;
+    the Python caller only materializes the usually small set of candidate
+    cluster pairs.  This count is a superset of the exact one-to-one count,
+    so it cannot hide a pair that the adjudicator would accept.
+    """
+    counts = np.zeros((n_labels, n_labels, n_bins), dtype=np.uint32)
+    width = 2 * halfbin + 1
+    lo_edge = -maxlag - halfbin
+    window = maxlag + halfbin
+    n = len(times)
+    for i in range(n - 1):
+        j = i + 1
+        while j < n and times[j] - times[i] <= window:
+            li = labels[i]
+            lj = labels[j]
+            if li != lj:
+                if li < lj:
+                    a = li
+                    b = lj
+                    signed_lag = times[j] - times[i]
+                else:
+                    a = lj
+                    b = li
+                    signed_lag = times[i] - times[j]
+                lag_bin = (signed_lag - lo_edge) // width
+                if lag_bin == n_bins and signed_lag == lo_edge + n_bins * width:
+                    lag_bin = n_bins - 1
+                if 0 <= lag_bin < n_bins:
+                    counts[a, b, lag_bin] += 1
+            j += 1
+    return counts
+
+
+@njit(cache=True)
+def _coincidence_target_vote_counts(target_times, other_times, other_labels,
+                                    target_index, n_labels, maxlag, halfbin,
+                                    n_bins):
+    """Count broad-bin votes from one grown target to all other clusters."""
+    counts = np.zeros((n_labels, n_bins), dtype=np.uint32)
+    width = 2 * halfbin + 1
+    lo_edge = -maxlag - halfbin
+    window = maxlag + halfbin
+    for target_time in target_times:
+        lo = np.searchsorted(other_times, target_time - window, side='left')
+        hi = np.searchsorted(other_times, target_time + window, side='right')
+        for j in range(lo, hi):
+            other_index = other_labels[j]
+            if target_index < other_index:
+                signed_lag = other_times[j] - target_time
+            else:
+                signed_lag = target_time - other_times[j]
+            lag_bin = (signed_lag - lo_edge) // width
+            if lag_bin == n_bins and signed_lag == lo_edge + n_bins * width:
+                lag_bin = n_bins - 1
+            if 0 <= lag_bin < n_bins:
+                counts[other_index, lag_bin] += 1
+    return counts
+
+
+def _coincidence_candidate_partners(target_label, target_times,
+                                    cluster_times, fs, frac_thresh,
+                                    maxlag_s=0.002, halfbin_s=0.00025):
+    """Refresh only the candidate edges incident to a grown target."""
+    labels = sorted(int(k) for k, v in cluster_times.items()
+                    if int(k) != int(target_label) and len(v) >= 100)
+    if not labels or len(target_times) < 100:
+        return set()
+    maxlag = int(maxlag_s * fs)
+    halfbin = int(halfbin_s * fs)
+    label_values = np.asarray(sorted(labels + [int(target_label)]), dtype=np.int64)
+    target_index = int(np.searchsorted(label_values, int(target_label)))
+    other_times = np.concatenate([
+        np.asarray(cluster_times[k], dtype=np.int64) for k in labels])
+    other_labels = np.concatenate([
+        np.full(len(cluster_times[k]), int(np.searchsorted(label_values, k)),
+                dtype=np.int64) for k in labels])
+    order = np.argsort(other_times, kind='stable')
+    other_times = other_times[order]
+    other_labels = other_labels[order]
+    edges = np.arange(-maxlag - halfbin, maxlag + halfbin + 1,
+                      2 * halfbin + 1)
+    counts = _coincidence_target_vote_counts(
+        np.asarray(target_times, dtype=np.int64), other_times, other_labels,
+        target_index, len(label_values), maxlag, halfbin, len(edges) - 1)
+    peak_counts = counts.max(axis=1)
+    if counts.shape[1] > 1:
+        peak_counts = np.maximum(
+            peak_counts, (counts[:, :-1] + counts[:, 1:]).max(axis=1))
+
+    pairs = set()
+    for other_index, other_label in enumerate(label_values):
+        if other_index == target_index:
+            continue
+        required = int(np.ceil(
+            frac_thresh * min(len(target_times),
+                              len(cluster_times[int(other_label)]))))
+        if required and peak_counts[other_index] >= required:
+            a, b = sorted((int(target_label), int(other_label)))
+            pairs.add((a, b))
+    return pairs
+
+
+def _coincidence_candidate_pairs(cluster_times, fs, frac_thresh,
+                                 maxlag_s=0.002, halfbin_s=0.00025,
+                                 max_samples_per_cluster=None):
+    """Find candidate pairs with an exhaustive event-indexed vote pass.
+
+    Every event is considered, so a real duplicate is not lost because its
+    shared spikes missed a sampling grid.  The broad-bin count is a cheap
+    superset of the exact one-to-one count; callers must still run
+    ``_peak_shared_fraction_with_matches`` on every returned pair.
+
+    ``max_samples_per_cluster`` is retained only as an explicit diagnostic
+    escape hatch for small benchmarks.  The production caller leaves it
+    unset, which is the recall-preserving mode.
+    """
+    labels = sorted(int(k) for k, v in cluster_times.items() if len(v) >= 100)
+    if len(labels) < 2:
+        return set()
+    maxlag = int(maxlag_s * fs)
+    halfbin = int(halfbin_s * fs)
+    all_times = np.concatenate([np.asarray(cluster_times[k], dtype=np.int64)
+                                for k in labels])
+    all_labels = np.concatenate([np.full(len(cluster_times[k]), k,
+                                         dtype=np.int64) for k in labels])
+    if max_samples_per_cluster is not None:
+        sampled_times = []
+        sampled_labels = []
+        for label in labels:
+            train = np.asarray(cluster_times[label], dtype=np.int64)
+            count = min(len(train), int(max_samples_per_cluster))
+            positions = np.linspace(0, len(train) - 1, count).round().astype(int)
+            sampled_times.append(train[positions])
+            sampled_labels.append(np.full(count, label, dtype=np.int64))
+        all_times = np.concatenate(sampled_times)
+        all_labels = np.concatenate(sampled_labels)
+
+    order = np.argsort(all_times, kind='stable')
+    all_times = all_times[order]
+    all_labels = all_labels[order]
+    label_values = np.asarray(labels, dtype=np.int64)
+    label_indices = np.searchsorted(label_values, all_labels)
+    edges = np.arange(-maxlag - halfbin, maxlag + halfbin + 1,
+                      2 * halfbin + 1)
+    counts = _coincidence_vote_counts(
+        all_times, label_indices, len(label_values), maxlag, halfbin,
+        len(edges) - 1)
+
+    # The exact adjudicator includes the final histogram edge.  Treat that
+    # edge the same way here, then also join neighboring bins when deciding
+    # eligibility.  The latter is conservative for a train whose true lag
+    # straddles a broad-bin boundary; the exact matcher still decides it.
+    peak_counts = counts.max(axis=2)
+    if counts.shape[2] > 1:
+        adjacent_counts = counts[:, :, :-1] + counts[:, :, 1:]
+        peak_counts = np.maximum(peak_counts, adjacent_counts.max(axis=2))
+
+    candidates = set()
+    for i in range(len(label_values)):
+        for j in range(i + 1, len(label_values)):
+            count_i = len(cluster_times[int(label_values[i])])
+            count_j = len(cluster_times[int(label_values[j])])
+            if max_samples_per_cluster is not None:
+                count_i = min(count_i, int(max_samples_per_cluster))
+                count_j = min(count_j, int(max_samples_per_cluster))
+            required = int(np.ceil(frac_thresh * min(count_i, count_j)))
+            if required and peak_counts[i, j] >= required:
+                candidates.add((int(label_values[i]), int(label_values[j])))
+    return candidates
+
+
+def _retained_global_feature_mean(ops, st, tF, spike_idx, n_channels):
+    """Place retained local PC features on physical channels and average.
+
+    ``tF`` is stored in the nearest-channel order of each detection template,
+    whereas ``Wall`` is indexed by physical channel.  A direct mean of ``tF``
+    is therefore only valid for the small legacy fixtures that have no
+    template map.  Production data always take the mapped scatter path.
+    """
+    idx = torch.as_tensor(spike_idx, dtype=torch.long, device=tF.device)
+    values = tF[idx]
+    if values.ndim != 3 or values.shape[0] == 0:
+        raise ValueError('retained features must be a non-empty 3-D tensor')
+
+    iC = ops.get('iC')
+    iCC = ops.get('iCC')
+    iU = ops.get('iU')
+    st_array = np.asarray(st)
+    if ((iC is None and (iCC is None or iU is None)) or
+            st_array.ndim < 2 or st_array.shape[1] < 2):
+        # Compatibility for minimal unit-test fixtures from before st[:, 5]
+        # (the universal detection-template id) was part of this contract.
+        if values.shape[1] != n_channels:
+            raise ValueError(
+                'cannot align retained features without ops["iC"]: '
+                f'{values.shape[1]} local channels vs {n_channels} global')
+        return values.mean(dim=0)
+
+    # In-memory spike tables have six columns and keep the detection template
+    # in column 5.  The compact three-column export keeps that same id in
+    # column 1, which is useful for replaying a saved merge checkpoint.
+    template_column = 5 if st_array.shape[1] > 5 else 1
+    templates = torch.as_tensor(
+        st_array[np.asarray(spike_idx), template_column].astype(np.int64),
+        dtype=torch.long, device=tF.device)
+    if iCC is not None and iU is not None:
+        iCC = torch.as_tensor(iCC, dtype=torch.long, device=tF.device)
+        iU = torch.as_tensor(iU, dtype=torch.long, device=tF.device)
+        if templates.numel() and (templates.min() < 0 or
+                                  templates.max() >= iU.shape[0]):
+            raise ValueError('learned spike template index is out of range')
+        channels = iCC[:, iU[templates]].T.contiguous()
+    else:
+        iC = torch.as_tensor(iC, dtype=torch.long, device=tF.device)
+        if templates.numel() and (templates.min() < 0 or
+                                  templates.max() >= iC.shape[1]):
+            raise ValueError('spike template index is out of range for ops["iC"]')
+        channels = iC[:, templates].T.contiguous()
+    if values.shape[:2] != channels.shape:
+        raise ValueError('retained features and template maps have incompatible shapes')
+    if channels.numel() and (channels.min() < 0 or channels.max() >= n_channels):
+        raise ValueError('template channel index is out of range for Wall')
+
+    n_features = int(values.shape[2])
+    sums = torch.zeros((n_channels, n_features), dtype=values.dtype,
+                       device=tF.device)
+    flat_channels = channels.reshape(-1)
+    sums.index_add_(0, flat_channels, values.reshape(-1, n_features))
+    # Wall is built with zero-filled unmapped channels and divided by the
+    # total number of events, not by per-channel observation counts.
+    return sums / float(values.shape[0])
+
+
 def residual_event_sample_reference(detector_samples, nt, nt0min):
     """Convert detector-window positions to the learned spike-time reference."""
     return np.asarray(detector_samples) - nt - nt // 2 + nt0min
@@ -923,6 +1162,8 @@ def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
 
     spike_idx = group_indices_by_label(clu2)
     is_merged = np.zeros(n_clusters, dtype=bool)
+    dropped_spikes = np.zeros(len(st), dtype=bool)
+    ops['coincidence_merge_deduped_spikes'] = 0
 
     # Count spikes per cluster, sort descending
     ns = np.bincount(clu2.astype(np.int64), minlength=n_clusters).astype(np.float64)
@@ -939,13 +1180,25 @@ def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
     # Only check clusters with enough spikes to be meaningful
     candidates = [int(isort[i]) for i in range(n_clusters)
                   if ns[int(isort[i])] >= 100 and not is_merged[int(isort[i])]]
+    candidate_pairs = _coincidence_candidate_pairs(
+        cluster_times, fs, frac_thresh)
+    ops['coincidence_candidate_pairs'] = len(candidate_pairs)
+    # A target can grow as the merge loop proceeds.  Preserve the original
+    # source labels so evidence for B-C remains usable after B is absorbed
+    # into A; otherwise the prefilter changes the old chain semantics.
+    merge_sources = {int(k): {int(k)} for k in cluster_times}
 
-    for i, kk in enumerate(candidates):
+    # Revisit a target after it grows. This handles aggregate evidence split
+    # across several source clusters and partners that were earlier in the
+    # original count ordering.
+    candidate_queue = list(candidates)
+    while candidate_queue:
+        kk = candidate_queue.pop(0)
         if is_merged[kk] or kk not in cluster_times:
             continue
         if not is_ref[kk]:
             continue
-        for j in range(i + 1, len(candidates)):
+        for j in range(len(candidates)):
             # The target grows after every accepted merge.  Read it here,
             # inside the loop, so subsequent candidates are tested against
             # the committed train rather than a stale pre-merge snapshot.
@@ -953,7 +1206,21 @@ def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
             if st_a is None or len(st_a) < 100:
                 break
             jj = candidates[j]
+            if jj == kk:
+                continue
             if is_merged[jj] or jj not in cluster_times:
+                continue
+            # The larger current train absorbs the smaller one. A target can
+            # change rank after a merge, hence the queue revisit above.
+            if ns[kk] < ns[jj]:
+                continue
+            pair = (kk, jj) if kk < jj else (jj, kk)
+            possible = pair in candidate_pairs
+            if not possible:
+                possible = any(
+                    ((src, jj) if src < jj else (jj, src)) in candidate_pairs
+                    for src in merge_sources.get(kk, {kk}))
+            if not possible:
                 continue
             st_b = cluster_times[jj]
             if len(st_b) < 100:
@@ -987,32 +1254,65 @@ def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
                 nveto += 1
                 continue
 
-            # Merge jj into kk
-            is_merged[jj] = True
             idx_jj = spike_idx.get(jj, np.zeros(0, dtype=np.int64))
+            # ``matched_b`` is aligned to the time-sorted train, while
+            # ``idx_jj`` is in the original spike-row order.  Convert the
+            # match mask back to row indices before committing the merge.
+            jj_order = np.argsort(st[idx_jj, 0])
+            idx_jj_sorted = idx_jj[jj_order]
+            keep_idx_jj = idx_jj_sorted[~matched_b]
+            drop_idx_jj = idx_jj_sorted[matched_b]
+
+            # Merge jj into kk.  The trial union above is the event set we
+            # validated, so matched copies must be removed from the returned
+            # arrays as well; retaining them would make later merges see a
+            # different train from the one that passed the veto.
+            is_merged[jj] = True
+            merge_sources.setdefault(kk, {kk}).update(
+                merge_sources.pop(jj, {jj}))
+            dropped_spikes[drop_idx_jj] = True
             if idx_jj.size:
                 if dt_samples != 0:
                     # The timestamp shift changes the waveform's reference
                     # time too. Keep features and the averaged template in
                     # the same frame as the committed spike times.
                     tF, Wall = roll_features(
-                        ops['wPCA'], tF, Wall, idx_jj, jj, dt_samples)
-                    st[idx_jj, 0] -= dt_samples
-                clu2[idx_jj] = kk
+                        ops['wPCA'], tF, Wall, keep_idx_jj, jj, dt_samples)
+                    st[keep_idx_jj, 0] -= dt_samples
+                clu2[keep_idx_jj] = kk
                 prev = spike_idx.get(kk, np.zeros(0, dtype=np.int64))
-                spike_idx[kk] = np.sort(np.concatenate((prev, idx_jj)))
+                spike_idx[kk] = np.sort(np.concatenate((prev, keep_idx_jj)))
                 spike_idx.pop(jj, None)
                 cluster_times[kk] = np.sort(st[spike_idx[kk], 0].astype(np.int64))
 
             # Weighted average of Wall templates
-            n_jj = ns[jj]
+            n_jj = len(keep_idx_jj)
             ns[kk] += n_jj
             ns[jj] = 0
             denom = ns[kk]
-            if denom > 0 and Wall is not None:
+            if denom > 0 and Wall is not None and n_jj:
+                # Wall[jj] was estimated from all source events.  Once the
+                # matched rows are removed it is no longer the right source
+                # mean; use the surviving event features instead.
+                retained_wall_jj = _retained_global_feature_mean(
+                    ops, st, tF, keep_idx_jj, Wall.shape[1])
+                retained_wall_jj = retained_wall_jj.to(
+                    device=Wall.device, dtype=Wall.dtype)
                 old_kk = denom - n_jj
-                Wall[kk] = (old_kk / denom) * Wall[kk] + (n_jj / denom) * Wall[jj]
+                Wall[kk] = ((old_kk / denom) * Wall[kk]
+                            + (n_jj / denom) * retained_wall_jj)
                 Wall[jj] = 0
+
+            if len(merge_sources.get(kk, {kk})) > 1:
+                # A pair can become eligible only after evidence from several
+                # already-merged sources is combined. Refresh the conservative
+                # event-indexed graph, then queue this target so partners that
+                # were already scanned are reconsidered.
+                candidate_pairs.update(
+                    _coincidence_candidate_partners(
+                        kk, cluster_times[kk], cluster_times,
+                        fs, frac_thresh))
+                candidate_queue.append(kk)
 
             nmerge += 1
             ops['coincidence_merge_deduped_spikes'] = (
@@ -1022,8 +1322,8 @@ def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
                 f'coincidence merge: {jj} → {kk} (frac={frac:.2f}, '
                 f'lag={lag*1000:.2f}ms)')
             # Keep scanning this target. Its refreshed time cache and size
-            # should be used for the remaining candidates; stopping here
-            # leaves duplicate chains only partially collapsed.
+            # should be used for the remaining candidates. The queue revisit
+            # handles candidates earlier in the original count ordering.
 
     ops['coincidence_merge_count'] = nmerge
     ops['coincidence_merge_veto_count'] = nveto
@@ -1038,11 +1338,21 @@ def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
         clu2 = imap[clu2]
     Wall = Wall[~is_merged]
 
+    # Remove the duplicate event rows that were explicitly matched above.
+    # This is deliberately after all index-based merge bookkeeping is done.
+    if dropped_spikes.any():
+        keep_spikes = ~dropped_spikes
+        st = st[keep_spikes]
+        clu2 = clu2[keep_spikes]
+        keep_idx = torch.as_tensor(np.flatnonzero(keep_spikes),
+                                   device=tF.device)
+        tF = tF[keep_idx]
+
     # Re-sort by time
     sorted_idx = np.argsort(st[:, 0])
     st = np.take_along_axis(st, sorted_idx[..., np.newaxis], axis=0)
     clu2 = clu2[sorted_idx]
-    tensor_idx = torch.from_numpy(sorted_idx)
+    tensor_idx = torch.as_tensor(sorted_idx, device=tF.device)
     tF = tF[tensor_idx]
 
     return Wall, clu2, None, st, tF
