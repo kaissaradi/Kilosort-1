@@ -272,6 +272,20 @@ def test_detect_ttl_onsets_chunk_boundary(tmp_path):
         np.testing.assert_array_equal(onsets, np.array([24], dtype=np.int64))
 
 
+def test_detect_ttl_starts_matches_mea_pipeline_convention(tmp_path):
+    n_samples, n_elec = 50, 7
+    ttl = np.zeros(n_samples, dtype=np.int16)
+    ttl[10:20] = -2000
+    ttl[40:50] = -2000
+    data = np.concatenate([ttl[:, None], np.zeros((n_samples, n_elec - 1), dtype=np.int16)], axis=1)
+    path = _write_litke_file(tmp_path / 'starts.bin', data, array_id=504)
+    with litke.LitkeRecording(path, drop_ttl=True) as rec:
+        starts = rec.detect_ttl_starts(threshold=1000, chunk_samples=10)
+        np.testing.assert_array_equal(starts, np.array([10, 40], dtype=np.int64))
+        edges = rec.detect_ttl_pipeline_edges(threshold=1000, chunk_samples=10)
+        np.testing.assert_array_equal(edges, np.array([9, 39], dtype=np.int64))
+
+
 # ---------------------------------------------------------------------------
 # Real-data / lab-oracle fixtures (not self-pack roundtrips)
 # ---------------------------------------------------------------------------

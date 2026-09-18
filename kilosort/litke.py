@@ -801,6 +801,85 @@ class LitkeRecording:
             return np.zeros(0, dtype=np.int64)
         return np.concatenate(onsets)
 
+    def detect_ttl_starts(self, threshold: int = DEFAULT_TTL_THRESHOLD,
+                          start: int = 0,
+                          n_samples: Optional[int] = None,
+                          chunk_samples: int = 100_000) -> np.ndarray:
+        """Return the first low sample of each TTL pulse.
+
+        This is the convention used by MEA-fieldlab and Vision's converted
+        Litke recordings. ``detect_ttl_onsets`` is retained because older
+        callers rely on its historical last-low-sample result.
+        """
+        start = int(start)
+        total = self.n_samples - start if n_samples is None else int(n_samples)
+        if total <= 0:
+            return np.zeros(0, dtype=np.int64)
+        thr = int(threshold)
+        starts = []
+        prev = None
+        done = 0
+        while done < total:
+            take = min(int(chunk_samples), total - done)
+            seg = self.get_ttl(start + done, take)
+            below = seg < -thr
+            if prev is None:
+                if below[0]:
+                    starts.append(np.array([start + done], dtype=np.int64))
+                edges = np.flatnonzero(~below[:-1] & below[1:]) + start + done + 1
+            else:
+                edges = np.flatnonzero(
+                    ~np.r_[prev < -thr, below[:-1]] & below
+                ) + start + done
+            if edges.size:
+                starts.append(edges.astype(np.int64))
+            prev = seg[-1]
+            done += take
+        if not starts:
+            return np.zeros(0, dtype=np.int64)
+        return np.concatenate(starts)
+
+    def detect_ttl_pipeline_edges(self, threshold: int = DEFAULT_TTL_THRESHOLD,
+                                  start: int = 0,
+                                  n_samples: Optional[int] = None,
+                                  chunk_samples: int = 100_000) -> np.ndarray:
+        """Return TTL transition indices used by the MEA/Vision converter.
+
+        The converter stores the sample immediately before a low pulse begins
+        (the ``above -> below`` pair index), rather than the first low sample.
+        Keep this convention separate from :meth:`detect_ttl_starts` so the
+        one-sample distinction is visible at call sites.
+        """
+        start = int(start)
+        total = self.n_samples - start if n_samples is None else int(n_samples)
+        if total <= 1:
+            return np.zeros(0, dtype=np.int64)
+        thr = int(threshold)
+        edges = []
+        prev = None
+        done = 0
+        while done < total:
+            take = min(int(chunk_samples), total - done)
+            seg = self.get_ttl(start + done, take)
+            if prev is None:
+                below = seg < -thr
+                local = np.flatnonzero(~below[:-1] & below[1:])
+                if local.size:
+                    edges.append(local.astype(np.int64) + start + done)
+            else:
+                work = np.empty(take + 1, dtype=np.int16)
+                work[0] = prev
+                work[1:] = seg
+                below = work < -thr
+                local = np.flatnonzero(~below[:-1] & below[1:])
+                if local.size:
+                    edges.append(local.astype(np.int64) + start + done - 1)
+            prev = seg[-1]
+            done += take
+        if not edges:
+            return np.zeros(0, dtype=np.int64)
+        return np.concatenate(edges)
+
 
 def open_litke(path: Union[str, Path], drop_ttl: bool = True) -> LitkeRecording:
     """Convenience constructor matching lab default (TTL dropped for sorting)."""
