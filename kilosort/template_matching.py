@@ -1566,7 +1566,9 @@ def roll_features(wPCA, tF, Wall, spike_idx, clust_idx, dt):
             temps[:, :, d:] = temps[:, :, d - 1].unsqueeze(-1)
 
     # Project back to PC space and update tF / Wall
-    tF[spike_idx] = feats @ W_host.T
-    Wall[clust_idx] = temps @ W_wall.T
+    # Transpose only the matrix dimensions. ``wPCA`` is normally 2-D, but
+    # keeping this batch-safe avoids PyTorch's deprecated N-D ``.T`` reversal.
+    tF[spike_idx] = feats @ W_host.transpose(-2, -1)
+    Wall[clust_idx] = temps @ W_wall.transpose(-2, -1)
 
     return tF, Wall
