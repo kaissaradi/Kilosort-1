@@ -304,8 +304,22 @@ EXTRA_PARAMETERS = {
         'description':
             """
             Templates farther away than this from their nearest channel will
-            not be used. Also limits distance between compared channels during
-            clustering.
+            not be used.
+
+            That is ALL it does, despite the "also limits distance between
+            compared channels during clustering" this claimed until
+            2026-09-19. Its only consumer is spikedetect.py:
+
+                igood = ds[0,:] <= ops['max_channel_distance']**2
+
+            which drops candidate template POSITIONS whose nearest channel is
+            too far. It does not widen or narrow a template's channel
+            footprint -- `nearest_chans` does that. On a dense array every grid
+            position is already within the default of some channel, so it is a
+            no-op there: on 20260511A/data007 (512 ch at 60 um) raising it from
+            66 to 200 produced BYTE-IDENTICAL output -- 948 good clusters,
+            69.12% duplication, 1,054 pre-merge clusters, clean yield
+            4,439,931 -- with the manifest confirming the setting applied.
             """
     },
 
@@ -377,7 +391,25 @@ EXTRA_PARAMETERS = {
         'description':
             """
             Fraction of refractory period violations that are allowed in the CCG
-            compared to baseline; used to perform splits and merges.
+            compared to baseline; used to perform MERGES ONLY.
+
+            NOT splits, despite what this said until 2026-09-19. The splitter
+            calls its own check_CCG in swarmsplitter.py and reads
+            `split_ccg_threshold`; it never reads this value, so raising this
+            alone will not make the sorter split less.
+
+            It also has less reach over merges than it appears.
+            `merging_function` only reaches the CCG test for pairs whose
+            template similarity clears `r_thresh` (0.5), and `break`s out of the
+            candidate scan below that. On a large MEA the same cell detected
+            along its own axon lands on channels the soma template never
+            touches: measured over the 267 duplicate pairs still present after
+            a full sort of 20260511A/data007, median template similarity is
+            0.0000, 53.9% are exactly zero, and only 6.4% reach the gate. Those
+            pairs never reach this threshold at ANY value, which is why raising
+            it from 0.2 to 0.5 moved that sort's pre-merge duplication by 0.3
+            percentage points (69.12% -> 69.42%). `coincidence_frac_thresh` is
+            the pass that catches them.
             """
     },
 
