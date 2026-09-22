@@ -1,5 +1,6 @@
 """CPU-safe unit tests for template_matching hot paths."""
 import numpy as np
+import pytest
 import torch
 from torch.nn.functional import conv1d
 
@@ -11,10 +12,31 @@ from kilosort.template_matching import (
     coincidence_merge,
     extract_residual_spikes,
     merging_function,
+    physical_template_similarity,
     prepare_matching,
     roll_features,
     run_matching,
 )
+
+
+def test_physical_template_similarity_undoes_spatial_whitening():
+    W = torch.tensor([[1., 0., -1.], [0., 1., 0.]])
+    whitening_inv = torch.tensor([[2., 0.3], [0., 0.5]])
+    a = torch.tensor([[1., 0.2], [0.4, -0.1]])
+    assert physical_template_similarity(
+        a, 3 * a, whitening_inv, W).item() > 0.999
+
+    # Spatially disjoint templates remain dissimilar with identity whitening.
+    a = torch.tensor([[1., 0.], [0., 0.]])
+    b = torch.tensor([[0., 0.], [1., 0.]])
+    assert physical_template_similarity(
+        a, b, torch.eye(2), W).item() < 0.1
+
+    # Asking for a specific lag scores that alignment instead of silently
+    # maximizing a second, potentially inconsistent lag.
+    same_lag = physical_template_similarity(
+        a, 3 * a, whitening_inv, W, lag_index=W.shape[-1])
+    assert same_lag.item() <= 1.00001
 
 
 def test_coincidence_prefilter_keeps_shifted_duplicates_only():
@@ -522,6 +544,40 @@ def test_final_union_acg_veto_default_off_matches_missing_setting_and_template_m
         r_thresh=0.5, mode='template', check_dt=True, device=device
     )
     _assert_merge_outputs_equal(template_on, template_off)
+
+
+def test_borderline_rescue_is_opt_in_and_records_provenance(monkeypatch):
+    ops, Wall, clu, st, tF, device = _two_cluster_ccg_case(aligned=False)
+    ops['Wrot'] = torch.eye(1)
+    ops['settings'].update({
+        'ccg_threshold': 0.20,
+        'final_merge_borderline_rescue': True,
+        'final_merge_borderline_ccg_threshold': 0.22,
+        'final_merge_borderline_template_r': 0.8,
+    })
+
+    def fake_check(st0, st1=None, *, ccg_threshold, **kwargs):
+        if st1 is None:
+            return True, True, 0.05       # prospective union is refractory
+        if ccg_threshold == 0.20:
+            return True, False, 0.21     # ordinary gate narrowly rejects
+        return True, True, 0.21          # relaxed gate accepts
+
+    monkeypatch.setattr(CCG, 'check_CCG', fake_check)
+    got = merging_function(
+        ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg',
+        check_dt=True, device=device)
+
+    assert got[0].shape[0] == 1
+    assert ops['final_merge_borderline_rescue_count'] == 1
+    event, = ops['final_merge_borderline_rescue_events']
+    assert sorted(event['kept_members'] + event['absorbed_members']) == [0, 1]
+    assert event['template_r'] >= 0.8
+    assert event['physical_template_r'] >= 0.8
+    assert event['pair_r12'] == pytest.approx(0.21)
+    assert event['relaxed_r12'] == pytest.approx(0.21)
+    assert event['union_r12'] == pytest.approx(0.05)
+    assert event['shift_samples'] == 0
 
 
 def test_final_union_acg_veto_rejects_a_bad_union():

@@ -531,6 +531,28 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=None):
     return  st, amps, th_amps, Xres
 
 
+def physical_template_similarity(wa, wb, whitening_inv, W, WtW=None,
+                                 lag_index=None):
+    """Physical-waveform cosine after undoing spatial whitening.
+
+    ``lag_index`` uses the same correlation-vector index as ``ctc`` below, so
+    a merge gate can score the exact temporal alignment it would commit rather
+    than independently choosing a more flattering lag.
+    """
+    pa = whitening_inv.T @ wa
+    pb = whitening_inv.T @ wb
+    norm = ((torch.linalg.vector_norm(pa @ W) + 1e-6) *
+            (torch.linalg.vector_norm(pb @ W) + 1e-6))
+    if WtW is None:
+        nt = W.shape[-1]
+        WtW = conv1d(W.reshape(-1, 1, nt), W.reshape(-1, 1, nt),
+                     padding=nt)
+        WtW = torch.flip(WtW, [2])
+    utu = torch.einsum('lk,lm->km', pa, pb)
+    corr = torch.einsum('km,kml->l', utu, WtW) / norm
+    return corr.max() if lag_index is None else corr[int(lag_index)]
+
+
 def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=True,
                      device=torch.device('cuda'), max_sweeps=None):
     clu2 = clu.copy()
@@ -561,9 +583,18 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
     isi_threshold = ops['settings'].get('isi_threshold', 0.01)
     isi_min_spikes = ops['settings'].get('isi_min_spikes', 500)
     final_merge_union_acg_veto = False
+    borderline_rescue = False
+    borderline_ccg_threshold = 0.22
+    borderline_template_r = 0.8
     if mode == 'ccg':
         final_merge_union_acg_veto = bool(ops['settings'].get(
             'final_merge_union_acg_veto', False))
+        borderline_rescue = bool(ops['settings'].get(
+            'final_merge_borderline_rescue', False))
+        borderline_ccg_threshold = float(ops['settings'].get(
+            'final_merge_borderline_ccg_threshold', 0.22))
+        borderline_template_r = float(ops['settings'].get(
+            'final_merge_borderline_template_r', 0.8))
         is_ref, est_contam_rate = CCG.refract(clu, st[:,0]/ops['fs'],
                                               acg_threshold=acg_threshold,
                                               ccg_threshold=ccg_threshold,
@@ -580,6 +611,12 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
     W = ops['wPCA'].contiguous()
     WtW = conv1d(W.reshape(-1, 1,nt), W.reshape(-1, 1 ,nt), padding = nt) 
     WtW = torch.flip(WtW, [2,])
+    whitening_inv = None
+    if borderline_rescue:
+        Wrot = ops['Wrot'].to(device)
+        whitening_inv = torch.linalg.inv(
+            Wrot + 1e-5 * torch.eye(Wrot.shape[0], device=device,
+                                    dtype=Wrot.dtype))
 
     # Spike index lists per cluster: replace repeated full-vector
     # `clu2 == kk` masks. On merge, reassign labels and concat+sort indices so
@@ -647,6 +684,9 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
     t = 0 if not no_merge else NN
     nmerge = 0
     union_acg_veto_count = 0
+    borderline_rescue_count = 0
+    borderline_rescue_events = []
+    merge_members = [[i] for i in range(NN)]
     sweep_merges = 0
     sweeps_done = 0
     while True:
@@ -697,13 +737,53 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
                 # Merged-away / empty labels may be missing from spike_idx
                 if jj not in spike_idx:
                     continue
-                st1 = st_sec[spike_idx[jj]]
-                _, is_ccg, _ = CCG.check_CCG(
+                idx = spike_idx[jj]
+                st1 = st_sec[idx]
+                _, is_ccg, pair_r12 = CCG.check_CCG(
                     st0, st1,
                     acg_threshold=acg_threshold,
                     ccg_threshold=ccg_threshold,
                     assume_sorted=times_sorted,
                 )
+                if not is_ccg and borderline_rescue:
+                    _, relaxed_ccg, relaxed_r12 = CCG.check_CCG(
+                        st0, st1,
+                        acg_threshold=acg_threshold,
+                        ccg_threshold=borderline_ccg_threshold,
+                        assume_sorted=times_sorted,
+                    )
+                    if relaxed_ccg:
+                        physical_r = physical_template_similarity(
+                            Ww[kk], Ww[jj], whitening_inv, W, WtW,
+                            lag_index=int(imax[jj].item()))
+                        if physical_r >= borderline_template_r:
+                            dt_rescue = (imax[kk] - imax[jj]).item()
+                            st1_union = np.array(st[idx, 0], copy=True)
+                            if dt_rescue != 0 and check_dt and idx.size:
+                                st1_union -= dt_rescue
+                            st_union = np.sort(np.concatenate((
+                                st[spike_idx[kk], 0] / ops['fs'],
+                                st1_union / ops['fs'])))
+                            union_ref, _, union_r12 = CCG.check_CCG(
+                                st_union,
+                                acg_threshold=acg_threshold,
+                                ccg_threshold=ccg_threshold,
+                                assume_sorted=True,
+                            )
+                            if union_ref:
+                                is_ccg = True
+                                borderline_rescue_count += 1
+                                borderline_rescue_events.append({
+                                    'kept_members': list(merge_members[kk]),
+                                    'absorbed_members': list(merge_members[jj]),
+                                    'template_r': float(cmax[jj].item()),
+                                    'physical_template_r': float(
+                                        physical_r.item()),
+                                    'pair_r12': float(pair_r12),
+                                    'relaxed_r12': float(relaxed_r12),
+                                    'union_r12': float(union_r12),
+                                    'shift_samples': int(dt_rescue),
+                                })
             else:
                 # Zero-energy templates (empty Wall rows) → 0/0; treat as not
                 # mergeable on amplitude criterion (same as non-match).
@@ -755,6 +835,8 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
                 Ww[jj] = 0
                 ns[kk] += ns[jj]
                 ns[jj] = 0
+                merge_members[kk].extend(merge_members[jj])
+                merge_members[jj] = []
                 if idx.size:
                     clu2[idx] = kk
                     # Preserve ascending-index gather order of `clu2 == kk`.
@@ -777,6 +859,9 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
         ops['final_merge_sweep_cap_hit'] = bool(
             not no_merge and sweep_merges > 0 and sweeps_done >= max_sweeps)
         ops['final_merge_union_acg_veto_count'] = int(union_acg_veto_count)
+        ops['final_merge_borderline_rescue_count'] = int(
+            borderline_rescue_count)
+        ops['final_merge_borderline_rescue_events'] = borderline_rescue_events
 
     imap = np.cumsum((~is_merged).astype('int32')) - 1
     if imap.size > 0:

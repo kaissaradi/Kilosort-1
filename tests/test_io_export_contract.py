@@ -181,6 +181,31 @@ def test_save_to_phy_normalizes_numpy_dtype_in_params(
     assert "dtype = 'uint16'" in params
 
 
+def test_save_to_phy_exports_aligned_detection_scores(
+    tmp_path, patched_export_dependencies, monkeypatch
+):
+    """The KS2.5-style cutoff score must survive duplicate removal in lockstep."""
+    st, clu, tF, Wall, probe, ops = _export_inputs()
+    st[:, 2] = [8.25, 11.5]
+    monkeypatch.setattr(
+        io,
+        'remove_duplicates',
+        lambda times, clusters, dt: (
+            times[[1]], clusters[[1]], np.array([False, True]),
+        ),
+    )
+    result_dir = tmp_path / 'results'
+
+    io.save_to_phy(
+        st, clu, tF, Wall, probe, ops, imin=0, results_dir=result_dir
+    )
+
+    scores = np.load(result_dir / 'spike_detection_scores.npy')
+    assert scores.dtype == np.float32
+    np.testing.assert_array_equal(scores, np.array([11.5], dtype=np.float32))
+    assert scores.shape == np.load(result_dir / 'spike_times.npy').shape
+
+
 def test_save_ops_does_not_mutate_nested_live_ops(tmp_path):
     settings = {
         'results_dir': tmp_path / 'original',

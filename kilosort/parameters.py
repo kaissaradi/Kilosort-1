@@ -545,6 +545,39 @@ EXTRA_PARAMETERS = {
             """
     },
 
+    'final_merge_borderline_rescue': {
+        'gui_name': 'final merge borderline rescue', 'type': bool, 'min': None,
+        'max': None, 'exclude': [], 'default': False, 'step': 'postprocessing',
+        'description':
+            """
+            Recover complementary amplitude-state fragments that narrowly miss
+            the ordinary cross-CCG threshold. A rejected pair is rescued only
+            when it passes the relaxed CCG threshold, its prospective union is
+            refractory, and its templates remain strongly correlated after
+            undoing spatial whitening. Off by default while the rule is being
+            validated across preparations.
+            """
+    },
+
+    'final_merge_borderline_ccg_threshold': {
+        'gui_name': 'borderline merge CCG threshold', 'type': float,
+        'min': 0.0, 'max': 1.0, 'exclude': [], 'default': 0.22,
+        'step': 'postprocessing',
+        'description':
+            """Upper R12 limit used only by final_merge_borderline_rescue."""
+    },
+
+    'final_merge_borderline_template_r': {
+        'gui_name': 'borderline physical template correlation', 'type': float,
+        'min': -1.0, 'max': 1.0, 'exclude': [], 'default': 0.8,
+        'step': 'postprocessing',
+        'description':
+            """
+            Minimum best-lag correlation between spatially unwhitened templates
+            for final_merge_borderline_rescue.
+            """
+    },
+
     'refractory_veto_ratio': {
         'gui_name': 'refractory veto ratio', 'type': float, 'min': 0.0,
         'max': 2.0, 'exclude': [], 'default': 0.35, 'step': 'clustering',

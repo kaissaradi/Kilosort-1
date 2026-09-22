@@ -24,6 +24,21 @@ def test_final_merge_union_acg_veto_is_registered_with_default_and_provenance():
     }
 
 
+def test_final_merge_borderline_rescue_settings_are_registered():
+    from kilosort.parameters import DEFAULT_SETTINGS, EXTRA_PARAMETERS
+    from kilosort.run_kilosort import RECOGNIZED_SETTINGS
+
+    expected = {
+        'final_merge_borderline_rescue': False,
+        'final_merge_borderline_ccg_threshold': 0.22,
+        'final_merge_borderline_template_r': 0.8,
+    }
+    for name, default in expected.items():
+        assert EXTRA_PARAMETERS[name]['default'] == default
+        assert DEFAULT_SETTINGS[name] == default
+        assert name in RECOGNIZED_SETTINGS
+
+
 def test_dmin():
     settings = {'dmin': None, 'dminx': 32}
     ops = {'xc': np.array([10, 20, 30]), 'yc': np.array([40, 40, 60]),

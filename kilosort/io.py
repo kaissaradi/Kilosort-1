@@ -408,6 +408,11 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
     xs, ys = compute_spike_positions(st, tF, ops)
     spike_positions = np.vstack([xs, ys]).T
     amplitudes = torch.norm(tF, dim=[-2,-1]).cpu().numpy()
+    # Detection-time winning-template score. This is sqrt(Cf) from
+    # template_matching.run_matching, the quantity Kilosort 2.5 stores as
+    # rez.st3(:,4) and uses for its per-cluster cutoff. It is already computed;
+    # preserving it costs one float32 per spike and no additional GPU work.
+    detection_scores = st[:, 2].astype('float32', copy=False)
     log_performance(logger, level='debug', header='save_to_phy, spike positions',
                     reset=True)
 
@@ -416,6 +421,7 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
         spike_times, spike_clusters, dt=ops['duplicate_spike_bins']
     )
     amp = amplitudes[kept_spikes]
+    detection_scores = detection_scores[kept_spikes]
     spike_templates = spike_templates[kept_spikes]
     spike_positions = spike_positions[kept_spikes]
     np.save((results_dir / 'spike_times.npy'), spike_times)
@@ -424,6 +430,7 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
     np.save((results_dir / 'spike_positions.npy'), spike_positions)
     np.save((results_dir / 'spike_detection_templates.npy'), spike_templates)
     np.save((results_dir / 'amplitudes.npy'), amp)
+    np.save((results_dir / 'spike_detection_scores.npy'), detection_scores)
     # Save spike mask so that it can be applied to other variables if needed
     # when loading results.
     np.save((results_dir / 'kept_spikes.npy'), kept_spikes)

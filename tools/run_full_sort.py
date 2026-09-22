@@ -44,11 +44,31 @@ os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 import torch  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from kilosort.run_kilosort import run_kilosort   # noqa: E402
+from kilosort.run_kilosort import RECOGNIZED_SETTINGS, run_kilosort  # noqa: E402
 
 SWITCHES = ['KILOSORT_NO_FUSED_DETECT', 'KILOSORT_NO_FUSED_PEEL',
             'KILOSORT_NO_FUSED_PEAKS', 'KILOSORT_NO_FAST_KPP',
             'KILOSORT_NO_KPP_GRAPH']
+
+
+def apply_overrides(settings, items):
+    """Apply registered ``KEY=VALUE`` overrides to a settings snapshot."""
+    overrides = {}
+    for item in items:
+        if '=' not in item:
+            raise ValueError(f'--set expects KEY=VALUE, got {item!r}')
+        key, raw = item.split('=', 1)
+        if key not in RECOGNIZED_SETTINGS:
+            raise ValueError(
+                f'--set {key}: not a registered Kilosort setting (typo?). '
+                f'Known keys: {sorted(RECOGNIZED_SETTINGS)}')
+        try:
+            val = json.loads(raw)
+        except json.JSONDecodeError:
+            val = raw
+        overrides[key] = val
+        settings[key] = val
+    return overrides
 
 
 def main():
@@ -65,8 +85,9 @@ def main():
                          'is printed and written to settings_override.json in '
                          'the results dir -- a settings sweep that does not '
                          'record its own arm is indistinguishable from a '
-                         'wobble. Only keys already present are accepted, so a '
-                         'typo fails loudly instead of being silently ignored.')
+                         'wobble. Only registered Kilosort settings are '
+                         'accepted, so typos fail loudly while a current '
+                         'setting can still be added to an older ops.npy.')
     ap.add_argument('--device', default='cuda')
     ap.add_argument('--invert-sign', action='store_true',
                     help='the lab pipeline passes invert_sign=True for Litke')
@@ -115,20 +136,10 @@ def main():
         do_CAR = args.do_car
         invert_sign = args.invert_sign
 
-    overrides = {}
-    for item in args.set:
-        if '=' not in item:
-            ap.error(f'--set expects KEY=VALUE, got {item!r}')
-        key, raw = item.split('=', 1)
-        if key not in settings:
-            ap.error(f'--set {key}: not a key of the loaded settings '
-                     f'(typo?). Known keys: {sorted(settings)}')
-        try:
-            val = json.loads(raw)
-        except json.JSONDecodeError:
-            val = raw
-        overrides[key] = val
-        settings[key] = val
+    try:
+        overrides = apply_overrides(settings, args.set)
+    except ValueError as exc:
+        ap.error(str(exc))
 
     settings['filename'] = args.data
     settings['data_dir'] = None
