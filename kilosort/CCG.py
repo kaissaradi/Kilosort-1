@@ -154,7 +154,7 @@ def isi_violation_rate(st_sec, refractory_s=0.0015):
 
 
 def refract(iclust2, st0, acg_threshold=0.2, ccg_threshold=0.25,
-            isi_threshold=0.01, isi_min_spikes=500):
+            isi_threshold=0.0, isi_min_spikes=500):
     """Estimate refractory labels and contamination for every cluster.
 
     A cluster is labeled "good" (refractory) when EITHER criterion passes:

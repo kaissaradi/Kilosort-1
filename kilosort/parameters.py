@@ -427,14 +427,19 @@ EXTRA_PARAMETERS = {
 
     'isi_threshold': {
         'gui_name': 'ISI threshold', 'type': float, 'min': 0, 'max': 1.0,
-        'exclude': [], 'default': 0.01, 'step': 'clustering',
+        'exclude': [], 'default': 0.0, 'step': 'clustering',
         'description':
             """
-            ISI-based fallback for the quality classifier. A cluster that fails
-            the ACG test (R12 >= acg_threshold) is still labeled "good" when
-            fewer than this fraction of its spikes violate the 1.5 ms refractory
-            period and it has at least ``isi_min_spikes`` spikes. Set to 0 to
-            disable the fallback and use only the ACG test.
+            ISI-based fallback for the quality classifier, OFF by default (0).
+            When > 0, a cluster that fails the ACG test (R12 >= acg_threshold)
+            is still labeled "good" when fewer than this fraction of its spikes
+            violate the 1.5 ms refractory period and it has at least
+            ``isi_min_spikes`` spikes. A "good" cluster may also anchor a final
+            merge. Caution: a random, non-refractory train at rate r has about
+            r * 1.5 ms of its intervals below 1.5 ms, so 0.01 passes ANY train
+            under ~6.7 Hz. Turning it off (0.01 -> 0) raised precision on two
+            ground truths with recall unchanged (20260514A/data003 best-unit
+            0.8853 -> 0.8947; data000 0.7746 -> 0.7844, 2026-09-22).
             """
     },
 
@@ -564,7 +569,12 @@ EXTRA_PARAMETERS = {
         'min': 0.0, 'max': 1.0, 'exclude': [], 'default': 0.22,
         'step': 'postprocessing',
         'description':
-            """Upper R12 limit used only by final_merge_borderline_rescue."""
+            """
+            Upper R12 limit used only by final_merge_borderline_rescue. It must
+            be greater than ccg_threshold: the rescue revisits pairs that fail
+            at ccg_threshold, so a lower or equal value can never rescue one,
+            and the rescue is then disabled with a warning.
+            """
     },
 
     'final_merge_borderline_template_r': {

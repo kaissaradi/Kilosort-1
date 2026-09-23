@@ -580,7 +580,7 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
 
     acg_threshold = ops['settings']['acg_threshold']
     ccg_threshold = ops['settings']['ccg_threshold']
-    isi_threshold = ops['settings'].get('isi_threshold', 0.01)
+    isi_threshold = ops['settings'].get('isi_threshold', 0.0)
     isi_min_spikes = ops['settings'].get('isi_min_spikes', 500)
     final_merge_union_acg_veto = False
     borderline_rescue = False
@@ -595,6 +595,20 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
             'final_merge_borderline_ccg_threshold', 0.22))
         borderline_template_r = float(ops['settings'].get(
             'final_merge_borderline_template_r', 0.8))
+        # The rescue only revisits pairs that FAIL at ccg_threshold, then asks
+        # them to PASS at the relaxed threshold. A relaxed threshold at or below
+        # ccg_threshold can never pass such a pair, so the rule would be silently
+        # inert -- which is what stock ccg_threshold=0.25 with the 0.22 default
+        # did. Say so instead of pretending to run.
+        if borderline_rescue and borderline_ccg_threshold <= ccg_threshold:
+            logger.warning(
+                'final_merge_borderline_rescue disabled: '
+                'final_merge_borderline_ccg_threshold (%.3f) must exceed '
+                'ccg_threshold (%.3f), or no pair can be rescued.',
+                borderline_ccg_threshold, ccg_threshold)
+            ops['final_merge_borderline_rescue_disabled'] = (
+                'final_merge_borderline_ccg_threshold <= ccg_threshold')
+            borderline_rescue = False
         is_ref, est_contam_rate = CCG.refract(clu, st[:,0]/ops['fs'],
                                               acg_threshold=acg_threshold,
                                               ccg_threshold=ccg_threshold,
@@ -1258,7 +1272,7 @@ def residual_event_sample_reference(detector_samples, nt, nt0min):
 
 def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
                       acg_threshold=0.2, ccg_threshold=0.25,
-                      isi_threshold=0.01, isi_min_spikes=500):
+                      isi_threshold=0.0, isi_min_spikes=500):
     """Merge clusters that share spike-time coincidences above a threshold.
 
     This pass catches splits that the template-similarity merge misses: the

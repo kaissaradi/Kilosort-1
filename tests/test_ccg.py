@@ -4,7 +4,7 @@ from kilosort import CCG
 
 
 def reference_refract(cluster_ids, spike_times, acg_threshold=0.2,
-                      ccg_threshold=0.25, isi_threshold=0.01,
+                      ccg_threshold=0.25, isi_threshold=0.0,
                       isi_min_spikes=500):
     n_clusters = cluster_ids.max() + 1
     is_refractory = np.zeros(n_clusters)
@@ -177,3 +177,22 @@ def test_check_ccg_empty_and_zero_span():
     times = np.arange(0, 5, 0.05)
     is_ref, cross, R12 = CCG.check_CCG(times)
     assert np.isfinite(R12)
+
+
+def test_isi_fallback_is_off_by_default():
+    """A random, non-refractory train must not be labeled good by default.
+
+    The ISI fallback at 0.01 passes ANY Poisson train under ~6.7 Hz (about
+    rate * 1.5 ms of its intervals fall below 1.5 ms), and a good cluster may
+    anchor a final merge. It shipped ON by default in 3d2e8fd; turning it off
+    raised precision on two ground truths with recall unchanged (2026-09-22).
+    """
+    from kilosort.parameters import EXTRA_PARAMETERS
+    assert EXTRA_PARAMETERS['isi_threshold']['default'] == 0.0
+
+    rng = np.random.default_rng(1)
+    rate, dur = 4.0, 1800.0                      # 7200 spikes, no refractory
+    st = np.sort(rng.uniform(0.0, dur, int(rate * dur)))
+    assert CCG.isi_violation_rate(st) < 0.01     # the fallback WOULD pass it
+    labels, _ = CCG.refract(np.zeros(st.size, dtype=np.int64), st)
+    assert not labels[0]                         # default: ACG test only -> mua

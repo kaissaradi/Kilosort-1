@@ -868,7 +868,7 @@ def discover_templates(ops, bfile, Wall3, device=torch.device('cuda'),
     fs = ops['fs']
     acg_threshold = ops['settings']['acg_threshold']
     ccg_threshold = ops['settings']['ccg_threshold']
-    isi_threshold = ops['settings'].get('isi_threshold', 0.01)
+    isi_threshold = ops['settings'].get('isi_threshold', 0.0)
     isi_min_spikes = ops['settings'].get('isi_min_spikes', 500)
 
     keep = np.ones(n_res, dtype=bool)
@@ -1259,7 +1259,7 @@ def cluster_spikes(st, tF, ops, device, bfile, tic0=np.nan, progress_bar=None,
         logger.info(' ')
         logger.info('Coincidence merge (spike-time overlap)')
         logger.info('-'*40)
-        isi_threshold = ops['settings'].get('isi_threshold', 0.01)
+        isi_threshold = ops['settings'].get('isi_threshold', 0.0)
         isi_min_spikes = ops['settings'].get('isi_min_spikes', 500)
         acg_threshold = ops['settings']['acg_threshold']
         ccg_threshold = ops['settings']['ccg_threshold']
@@ -1330,7 +1330,7 @@ def residual_recluster(ops, bfile, Wall, clu, st, tF, device=torch.device('cuda'
     fs = ops['fs']
     acg_threshold = ops['settings']['acg_threshold']
     ccg_threshold = ops['settings']['ccg_threshold']
-    isi_threshold = ops['settings'].get('isi_threshold', 0.01)
+    isi_threshold = ops['settings'].get('isi_threshold', 0.0)
     isi_min_spikes = ops['settings'].get('isi_min_spikes', 500)
 
     st_res_samples = (st_res[:, 0] * fs).astype(np.int64)
@@ -1671,7 +1671,7 @@ def load_sorting(results_dir, device=None, load_extra_vars=False):
     kept_spikes = np.load(results_dir / 'kept_spikes.npy')
     acg_threshold = ops['settings']['acg_threshold']
     ccg_threshold = ops['settings']['ccg_threshold']
-    isi_threshold = ops['settings'].get('isi_threshold', 0.01)
+    isi_threshold = ops['settings'].get('isi_threshold', 0.0)
     isi_min_spikes = ops['settings'].get('isi_min_spikes', 500)
     is_ref, est_contam_rate = CCG.refract(clu, st / ops['fs'],
                                           acg_threshold=acg_threshold,

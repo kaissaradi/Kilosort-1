@@ -580,6 +580,41 @@ def test_borderline_rescue_is_opt_in_and_records_provenance(monkeypatch):
     assert event['shift_samples'] == 0
 
 
+def test_borderline_rescue_refuses_a_threshold_at_or_below_ccg(
+        monkeypatch, caplog):
+    # Stock ccg_threshold is 0.25 and the rescue default is 0.22: every pair
+    # the rescue revisits already failed 0.25, so it can never pass 0.22.
+    # The rule must say it is inert instead of silently doing nothing.
+    ops, Wall, clu, st, tF, device = _two_cluster_ccg_case(aligned=False)
+    ops['Wrot'] = torch.eye(1)
+    ops['settings'].update({
+        'ccg_threshold': 0.25,
+        'final_merge_borderline_rescue': True,
+        'final_merge_borderline_ccg_threshold': 0.22,
+        'final_merge_borderline_template_r': 0.8,
+    })
+    calls = []
+
+    def fake_check(st0, st1=None, *, ccg_threshold, **kwargs):
+        calls.append(ccg_threshold)
+        if st1 is None:
+            return True, True, 0.05
+        return True, False, 0.24         # ordinary gate rejects
+
+    monkeypatch.setattr(CCG, 'check_CCG', fake_check)
+    with caplog.at_level('WARNING', logger='kilosort.template_matching'):
+        got = merging_function(
+            ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg',
+            check_dt=True, device=device)
+
+    assert got[0].shape[0] == 2                      # nothing merged
+    assert ops['final_merge_borderline_rescue_count'] == 0
+    assert 'ccg_threshold' in ops['final_merge_borderline_rescue_disabled']
+    assert 0.22 not in calls                         # relaxed gate never run
+    assert any('borderline_rescue disabled' in r.getMessage()
+               for r in caplog.records)
+
+
 def test_final_union_acg_veto_rejects_a_bad_union():
     ops, Wall, clu, st, tF, device = _two_cluster_ccg_case(aligned=False)
     # Keep cluster 0 refractory, but put sub-refractory pairs in cluster 1.
