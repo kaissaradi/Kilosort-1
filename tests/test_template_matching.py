@@ -1378,3 +1378,94 @@ def test_residual_dump_handles_a_device_resident_array():
         assert np.load(os.path.join(sub, 'stt.npy')).tolist() == [[10, 0],
                                                                  [20, 1]]
         assert np.load(os.path.join(sub, 'Wrot.npy')).shape == (n_chan, n_chan)
+
+
+def _drop_only_fixture(n_extra):
+    """kk = a regular train (1000 spikes); jj = copies of its first 500
+    spikes at +6 samples plus n_extra spikes of a second neuron placed
+    midway between kk spikes, so kk is always the larger (target) unit."""
+    base = np.arange(1_000, 1_001_000, 1_000, dtype=np.int64)
+    extra = base[:n_extra] + 500
+    t_jj = np.sort(np.concatenate((base[:500] + 6, extra)))
+    st = np.column_stack((
+        np.concatenate((base, t_jj)),
+        np.zeros(len(base) + len(t_jj), dtype=np.int64),
+        np.ones(len(base) + len(t_jj), dtype=np.float32),
+    ))
+    clu = np.concatenate((np.zeros(len(base), dtype=np.int32),
+                          np.ones(len(t_jj), dtype=np.int32)))
+    ops = {'fs': 20_000, 'wPCA': torch.zeros((1, 81)), 'settings': {
+        'acg_threshold': 0.2, 'ccg_threshold': 0.25,
+        'isi_threshold': 0.01, 'isi_min_spikes': 500}}
+    return base, extra, st, clu, ops
+
+
+def test_coincidence_drop_only_deletes_pure_copies_without_moving_spikes():
+    base, _, st, clu, ops = _drop_only_fixture(0)
+    Wall = torch.zeros((2, 1, 1)); tF = torch.zeros((len(st), 1, 1))
+    Wall2, clu2, _, st2, tF2 = coincidence_merge(
+        ops, Wall, clu, st, tF, frac_thresh=0.2, import_unmatched=False)
+    assert ops['coincidence_drop_only_count'] == 1
+    assert ops['coincidence_merge_count'] == 0
+    assert ops['coincidence_merge_deduped_spikes'] == 500
+    # jj held nothing but copies: it is emptied, kk keeps its own times.
+    assert len(np.unique(clu2)) == 1
+    np.testing.assert_array_equal(np.sort(st2[:, 0]), base)
+    assert tF2.shape[0] == len(base) and Wall2.shape[0] == 1
+
+
+def test_coincidence_drop_only_keeps_a_second_neuron_out_of_the_target():
+    base, extra, st, clu, ops = _drop_only_fixture(100)
+    Wall = torch.zeros((2, 1, 1)); tF = torch.zeros((len(st), 1, 1))
+    _, clu_u, _, st_u, _ = coincidence_merge(
+        dict(ops), Wall.clone(), clu.copy(), st.copy(), tF.clone(),
+        frac_thresh=0.2, import_unmatched=True)
+    # Original mode: the second neuron's spikes are imported into the target.
+    assert len(np.unique(clu_u)) == 1
+    assert len(st_u) == len(base) + len(extra)   # 500 copies dropped
+    _, clu_d, _, st_d, _ = coincidence_merge(
+        ops, Wall, clu, st, tF, frac_thresh=0.2, import_unmatched=False)
+    # Drop-only: the target is unchanged and the extra spikes stay separate.
+    assert len(np.unique(clu_d)) == 2
+    t = st_d[:, 0].astype(np.int64)
+    target = clu_d[np.searchsorted(t, base[0])]
+    np.testing.assert_array_equal(np.sort(t[clu_d == target]), base)
+    np.testing.assert_array_equal(np.sort(t[clu_d != target]), extra)
+
+
+def test_coincidence_drop_only_can_preserve_the_cleaner_smaller_unit(monkeypatch):
+    a = np.arange(2_000, 2_002_000, 2_000, dtype=np.int64)
+    b = a + 1_000
+    mixed = np.sort(np.concatenate((a, b)))
+    clean = a + 6
+    st = np.column_stack((
+        np.concatenate((mixed, clean)),
+        np.zeros(len(mixed) + len(clean), dtype=np.int64),
+        np.ones(len(mixed) + len(clean), dtype=np.float32),
+    ))
+    clu = np.concatenate((np.zeros(len(mixed), dtype=np.int32),
+                          np.ones(len(clean), dtype=np.int32)))
+    order = np.argsort(st[:, 0], kind='stable')
+    st, clu = st[order], clu[order]
+    ops = {'fs': 20_000, 'wPCA': torch.zeros((1, 81)), 'settings': {
+        'acg_threshold': 10.0, 'ccg_threshold': 10.0,
+        'isi_threshold': 0.0, 'isi_min_spikes': 500}}
+    Wall = torch.zeros((2, 1, 1)); tF = torch.zeros((len(st), 1, 1))
+
+    real_refract = CCG.refract
+
+    def controlled_refract(*args, **kwargs):
+        is_ref, _ = real_refract(*args, **kwargs)
+        # kk is the larger mixed unit; jj is the cleaner copy of base[:500].
+        return is_ref, np.array([0.08, 0.0])
+
+    monkeypatch.setattr(CCG, 'refract', controlled_refract)
+    _, clu_d, _, st_d, _ = coincidence_merge(
+        ops, Wall, clu, st, tF, frac_thresh=0.2,
+        import_unmatched=False, keep_cleaner=True)
+
+    assert ops['coincidence_drop_cleaner_count'] == 1
+    t = st_d[:, 0].astype(np.int64)
+    units = {u: np.sort(t[clu_d == u]) for u in np.unique(clu_d)}
+    assert any(np.array_equal(v, clean) for v in units.values())
+    assert any(np.array_equal(v, b) for v in units.values())

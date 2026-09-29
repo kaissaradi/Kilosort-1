@@ -1266,7 +1266,11 @@ def cluster_spikes(st, tF, ops, device, bfile, tic0=np.nan, progress_bar=None,
         Wall, clu, _, st, tF = template_matching.coincidence_merge(
             ops, Wall, clu, st, tF, frac_thresh=frac_thresh,
             acg_threshold=acg_threshold, ccg_threshold=ccg_threshold,
-            isi_threshold=isi_threshold, isi_min_spikes=isi_min_spikes)
+            isi_threshold=isi_threshold, isi_min_spikes=isi_min_spikes,
+            import_unmatched=ops['settings'].get(
+                'coincidence_import_unmatched', True),
+            keep_cleaner=ops['settings'].get(
+                'coincidence_keep_cleaner', False))
         clu = clu.astype('int32')
         elapsed2 = time.time() - tic2
         ops['runtime_coincidence_merge'] = elapsed2

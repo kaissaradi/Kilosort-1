@@ -1272,7 +1272,8 @@ def residual_event_sample_reference(detector_samples, nt, nt0min):
 
 def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
                       acg_threshold=0.2, ccg_threshold=0.25,
-                      isi_threshold=0.0, isi_min_spikes=500):
+                      isi_threshold=0.0, isi_min_spikes=500,
+                      import_unmatched=True, keep_cleaner=False):
     """Merge clusters that share spike-time coincidences above a threshold.
 
     This pass catches splits that the template-similarity merge misses: the
@@ -1292,7 +1293,16 @@ def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
         Minimum fraction of the smaller cluster's spikes that must coincide
         at the CCG peak lag for a merge. Default 0.20 (same as the lab's
         dup_collapse_figure.py).
-
+    import_unmatched : bool
+        True (original): an accepted pair moves the smaller cluster's
+        unmatched spikes into the larger cluster. False: only the matched
+        copies are deleted and the smaller cluster keeps its unmatched spikes
+        as its own unit (deleted entirely if none remain). Same gates.
+    keep_cleaner : bool
+        Drop-only mode only. Preserve the smaller unit when its CCG
+        contamination estimate is at least 0.01 lower than the larger unit's,
+        and delete the matched copies from the larger unit instead. The
+        estimate is independent of the pair's spike-time overlap.
     Returns the same tuple as merging_function.
     """
     logger = logging.getLogger(__name__)
@@ -1307,14 +1317,18 @@ def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
         n_clusters = max(n_clusters, int(Wall.shape[0]))
 
     # Quality labels from the preceding merge step (with ISI fallback)
-    is_ref, _ = CCG.refract(clu2, st[:, 0] / fs,
-                            acg_threshold=acg_threshold,
-                            ccg_threshold=ccg_threshold,
-                            isi_threshold=isi_threshold,
-                            isi_min_spikes=isi_min_spikes)
+    is_ref, contamination = CCG.refract(
+        clu2, st[:, 0] / fs,
+        acg_threshold=acg_threshold,
+        ccg_threshold=ccg_threshold,
+        isi_threshold=isi_threshold,
+        isi_min_spikes=isi_min_spikes)
     if len(is_ref) < n_clusters:
         is_ref = np.concatenate([is_ref,
                                  np.zeros(n_clusters - len(is_ref), dtype=bool)])
+        contamination = np.concatenate([
+            contamination,
+            np.full(n_clusters - len(contamination), np.inf)])
 
     spike_idx = group_indices_by_label(clu2)
     is_merged = np.zeros(n_clusters, dtype=bool)
@@ -1332,6 +1346,8 @@ def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
 
     nmerge = 0
     nveto = 0
+    ndrop_only = 0
+    ndrop_cleaner = 0
 
     # Only check clusters with enough spikes to be meaningful
     candidates = [int(isort[i]) for i in range(n_clusters)
@@ -1419,6 +1435,83 @@ def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
             keep_idx_jj = idx_jj_sorted[~matched_b]
             drop_idx_jj = idx_jj_sorted[matched_b]
 
+            if (not import_unmatched and keep_cleaner
+                    and contamination[jj] + 0.01 < contamination[kk]):
+                # The smaller unit has the cleaner independent ACG. Preserve
+                # it intact and remove its matched copies from the dirtier
+                # larger unit. This avoids destroying a clean unit merely
+                # because a mixed cluster contains more events.
+                _, _, matched_a = _peak_shared_fraction_with_matches(
+                    st_b, st_a, fs)
+                idx_kk = spike_idx.get(kk, np.zeros(0, dtype=np.int64))
+                idx_kk_sorted = idx_kk[np.argsort(st[idx_kk, 0])]
+                keep_idx_kk = idx_kk_sorted[~matched_a]
+                dropped_spikes[idx_kk_sorted[matched_a]] = True
+                ops['coincidence_merge_deduped_spikes'] = (
+                    int(ops.get('coincidence_merge_deduped_spikes', 0))
+                    + int(matched_a.sum()))
+                ndrop_only += 1
+                ndrop_cleaner += 1
+                spike_idx[kk] = np.sort(keep_idx_kk)
+                cluster_times[kk] = np.sort(
+                    st[spike_idx[kk], 0].astype(np.int64))
+                ns[kk] = len(keep_idx_kk)
+                if Wall is not None and len(keep_idx_kk):
+                    Wall[kk] = _retained_global_feature_mean(
+                        ops, st, tF, keep_idx_kk, Wall.shape[1]).to(
+                            device=Wall.device, dtype=Wall.dtype)
+                if len(keep_idx_kk) > 10:
+                    _, _, contamination[kk] = CCG.check_CCG(
+                        cluster_times[kk] / fs,
+                        acg_threshold=acg_threshold,
+                        ccg_threshold=ccg_threshold,
+                        assume_sorted=True)
+                else:
+                    contamination[kk] = np.inf
+                logger.debug(
+                    f'coincidence drop-only (cleaner): '
+                    f'{int(matched_a.sum())} copies of {jj} removed from {kk}')
+                continue
+
+            if not import_unmatched:
+                # Drop-only: delete the matched copies, leave jj as its own
+                # unit with the unmatched spikes. kk is untouched, so no
+                # timestamp shift and no second neuron can enter kk.
+                dropped_spikes[drop_idx_jj] = True
+                ops['coincidence_merge_deduped_spikes'] = (
+                    int(ops.get('coincidence_merge_deduped_spikes', 0))
+                    + int(matched_b.sum()))
+                ndrop_only += 1
+                if keep_idx_jj.size == 0:
+                    is_merged[jj] = True
+                    ns[jj] = 0
+                    spike_idx.pop(jj, None)
+                    cluster_times.pop(jj, None)
+                    if Wall is not None:
+                        Wall[jj] = 0
+                else:
+                    spike_idx[jj] = np.sort(keep_idx_jj)
+                    cluster_times[jj] = np.sort(
+                        st[spike_idx[jj], 0].astype(np.int64))
+                    ns[jj] = len(keep_idx_jj)
+                    if len(keep_idx_jj) > 10:
+                        _, _, contamination[jj] = CCG.check_CCG(
+                            cluster_times[jj] / fs,
+                            acg_threshold=acg_threshold,
+                            ccg_threshold=ccg_threshold,
+                            assume_sorted=True)
+                    else:
+                        contamination[jj] = np.inf
+                    if Wall is not None:
+                        Wall[jj] = _retained_global_feature_mean(
+                            ops, st, tF, keep_idx_jj, Wall.shape[1]).to(
+                                device=Wall.device, dtype=Wall.dtype)
+                logger.debug(
+                    f'coincidence drop-only: {int(matched_b.sum())} copies of '
+                    f'{kk} removed from {jj} (frac={frac:.2f}, '
+                    f'lag={lag*1000:.2f}ms), {len(keep_idx_jj)} kept')
+                continue
+
             # Merge jj into kk.  The trial union above is the event set we
             # validated, so matched copies must be removed from the returned
             # arrays as well; retaining them would make later merges see a
@@ -1483,9 +1576,16 @@ def coincidence_merge(ops, Wall, clu, st, tF, frac_thresh=0.20,
 
     ops['coincidence_merge_count'] = nmerge
     ops['coincidence_merge_veto_count'] = nveto
-    logger.info(f'coincidence merge: {nmerge} merges, {nveto} vetoed by ACG')
+    ops['coincidence_drop_only_count'] = ndrop_only
+    ops['coincidence_drop_cleaner_count'] = ndrop_cleaner
+    if import_unmatched:
+        logger.info(f'coincidence merge: {nmerge} merges, {nveto} vetoed by ACG')
+    else:
+        logger.info(f'coincidence merge (drop-only): {ndrop_only} pairs '
+                    f'deduplicated, {int(is_merged.sum())} units emptied, '
+                    f'{nveto} vetoed by ACG')
 
-    if nmerge == 0:
+    if nmerge == 0 and ndrop_only == 0:
         return Wall, clu2, None, st, tF
 
     # Renumber clusters to fill gaps

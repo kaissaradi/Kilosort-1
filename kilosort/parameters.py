@@ -470,6 +470,37 @@ EXTRA_PARAMETERS = {
             """
     },
 
+    'coincidence_import_unmatched': {
+        'gui_name': 'coincidence merge imports unmatched', 'type': bool,
+        'min': None, 'max': None, 'exclude': [], 'default': True,
+        'step': 'postprocessing',
+        'description':
+            """
+            What an accepted coincidence pair does with the smaller unit's
+            spikes that do NOT coincide with the larger unit. True (the
+            original behaviour): they join the larger unit, so a smaller unit
+            that also holds a second neuron contaminates the target. False:
+            only the matched copies are deleted; the unmatched spikes stay as
+            their own unit, so the pass removes duplicates but cannot fuse two
+            neurons. The acceptance gates are the same in both modes.
+            """
+    },
+
+    'coincidence_keep_cleaner': {
+        'gui_name': 'coincidence drop-only keeps cleaner unit', 'type': bool,
+        'min': None, 'max': None, 'exclude': [], 'default': False,
+        'step': 'postprocessing',
+        'description':
+            """
+            Only used when coincidence_import_unmatched is False. If the
+            smaller unit's existing CCG contamination estimate is at least
+            one percentage point lower than the larger unit's, keep the
+            smaller unit intact and delete the matched copies from the larger
+            unit. Otherwise retain the size-directed drop-only behaviour.
+            This is experimental and default-off.
+            """
+    },
+
     'lam': {
         'gui_name': 'amplitude prior', 'type': float, 'min': 0, 'max': 100,
         'exclude': [], 'default': 0, 'step': 'template_matching',
