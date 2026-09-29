@@ -9,6 +9,7 @@ optional writer dependency is loaded only when :func:`export_vision` is used.
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Dict, Set, Tuple
@@ -18,6 +19,7 @@ from numba import njit, prange
 
 from .litke import LitkeRecording
 
+logger = logging.getLogger(__name__)
 
 class VisionExportError(ValueError):
     """An export precondition or output validation failed."""
@@ -44,9 +46,18 @@ def _quality_ids(path: Path) -> Set[int]:
 
 
 def load_kilosort_spikes(
-    sort_dir: os.PathLike, good_only: bool = False,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return one-based Vision IDs, sorted sample times, and dense cell IDs."""
+    sort_dir: os.PathLike, good_only: bool = False, n_samples=None,
+    return_dropped: bool = False,
+):
+    """Return one-based Vision IDs, sorted sample times, and dense cell IDs.
+
+    Kilosort can place a spike a few samples before the recording start (seen
+    at -1 and -2 on 20260724A/data003, stock 4.0.32 too), and its edge-padded
+    last batch could in principle do the same past the end.  A ``.neurons``
+    file cannot hold such a time, so those spikes are dropped, never shifted;
+    ``n_samples`` enables the upper bound.  With ``return_dropped`` the number
+    of dropped spikes is returned as a fourth value.
+    """
     sort_dir = Path(sort_dir)
     try:
         times = np.asarray(np.load(sort_dir / "spike_times.npy")).reshape(-1)
@@ -62,17 +73,31 @@ def load_kilosort_spikes(
         raise VisionExportError("Kilosort spike arrays must contain finite integers")
     times = times.astype(np.int64, copy=False)
     clusters = clusters.astype(np.int64, copy=False)
-    if np.any(times < 0) or np.any(clusters < 0):
-        raise VisionExportError("Kilosort spike times and IDs must be non-negative")
+    if np.any(clusters < 0):
+        raise VisionExportError("Kilosort cluster IDs must be non-negative")
     if good_only:
         good = _quality_ids(sort_dir / "cluster_KSLabel.tsv")
         keep = np.isin(clusters, np.fromiter(good, dtype=np.int64, count=len(good)))
         times, clusters = times[keep], clusters[keep]
         if times.size == 0:
             raise VisionExportError("good-only export contains no spikes")
+    # Count drops among the exported spikes only, after the good-only filter.
+    keep = times >= 0
+    if n_samples is not None:
+        keep &= times < int(n_samples)
+    dropped = int(times.size - np.count_nonzero(keep))
+    if dropped:
+        logger.warning(
+            "Vision export: dropping %d spike(s) outside the recording "
+            "(sample range [%d, %d])", dropped, int(times.min()), int(times.max()))
+        times, clusters = times[keep], clusters[keep]
+        if times.size == 0:
+            raise VisionExportError("no Kilosort spikes lie inside the recording")
     ids = np.unique(clusters)
     dense = np.searchsorted(ids, clusters).astype(np.int32, copy=False)
     order = np.lexsort((times, dense))
+    if return_dropped:
+        return ids + 1, times[order], dense[order], dropped
     return ids + 1, times[order], dense[order]
 
 
@@ -267,7 +292,10 @@ def export_vision(
         raise VisionExportError(
             "Vision export needs the kilosort1 environment with visionwriter") from exc
 
-    vision_ids, times, dense = load_kilosort_spikes(sort, good_only=good_only)
+    with LitkeRecording(raw, drop_ttl=False) as recording:
+        raw_samples = int(recording.n_samples)
+    vision_ids, times, dense, dropped = load_kilosort_spikes(
+        sort, good_only=good_only, n_samples=raw_samples, return_dropped=True)
     ids, counts, avg, err, ttl_times, n_samples, array_id = compute_ei_from_spikes(
         vision_ids, times, dense, raw, left=left, right=right,
         time_constant=time_constant, mode=mode, chunk=chunk, cell_block=cell_block)
@@ -303,6 +331,7 @@ def export_vision(
         "kilosort_cluster_id_base": 0, "vision_cell_id_base": 1,
         "cell_count": int(len(vision_ids)), "spike_count": int(len(times)),
         "good_only": bool(good_only),
+        "dropped_out_of_range_spikes": int(dropped),
         "ei": {"left_samples": int(left), "right_samples": int(right),
                "time_constant": float(time_constant), "mode": mode},
         "files": [path.name for path in expected],

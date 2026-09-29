@@ -36,6 +36,9 @@ def main():
             chunk=args.chunk, cell_block=args.cell_block)
         print(f"Exported {manifest['cell_count']} cells and "
               f"{manifest['spike_count']} spikes to {args.output_dir or args.sort_dir}")
+        if manifest["dropped_out_of_range_spikes"]:
+            print(f"Dropped {manifest['dropped_out_of_range_spikes']} spikes "
+                  "outside the raw recording")
         return 0
     except VisionExportError as exc:
         parser.error(str(exc))
