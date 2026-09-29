@@ -1026,6 +1026,25 @@ def _register_residual_detection_templates(ops):
     return int(iU.shape[0])
 
 
+def _trace(name, **arrays):
+    """Save one sorter stage's spike table when KILOSORT_TRACE_DIR is set.
+
+    Diagnostic only: it writes files and changes nothing in the sort, so the
+    default output (variable unset) is byte-identical. Used to follow each
+    ground-truth spike through detection, extraction, clustering and merges.
+    """
+    out = os.environ.get('KILOSORT_TRACE_DIR')
+    if not out:
+        return
+    os.makedirs(out, exist_ok=True)
+    conv = {}
+    for k, v in arrays.items():
+        if torch.is_tensor(v):
+            v = v.detach().cpu().numpy()
+        conv[k] = np.asarray(v)
+    np.savez(os.path.join(out, f'{name}.npz'), **conv)
+
+
 def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
                   clear_cache=False, verbose=False):
     """Detect spikes via template deconvolution.
@@ -1074,6 +1093,9 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
         clear_cache=clear_cache, verbose=verbose
         )
     tF = torch.from_numpy(tF)
+    _trace('stage1_universal', st=st0, imin=getattr(bfile, 'imin', 0),
+           iC=ops.get('iC', np.zeros(0)), fs=ops['fs'],
+           xcup=ops.get('xcup', np.zeros(0)), ycup=ops.get('ycup', np.zeros(0)))
 
     elapsed = time.time() - tic
     total = time.time() - tic0
@@ -1145,6 +1167,9 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
         ops, bfile, Wall3, device=device, progress_bar=progress_bar,
         spike_capacity_hint=int(n_univ_spikes * 1.5) + 10_000,
         )
+    _trace('stage2_learned', st=st,
+           tmain=(Wall3.detach().float().norm(dim=1).argmax(dim=1)
+                  if os.environ.get('KILOSORT_TRACE_DIR') else np.zeros(0)))
    
     log_thread_count(logger)
 
@@ -1215,6 +1240,7 @@ def cluster_spikes(st, tF, ops, device, bfile, tic0=np.nan, progress_bar=None,
         ops, st, tF,  mode = 'template', device=device, progress_bar=progress_bar,
         clear_cache=clear_cache, verbose=verbose
         )
+    _trace('stage3_clustered', st=st, clu=clu)
     
     elapsed = time.time() - tic
     total = time.time() - tic0
@@ -1237,6 +1263,7 @@ def cluster_spikes(st, tF, ops, device, bfile, tic0=np.nan, progress_bar=None,
         ops, Wall, clu, st, tF, device=device, check_dt=True
         )
     clu = clu.astype('int32')
+    _trace('stage4_merged', st=st, clu=clu)
 
     elapsed = time.time() - tic
     total = time.time() - tic0
@@ -1272,6 +1299,7 @@ def cluster_spikes(st, tF, ops, device, bfile, tic0=np.nan, progress_bar=None,
             keep_cleaner=ops['settings'].get(
                 'coincidence_keep_cleaner', False))
         clu = clu.astype('int32')
+        _trace('stage5_coincidence', st=st, clu=clu)
         elapsed2 = time.time() - tic2
         ops['runtime_coincidence_merge'] = elapsed2
         logger.info(f'{clu.max()+1} units after coincidence merge, '
