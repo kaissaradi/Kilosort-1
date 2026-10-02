@@ -1,73 +1,74 @@
 # Kilosort4, MEA fork (branch `mea-optimizations`): quick start
 
-The fork sorts 3–5× faster than stock Kilosort4. The GPU kernels give byte-identical output;
-5 other speed changes can change float rounding or tie order (CHANGE_INVENTORY class 2).
-It reads Litke raw data directly, adds MEA settings and merges, and writes Vision files.
-Full list of changes: MEA-fieldlab `papers/ks4_retina_mea/qa_report/CHANGE_INVENTORY.md`.
-
-## 1. Environment
-
-```bash
-conda activate kilosort1                       # has the fork (editable) + visionwriter
-cd MEA-fieldlab/src && python -m mea doctor    # must say "All critical checks passed"
-```
-
-The `kilosort` env holds **stock** 4.0.32. Do not sort with it.
-
-## 2. Full run: native Litke → sort → Vision `.neurons/.ei` → STA
-
-```bash
-python -m mea run 20260514A chunk1 -f "data003" -n "data003" -a 60 -l --dry-run   # check, then drop --dry-run
-```
-
-| Option | What it does |
-|---|---|
-| `-l`, `--native-litke` | Read the raw `dataXXX` folders directly (no bin2py). |
-| `--no-flat-bin` | With `-l`: do not write the joined `{chunk}.bin` (KS4 only). |
-| `-a 30` / `-a 60` | Array pitch. Picks the tuned per-array settings. |
-| `-k '...'` | Pass flags to `run_kilosort4.py` (table below). |
-| `--sort-only` | Sort only. No Vision export, EI or STA. |
-| `--lab-path DIR` | Archive to `DIR`, not the lab share. Use it for a test run. |
-
-Flags for `-k` (all optional):
-
-| Flag | Effect |
-|---|---|
-| `--params tuned` | The default. `baseline` = the Nov 2025 stock sort settings. |
-| `--deterministic` | Same output on every run. Use it for any A/B comparison. |
-| `--dedup-mode auto` | The default. 60 µm: label axonal copies (`axonal`), no merge. 30 µm: merge, then label. |
-| `--coincidence_frac_thresh X` | The coincidence merge. The default is 0.90 (drop-only + keep-cleaner) at 60 µm, off at 30 µm. |
-| `--plots`, `--pc-features` | Write the plots / Phy PC files (off by default). |
-
-Environment variables:
-
-| Variable | Values |
-|---|---|
-| `EI_BACKEND` | `fast` (default, numba, ~20× faster than Java), `python`, `java` |
-| `EI_MODE` | `exact` (default, bit-identical to Java), `accurate` (no int16 truncation bias), `truncated64` |
-| `MEA_STAGE_TIMES=file` | Write the start and end time of each pipeline stage to `file`. |
-| `MEA_KEEP_TRASH=1` | Do not empty `~/.local/share/Trash` at the end. |
-
-## 3. Vision bundle from an existing sort (no re-sort)
-
-```bash
-python -m mea export-vision /path/to/kilosort4 /path/to/raw/data003 -o /path/to/vision/kilosort4 --mode exact
-```
-
-This writes `.neurons`, `.globals`, `.ei`, `vision_export.json` and `<name>.axonal.tsv`.
-It writes no `.params` and no `.sta`. The STA step makes those (`mea run`, `mea analyze` or `mea sta-vision`).
-
-## 4. Sort only, from Python
+## 1. Sort the Litke raw data directly (no bin2py, no flat .bin)
 
 ```python
+import torch
+from kilosort import run_kilosort, io
 from kilosort.litke import LitkeRecording
-from kilosort import run_kilosort
-rec = LitkeRecording('/path/to/EXP/data003')          # electrode 0 (TTL) is dropped
-run_kilosort({'n_chan_bin': rec.n_chan, 'fs': int(rec.fs), 'results_dir': 'out'},
-             filename=str(rec.paths[0]), file_object=rec, probe=probe)   # probe: your 512/519 Litke probe
+
+raw = ['/path/EXP/data003']                              # one or more dataXXX folders, in order
+recs = [LitkeRecording(p) for p in raw]                  # drops electrode 0 (TTL)
+data = recs[0] if len(recs) == 1 else io.BinaryFileGroup(file_objects=recs)
+probe = io.load_probe('/path/to/LITKE_512_ARRAY.mat')
+
+settings = {                                             # production, 60 um array (512 ch)
+    'n_chan_bin': 512, 'fs': 20000, 'batch_size': 10000, 'nblocks': 0,
+    'dmin': 60, 'dminx': 60, 'nearest_chans': 19, 'nt': 81, 'max_channel_distance': 66,
+    'n_templates': 10, 'Th_single_ch': 5.0, 'x_centers': 10, 'whitening_range': 37,
+    'ccg_threshold': 0.2, 'split_ccg_threshold': 0.4,
+    'coincidence_frac_thresh': 0.9,                      # the coincidence merge
+    'coincidence_import_unmatched': False,               # drop-only
+    'coincidence_keep_cleaner': True,
+}
+run_kilosort(settings, probe=probe, filename=str(recs[0].paths[0]), file_object=data,
+             results_dir='out/kilosort4', data_dtype='int16', invert_sign=True, do_CAR=False,
+             device=torch.device('cuda'), save_pc_features=False)
 ```
 
-See `docs/litke.rst` for the TTL and probe details.
+**30 µm array (519 ch):** use `LITKE_519_ARRAY_30UM.mat` and
+`{'n_chan_bin': 519, 'fs': 20000, 'batch_size': 10000, 'nblocks': 0, 'dmin': 15, 'max_channel_distance': 33,
+'n_templates': 10, 'Th_single_ch': 5.0, 'x_centers': 10, 'whitening_range': 37, 'ccg_threshold': 0.2,
+'split_ccg_threshold': 0.4}`. The coincidence merge stays off there (no ground truth at 30 µm).
+
+**Same output on every run** (for any A/B): before you import torch, set `CUBLAS_WORKSPACE_CONFIG=:4096:8`.
+Then call `torch.use_deterministic_algorithms(True, warn_only=True)`.
+
+## 2. Vision files with the EI
+
+```bash
+python tools/export_vision.py out/kilosort4 /path/EXP/data003 -o out/vision/kilosort4 --mode exact
+```
+
+This writes `kilosort4.neurons`, `.globals`, `.ei` and `vision_export.json`. It does not write `.params` or `.sta`.
+
+| Option | Effect |
+|---|---|
+| `--mode exact` | The default. The EI is bit-identical to Java Vision. |
+| `--mode accurate` | No int16 truncation. Java EIs are 0.83 % too small (median). |
+| `--good-only` | Export only the `good` units. |
+| `--left 67 --right 133` | EI window in samples (the defaults). |
+
+## 3. Sort a flat int16 .bin
+
+```bash
+python tools/run_full_sort.py --data chunk.bin --results-dir out/kilosort4 --ops old_sort/ops.npy --deterministic
+python tools/run_full_sort.py --data chunk.bin --results-dir out/kilosort4 --probe P.mat --settings S.json --invert-sign
+```
+
+`--ops` replays the settings and probe of an earlier sort. `--set KEY=VALUE` changes one setting.
+
+## 4. Settings the fork adds (`kilosort/parameters.py`)
+
+| Setting | Fork default | What it does |
+|---|---|---|
+| `coincidence_frac_thresh` | 0 (off) | Merge two units that share this fraction of spikes at one CCG lag. |
+| `coincidence_import_unmatched` | True | False = drop-only: delete only the copied spikes. |
+| `coincidence_keep_cleaner` | False | With drop-only: delete the copies from the unit with the higher CCG contamination. |
+| `split_ccg_threshold` | 0.25 | CCG threshold for splits (stock uses `ccg_threshold`). |
+| `max_merge_sweeps` | 10 | Repeat the KS duplicate merge until nothing changes. |
+| `refractory_merge_veto` | True | Refuse a clustering merge whose result breaks the refractory period. |
+| `isi_threshold`, `lam`, `residual_Th`, `discover_templates`, `final_merge_*` | off | Tested, not used in production. |
 
 ## 5. Switches for checks (not for production)
 
