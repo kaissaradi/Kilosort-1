@@ -1122,9 +1122,23 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
         ops, st0, tF, mode='spikes', device=device, progress_bar=progress_bar,
         clear_cache=clear_cache, verbose=verbose
         )
-    Wall3 = template_matching.postprocess_templates(
-        Wall, ops, clu, st0, tF, device=device
-        )
+    use_ei = bool(ops['settings'].get('ei_peel', False))
+    E = None
+    if use_ei:
+        # ei_peel: the peel scores and subtracts each unit's EI (full time resolution, all channels), which holds
+        # the axon at its own delay; the PC template cannot (see kilosort/ei_peel.py).
+        from kilosort import ei_peel
+        E, cnt = ei_peel.unit_eis(ops, bfile, st0, clu, int(clu.max()) + 1, 'detect', device=device)
+        ntot0 = np.bincount(np.asarray(clu).astype(np.int64), minlength=E.shape[0])
+        keep, _ = ei_peel.merge_eis(E, torch.as_tensor(ntot0, device=E.device, dtype=torch.float32))
+        E = E[torch.as_tensor(keep, device=E.device)].contiguous()
+        Wall3 = ei_peel.ei_pcs(ops, E)
+        if ops['settings'].get('discover_templates', False):
+            logger.warning('ei_peel: discover_templates is ignored (the peel uses the EIs only)')
+    else:
+        Wall3 = template_matching.postprocess_templates(
+            Wall, ops, clu, st0, tF, device=device
+            )
     # First-pass spike table is only needed for clustering / template postproc.
     # Free it before learned extract allocates another (n_spikes × nC × nPC)
     # buffer — important on 15 GB hosts with dense MEA.
@@ -1165,8 +1179,26 @@ def detect_spikes(ops, device, bfile, tic0=np.nan, progress_bar=None,
     logger.info('-'*40)
     st, tF, ops = template_matching.extract(
         ops, bfile, Wall3, device=device, progress_bar=progress_bar,
-        spike_capacity_hint=int(n_univ_spikes * 1.5) + 10_000,
+        spike_capacity_hint=int(n_univ_spikes * 1.5) + 10_000, ei=E,
         )
+    if use_ei:
+        # update: EIs from the peel's own spikes (each unit's spikes now include the events its old EI won), merge
+        # again, and peel the recording again with them.
+        lab = st[:, 1].astype(np.int64)
+        ntot = np.bincount(lab, minlength=E.shape[0])
+        E2, cnt2 = ei_peel.unit_eis(ops, bfile, st, lab, E.shape[0], 'peel', device=device)
+        few = torch.as_tensor((cnt2 < ei_peel.MIN_SPIKES).cpu().numpy() & (ntot >= ei_peel.MIN_SPIKES), device=E.device)
+        E2[few] = E[few]
+        keep, _ = ei_peel.merge_eis(E2, torch.as_tensor(ntot, device=E.device, dtype=torch.float32))
+        logger.info(f'ei_peel pass 2: {int((ntot == 0).sum())} units won no spike in pass 1; '
+                    f'{int(keep.sum())} of {E.shape[0]} EIs kept')
+        E = E2[torch.as_tensor(keep, device=E.device)].contiguous()
+        del st, tF
+        st, tF, ops = template_matching.extract(
+            ops, bfile, None, device=device, progress_bar=progress_bar,
+            spike_capacity_hint=int(n_univ_spikes * 1.5) + 10_000, ei=E,
+            )
+        Wall3 = ei_peel.ei_pcs(ops, E)
     _trace('stage2_learned', st=st,
            tmain=(Wall3.detach().float().norm(dim=1).argmax(dim=1)
                   if os.environ.get('KILOSORT_TRACE_DIR') else np.zeros(0)))
@@ -1259,8 +1291,13 @@ def cluster_spikes(st, tF, ops, device, bfile, tic0=np.nan, progress_bar=None,
     logger.info(' ')
     logger.info('Merging clusters')
     logger.info('-'*40)
+    E_fin = None
+    if ops['settings'].get('ei_peel', False):
+        # final merge by EI identity (same neuron = same EI shape and size), not by PC-template similarity
+        from kilosort import ei_peel
+        E_fin, _ = ei_peel.unit_eis(ops, bfile, st, clu, Wall.shape[0], 'peel', device=device)
     Wall, clu, is_ref, st, tF = template_matching.merging_function(
-        ops, Wall, clu, st, tF, device=device, check_dt=True
+        ops, Wall, clu, st, tF, device=device, check_dt=True, ei=E_fin
         )
     clu = clu.astype('int32')
     _trace('stage4_merged', st=st, clu=clu)

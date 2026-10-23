@@ -651,6 +651,25 @@ EXTRA_PARAMETERS = {
             """
     },
 
+    'ei_peel': {
+        'gui_name': 'peel with EIs', 'type': bool,
+        'min': None, 'max': None, 'exclude': [], 'default': False,
+        'step': 'spike detection',
+        'description':
+            """
+            Score and subtract each unit's EI (mean whitened waveform on all
+            channels, full time resolution) in the peel instead of its PC
+            template. The PC template cannot hold a waveform that arrives later
+            on distant channels (an axon), so the peel leaves the axon behind
+            and detects it again as a second unit. EIs merge at lagged cosine
+            >= 0.9, are re-estimated from the first peel's spikes, and the
+            recording is peeled a second time. The final merge then joins two
+            units only if their EIs match in shape (lagged cosine >= 0.9) and
+            size (ratio 0.67-1.5) and their spike trains are cross-refractory.
+            Experimental; off by default (stock behaviour).
+            """
+    },
+
     'refractory_merge_veto': {
         'gui_name': 'refractory merge veto', 'type': bool, 'min': None,
         'max': None, 'exclude': [], 'default': True, 'step': 'clustering',

@@ -179,7 +179,12 @@ def prepare_extract(xc, yc, U, nC, position_limit, device=torch.device('cuda')):
 
 
 def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None,
-            spike_capacity_hint=None):
+            spike_capacity_hint=None, ei=None):
+    # ei: optional (n_units, n_chan, nt) full-resolution EIs (kilosort.ei_peel). When given, the peel scores and
+    # subtracts them instead of U, and U is replaced by their PC projection for iU / iCC / features.
+    if ei is not None:
+        from kilosort import ei_peel
+        U = ei_peel.ei_pcs(ops, ei)
     nC = ops['settings']['nearest_chans']
     position_limit = ops['settings']['position_limit']
     iCC, iCC_mask, iU, Ucc = prepare_extract(
@@ -195,7 +200,10 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None,
     wPCA_T = ops['wPCA'].T.contiguous()
     # U is fixed for the whole extract pass: scale, time-domain waveforms, and
     # ctc are batch-invariant. Build both in one pass over U.
-    ctc, match_cache = prepare_matching(ops, U, return_cache=True)
+    if ei is not None:
+        ctc, match_cache = ei_peel.ei_matching(ops, ei)
+    else:
+        ctc, match_cache = prepare_matching(ops, U, return_cache=True)
     dump = _residual_dump_request()
     spike_capacity = get_spike_buffer_capacity(bfile.n_batches)
     # Learned extract often finds a similar spike count to universal detect;
@@ -420,7 +428,7 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=None):
     if unit_cache is None:
         unit_cache = _matching_unit_cache(ops, U)
     s = unit_cache['s']
-    Us = unit_cache['Us']
+    Us = unit_cache.get('Us')
     U_time = unit_cache['U_time']
     W = unit_cache['W']
     # Windows are nt/device-fixed; older callers may pass a partial cache.
@@ -435,8 +443,13 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda'), unit_cache=None):
     lam = float(ops.get('lam', 0))
     use_lam = lam > 0
 
-    B = conv1d(X.unsqueeze(1), W.unsqueeze(1), padding=nt//2)
-    B = torch.einsum('ijk, kjl -> il', Us, B)
+    if 'Es' in unit_cache:
+        # ei_peel: full-resolution waveforms, B[i, t] = <X[:, t - nt//2 : t + nt//2 + 1], E_i> / |E_i|
+        with torch.backends.cudnn.flags(enabled=True, allow_tf32=False):
+            B = conv1d(X.unsqueeze(0), unit_cache['Es'], padding=nt//2)[0]
+    else:
+        B = conv1d(X.unsqueeze(1), W.unsqueeze(1), padding=nt//2)
+        B = torch.einsum('ijk, kjl -> il', Us, B)
 
     if use_lam:
         mu = 1.0 / s
@@ -554,8 +567,17 @@ def physical_template_similarity(wa, wb, whitening_inv, W, WtW=None,
 
 
 def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=True,
-                     device=torch.device('cuda'), max_sweeps=None):
+                     device=torch.device('cuda'), max_sweeps=None, ei=None):
+    # ei: optional (n_units, n_chan, nt) EIs of these clusters (kilosort.ei_peel.unit_eis). In 'ccg' mode a pair is
+    # then a candidate only if it is one neuron by its EI -- lagged EI cosine >= ei_peel.MERGE_COS and EI size ratio
+    # 0.67-1.5 -- before the CCG test, instead of PC-template similarity >= r_thresh.
     clu2 = clu.copy()
+    use_ei = ei is not None and mode == 'ccg'
+    if use_ei:
+        from kilosort import ei_peel
+        E_m = ei.to(device).clone()
+        ei_nrm = (E_m ** 2).sum((1, 2)).sqrt()
+        ei_sim = ei_peel._xcorr(E_m, reduce_max=True) / (ei_nrm[:, None] * ei_nrm[None, :] + 1e-12)
 
     Ww = Wall.to(device)
     NN = len(Ww)
@@ -734,6 +756,10 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
         ctc = torch.einsum('jkm, kml -> jl', UtU, WtW)
 
         cmax, imax = ctc.max(1)
+        if use_ei:
+            # EI identity replaces template similarity; EIs are trough-aligned, so a merge needs no time shift
+            cmax = ei_sim[kk].clone()
+            imax = torch.full_like(imax, int(imax[kk].item()))
         cmax[kk] = 0
 
         jsort = np.argsort(cmax.cpu().numpy())[::-1]
@@ -744,8 +770,12 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
         is_ccg  = 0
         for j in range(NN):
             jj = jsort[j]
-            if cmax[jj] < r_thresh:
+            if cmax[jj] < (ei_peel.MERGE_COS if use_ei else r_thresh):
                 break
+            if use_ei:
+                ratio = float(ei_nrm[jj].item() / max(ei_nrm[kk].item(), 1e-9))
+                if not (0.67 <= ratio <= 1.5):
+                    continue
             # compare with CCG
             if mode == 'ccg':
                 # Merged-away / empty labels may be missing from spike_idx
@@ -844,6 +874,12 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
                     times_sorted = False
                 
                 denom = ns[kk] + ns[jj]
+                if use_ei and denom > 0:
+                    E_m[kk] = (ns[kk] * E_m[kk] + ns[jj] * E_m[jj]) / denom
+                    E_m[jj] = 0
+                    ei_nrm[kk] = (E_m[kk] ** 2).sum().sqrt(); ei_nrm[jj] = 0
+                    row = ei_peel._xcorr_row(E_m, kk) / (ei_nrm[kk] * ei_nrm + 1e-12)
+                    ei_sim[kk] = row; ei_sim[:, kk] = row; ei_sim[jj] = 0; ei_sim[:, jj] = 0
                 if denom > 0:
                     Ww[kk] = ns[kk]/denom * Ww[kk] + ns[jj]/denom * Ww[jj]
                 Ww[jj] = 0
