@@ -1342,6 +1342,13 @@ def cluster_spikes(st, tF, ops, device, bfile, tic0=np.nan, progress_bar=None,
         logger.info(f'{clu.max()+1} units after coincidence merge, '
                     f'in {elapsed2:.2f}s')
 
+    # A unit that is the sum of two neighbouring units is their collisions,
+    # recorded as one spike each. Give those spikes back to the pair.
+    from kilosort import collision_templates
+    Wall, clu, st, tF = collision_templates.resolve_collision_units(
+        ops, Wall, clu, st, tF)
+    _trace('stage6_collision_units', st=st, clu=clu)
+
     log_cuda_details(logger)
     log_performance(logger, 'info', 'Resource usage after clustering',
                     reset=True)

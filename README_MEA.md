@@ -77,6 +77,7 @@ python tools/run_full_sort.py --data chunk.bin --results-dir out/kilosort4 --pro
 | `KILOSORT_NO_<X>=1`, X = `FUSED_DETECT`, `FUSED_PEEL`, `FUSED_PEAKS`, `FAST_KPP`, `KPP_GRAPH`, `PEEL_COND`, `PEEL_STORE`, `PEEL_LUT`, `COMPILE` | Turn one GPU speed-up off. The output stays the same. |
 | `KILOSORT_NO_SLIDING_COINCIDENCE=1` | Coincidence pass counts shared spikes in the fixed lag bins used before 2026-11-10 (they missed zero-lag copies at 20 kHz). Changes the output. |
 | `KILOSORT_NO_VETO_DEDUP=1` | Refractory veto counts double detections as violations, as before 2026-11-10 (it split one neuron in two). Changes the output. |
+| `KILOSORT_NO_COLLISION_UNITS=1` | Skip the final step that gives the spikes of a summed (collision) unit back to its two neurons. Changes the output. |
 | `KILOSORT_TRACE_DIR=dir` | Save the spike table after each sorter stage. |
 | `KS4_DUMP_RESIDUAL=dir:batches` | Save the peel residual for the given batches. |
 
