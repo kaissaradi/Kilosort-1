@@ -219,6 +219,10 @@ REFRAC_VETO = True
 # these two the obvious next measurement.
 REFRAC_VETO_RATIO = 0.35
 REFRAC_VETO_ALPHA = 0.01
+# Spikes closer than this (seconds) to the previous one are double detections,
+# not violations: the veto ignores them. Matches the `duplicate_spike_ms`
+# default; clustering_qr passes the run's own value. Not a user setting.
+REFRAC_VETO_DUP = 0.00025
 
 
 def _impossible(obs, exp, ratio=REFRAC_VETO_RATIO, alpha=REFRAC_VETO_ALPHA):
@@ -236,18 +240,30 @@ def _impossible(obs, exp, ratio=REFRAC_VETO_RATIO, alpha=REFRAC_VETO_ALPHA):
     return obs >= ratio * exp and poisson.sf(obs - 1, exp) < alpha
 
 
-def _rvi(st, refrac=0.0015):
+def _rvi(st, refrac=0.0015, dup=0.0):
     """Sub-refractory ISI count and its chance expectation for one train.
 
     Same convention as the GT-free contamination metric: a train whose observed
     count sits well above the rate-matched expectation holds more than one
     neuron. Returned raw so the audit, not this function, decides the bar.
+
+    ``dup`` (seconds) first drops every spike closer than that to the spike
+    before it, which is what the export's same-cluster duplicate removal
+    (``duplicate_spike_ms``) will do to this train anyway. Without it, one
+    neuron detected twice at a sub-``dup`` offset looks like thousands of
+    violations; the veto then splits it into a unit plus a fragment of
+    re-detections, and the export cannot rejoin them because its duplicate
+    removal only works inside one cluster. ``dup=0`` is the original count.
     """
     st = np.asarray(st)
+    if st.size < 50:
+        return int(st.size), 0, 0.0
+    st = np.sort(st)
+    if dup > 0:
+        st = st[np.concatenate(([True], np.diff(st) >= dup))]
     n = int(st.size)
     if n < 50:
         return n, 0, 0.0
-    st = np.sort(st)
     T = float(st[-1] - st[0])
     if T <= 0:
         return n, 0, 0.0
@@ -431,7 +447,8 @@ def refractoriness(st1, st2, assume_sorted=False,
 def split(Xd, xtree, tstat, iclust, my_clus, verbose = False, meta = None,
           meta_sorted=True, split_ccg_threshold=SPLIT_CCG_THRESHOLD,
           refrac_veto=REFRAC_VETO, refrac_veto_ratio=REFRAC_VETO_RATIO,
-          refrac_veto_alpha=REFRAC_VETO_ALPHA):
+          refrac_veto_alpha=REFRAC_VETO_ALPHA,
+          refrac_veto_dup=REFRAC_VETO_DUP):
     xtree = np.array(xtree)
     iclust = np.asarray(iclust)
 
@@ -497,7 +514,7 @@ def split(Xd, xtree, tstat, iclust, my_clus, verbose = False, meta = None,
         # into a split, so it can add fragments but never fuse anything.
         if (refrac_veto and criterion == 1 and meta is not None
                 and ix1 is not None):
-            _, _uo, _ue = _rvi(meta[ix1 | ix2])
+            _, _uo, _ue = _rvi(meta[ix1 | ix2], dup=refrac_veto_dup)
             if _impossible(_uo, _ue, refrac_veto_ratio, refrac_veto_alpha):
                 criterion = -1
                 gate = 'refrac'

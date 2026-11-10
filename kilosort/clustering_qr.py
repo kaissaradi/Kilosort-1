@@ -716,6 +716,13 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
         'refractory_veto_ratio', swarmsplitter.REFRAC_VETO_RATIO))
     refrac_veto_alpha = float(ops['settings'].get(
         'refractory_veto_alpha', swarmsplitter.REFRAC_VETO_ALPHA))
+    # The veto ignores double detections the export deletes anyway, using the
+    # same window as that export step. Not a setting. The check-only switch
+    # KILOSORT_NO_VETO_DEDUP=1 restores the old count (every interval).
+    refrac_veto_dup = float(ops['settings'].get(
+        'duplicate_spike_ms', swarmsplitter.REFRAC_VETO_DUP * 1000)) / 1000.0
+    if os.environ.get('KILOSORT_NO_VETO_DEDUP'):
+        refrac_veto_dup = 0.0
 
     def _postprocess(Xd, iclust, iclust0, M, st0, snaps, iclust_init_np,
                      igood, ichan):
@@ -740,7 +747,8 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
             split_ccg_threshold=split_ccg_thresh,
             refrac_veto=refrac_veto,
             refrac_veto_ratio=refrac_veto_ratio,
-            refrac_veto_alpha=refrac_veto_alpha)
+            refrac_veto_alpha=refrac_veto_alpha,
+            refrac_veto_dup=refrac_veto_dup)
         iclust = swarmsplitter.new_clusters(iclust, my_clus, xtree, tstat)
 
         if st0 is not None and os.environ.get('KS4_SPLIT_STATS'):

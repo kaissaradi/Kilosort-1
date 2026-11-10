@@ -758,3 +758,39 @@ def test_robust_covariance_agrees_with_stock_on_clean_data():
     Wrot_robust = preprocessing.whitening_local(
         CC_robust, xc, yc, nrange=n_chan, device=torch.device('cpu'))
     torch.testing.assert_close(Wrot_plain, Wrot_robust, rtol=0.05, atol=0.05)
+
+
+def _double_detected_node(seed=0, frac=0.3):
+    """One refractory neuron, 30 % of its spikes detected twice 2 samples on."""
+    rng = np.random.default_rng(seed)
+    a = np.cumsum(rng.uniform(0.004, 0.02, 4000))
+    b = a[rng.random(a.size) < frac] + 2 / 20_000
+    meta = np.concatenate([a, b])
+    iclust = np.concatenate([np.zeros(a.size, int), np.ones(b.size, int)])
+    xtree = np.array([[0, 1, 2]], dtype=np.int32)
+    tstat = np.array([[1.0, 2.0, 1.0]], dtype=np.float32)
+    my_clus = [[0], [1], [0, 1]]
+    Xd = np.zeros((meta.size, 2), dtype=np.float32)
+    return Xd, xtree, tstat, iclust, my_clus, meta
+
+
+def test_veto_does_not_split_off_double_detections():
+    """Re-detections of one neuron are export duplicates, not a second cell."""
+    Xd, xtree, tstat, iclust, my_clus, meta = _double_detected_node()
+    kept = swarmsplitter.split(Xd, xtree, tstat, iclust, my_clus, meta=meta,
+                               meta_sorted=False, refrac_veto=True)
+    assert kept[0].shape[0] == 0, 'the neuron must stay one unit'
+    legacy = swarmsplitter.split(Xd, xtree, tstat, iclust, my_clus, meta=meta,
+                                 meta_sorted=False, refrac_veto=True,
+                                 refrac_veto_dup=0.0)
+    assert legacy[0].shape[0] == 1, 'dup=0 reproduces the old over-split'
+
+
+def test_rvi_dup_window_only_removes_sub_window_intervals():
+    rng = np.random.default_rng(2)
+    a = np.cumsum(rng.uniform(0.004, 0.02, 4000))
+    # shifted by 0.7 ms: real violations, outside the duplicate window
+    st = np.concatenate([a, a + 0.0007])
+    assert swarmsplitter._rvi(st, dup=0.00025)[1] == swarmsplitter._rvi(st)[1]
+    # a clean train is untouched
+    assert swarmsplitter._rvi(a, dup=0.00025) == swarmsplitter._rvi(a)

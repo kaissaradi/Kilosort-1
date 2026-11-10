@@ -1469,3 +1469,64 @@ def test_coincidence_drop_only_can_preserve_the_cleaner_smaller_unit(monkeypatch
     units = {u: np.sort(t[clu_d == u]) for u in np.unique(clu_d)}
     assert any(np.array_equal(v, clean) for v in units.values())
     assert any(np.array_equal(v, b) for v in units.values())
+
+
+# ---- sliding lag window (the fixed 20 kHz bin grid split zero-lag copies) ----
+
+def _jittered_copy(seed, n=2000, jitter=2, offset=0, fs=20_000):
+    rng = np.random.default_rng(seed)
+    a = np.sort(rng.choice(np.arange(1000, 60 * fs), n, replace=False))
+    b = a + offset + rng.integers(-jitter, jitter + 1, n)
+    return a.astype(np.int64), np.sort(b).astype(np.int64)
+
+
+@pytest.mark.parametrize('fs', [20_000, 30_000])
+@pytest.mark.parametrize('offset', [-12, -6, -1, 0, 1, 5, 10, 21])
+def test_peak_shared_fraction_finds_a_jittered_copy_at_any_lag(fs, offset):
+    """A ±2-sample jittered copy is a full duplicate wherever its lag falls."""
+    a, b = _jittered_copy(0, offset=offset, fs=fs)
+    frac, lag = _peak_shared_fraction(a, b, fs=fs)
+    assert frac >= 0.99
+    assert abs(round(lag * fs) - offset) <= 2
+
+
+def test_peak_shared_fraction_fixed_grid_missed_the_zero_lag_copy():
+    """Documents the defect that sliding=False preserves (20 kHz only)."""
+    a, b = _jittered_copy(0)
+    legacy, _ = _peak_shared_fraction(a, b, fs=20_000, sliding=False)
+    assert legacy < 0.90
+    fixed, _ = _peak_shared_fraction(a, b, fs=20_000)
+    assert fixed >= 0.99
+
+
+@pytest.mark.parametrize('seed', range(5))
+def test_peak_shared_fraction_is_symmetric_under_swap(seed):
+    """keep_cleaner calls the kernel reversed; both calls must agree."""
+    rng = np.random.default_rng(seed)
+    a, b = _jittered_copy(seed, offset=int(rng.integers(-30, 31)), jitter=3)
+    b = b[rng.random(len(b)) > 0.2]          # b misses 20 % of the spikes
+    f_ab, lag_ab = _peak_shared_fraction(a, b, fs=20_000)
+    f_ba, lag_ba = _peak_shared_fraction(b, a, fs=20_000)
+    assert f_ab == pytest.approx(f_ba, abs=0.01)
+    assert lag_ab == pytest.approx(-lag_ba, abs=1.5 / 20_000)
+
+
+def test_peak_shared_fraction_sliding_leaves_independent_trains_low():
+    rng = np.random.default_rng(3)
+    a = np.sort(rng.choice(np.arange(60 * 20_000), 3000, replace=False))
+    b = np.sort(rng.choice(np.arange(60 * 20_000), 3000, replace=False))
+    frac, _ = _peak_shared_fraction(a.astype(np.int64), b.astype(np.int64),
+                                    fs=20_000)
+    assert frac < 0.10
+
+
+@pytest.mark.parametrize('fs', [20_000, 30_000])
+def test_coincidence_prefilter_is_a_superset_of_the_sliding_matcher(fs):
+    """Every lag the adjudicator can accept must reach it as a candidate."""
+    base = np.arange(1_000, 301_000, 300, dtype=np.int64)
+    window = int(0.002 * fs) + int(0.00025 * fs)
+    for offset in range(-window, window + 1):
+        frac, _ = _peak_shared_fraction(base, base + offset, fs=fs)
+        assert frac == 1.0
+        assert (4, 9) in _coincidence_candidate_pairs(
+            {4: base, 9: base + offset}, fs=fs, frac_thresh=0.90)

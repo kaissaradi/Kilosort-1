@@ -935,22 +935,118 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
 
 
 def _peak_shared_fraction_with_matches(st_a, st_b, fs, maxlag_s=0.002,
-                                       halfbin_s=0.00025):
+                                       halfbin_s=0.00025, sliding=None):
     """Fraction of the smaller train sharing spikes at the CCG peak lag.
 
-    Searches all lags within ±maxlag_s and returns the highest bin count
-    divided by min(len(a), len(b)). The final count is one-to-one: a spike
-    from either train can contribute at most once. Spike times are in SAMPLES
-    (int64).
+    Searches all lags within ±(maxlag_s + halfbin_s) and returns the highest
+    one-to-one count inside a lag window ``2 * halfbin + 1`` samples wide,
+    divided by min(len(a), len(b)). A spike from either train can contribute
+    at most once. Spike times are in SAMPLES (int64).
+
+    The window is placed wherever the count is highest. There is no setting
+    for this. ``sliding=False`` (or the check-only environment switch
+    ``KILOSORT_NO_SLIDING_COINCIDENCE=1``) reproduces the original fixed grid,
+    whose bin edges depend on the sampling rate: at 20 kHz a bin edge falls
+    between lags -2 and -1, so a zero-lag duplicate with ±2 samples of jitter
+    was split across two bins and scored ~0.79 instead of 1.0, and the score
+    changed when the two trains were swapped. Kept only so old sorts can be
+    reproduced.
     """
     if len(st_a) == 0 or len(st_b) == 0:
         return 0.0, 0.0, np.zeros(len(st_b), dtype=bool)
     maxlag = int(maxlag_s * fs)
     halfbin = int(halfbin_s * fs)
-    frac, best_lag, matched_b = _peak_shared_fraction_kernel(
+    if sliding is None:
+        sliding = not os.environ.get('KILOSORT_NO_SLIDING_COINCIDENCE')
+    kernel = (_peak_shared_fraction_sliding_kernel if sliding
+              else _peak_shared_fraction_kernel)
+    frac, best_lag, matched_b = kernel(
         np.asarray(st_a, dtype=np.int64), np.asarray(st_b, dtype=np.int64),
         maxlag, halfbin)
     return float(frac), float(best_lag / fs), matched_b
+
+
+@njit(cache=True)
+def _peak_shared_fraction_sliding_kernel(st_a, st_b, maxlag, halfbin):
+    """Peak shared fraction with a sliding (not fixed-grid) lag window.
+
+    1. Count every a-b pair per exact sample lag in [-window, window].
+    2. Slide a ``width``-sample window over those counts and keep the one
+       with the most pairs. Ties go to the window best centred on its own
+       pairs, then to the smaller absolute lag, so the choice mirrors
+       exactly when the two trains are swapped.
+    3. Inside that window pick the exact sample lag with the most pairs (the
+       committed shift) and match one-to-one, as the fixed-grid kernel does.
+    """
+    width = 2 * halfbin + 1
+    window = maxlag + halfbin
+    n_lags = 2 * window + 1
+    lag_counts = np.zeros(n_lags, dtype=np.int64)
+    has_pairs = False
+    for a in st_a:
+        lo = np.searchsorted(st_b, a - window, side='left')
+        hi = np.searchsorted(st_b, a + window, side='right')
+        for j in range(lo, hi):
+            lag_counts[st_b[j] - a + window] += 1
+            has_pairs = True
+
+    if not has_pairs:
+        return 0.0, 0, np.zeros(len(st_b), dtype=np.bool_)
+
+    n_starts = max(n_lags - width + 1, 1)
+    best_start = 0
+    best_total = -1
+    best_offcentre = 0.0
+    best_abs_centre = 0.0
+    for start in range(n_starts):
+        total = 0
+        moment = 0
+        stop = min(start + width, n_lags)
+        for i in range(start, stop):
+            total += lag_counts[i]
+            moment += lag_counts[i] * (i - window)
+        if total < best_total or total == 0:
+            continue
+        centre = start - window + (width - 1) / 2.0
+        offcentre = abs(moment / total - centre)
+        abs_centre = abs(centre)
+        if (total > best_total or
+                offcentre < best_offcentre - 1e-9 or
+                (abs(offcentre - best_offcentre) <= 1e-9 and
+                 abs_centre < best_abs_centre)):
+            best_total = total
+            best_start = start
+            best_offcentre = offcentre
+            best_abs_centre = abs_centre
+
+    lag_lo = best_start - window
+    lag_hi = lag_lo + width          # exclusive
+    midpoint = lag_lo + (width - 1) / 2.0
+
+    best_count = -1
+    best_lag = lag_lo
+    for lag in range(lag_lo, min(lag_hi, window + 1)):
+        count = lag_counts[lag + window]
+        distance = abs(lag - midpoint)
+        best_distance = abs(best_lag - midpoint)
+        if (count > best_count or
+                (count == best_count and distance < best_distance) or
+                (count == best_count and distance == best_distance and
+                 abs(lag) < abs(best_lag))):
+            best_count = count
+            best_lag = lag
+
+    matched_b = np.zeros(len(st_b), dtype=np.bool_)
+    j = 0
+    matched = 0
+    for a in st_a:
+        while j < len(st_b) and st_b[j] - a < lag_lo:
+            j += 1
+        if j < len(st_b) and st_b[j] - a < lag_hi:
+            matched += 1
+            matched_b[j] = True
+            j += 1
+    return matched / max(min(len(st_a), len(st_b)), 1), best_lag, matched_b
 
 
 @njit(cache=True)
@@ -1034,11 +1130,28 @@ def _peak_shared_fraction_kernel(st_a, st_b, maxlag, halfbin):
     return matched / max(min(len(st_a), len(st_b)), 1), best_lag, matched_b
 
 
-def _peak_shared_fraction(st_a, st_b, fs, maxlag_s=0.002, halfbin_s=0.00025):
+def _peak_shared_fraction(st_a, st_b, fs, maxlag_s=0.002, halfbin_s=0.00025,
+                          sliding=None):
     """Compatibility wrapper returning only fraction and lag."""
     frac, lag, _ = _peak_shared_fraction_with_matches(
-        st_a, st_b, fs, maxlag_s=maxlag_s, halfbin_s=halfbin_s)
+        st_a, st_b, fs, maxlag_s=maxlag_s, halfbin_s=halfbin_s,
+        sliding=sliding)
     return frac, lag
+
+
+def _coincidence_vote_edges(maxlag, halfbin):
+    """Broad vote-bin edges that cover every lag in ±(maxlag + halfbin).
+
+    The old ``np.arange(-w, w + 1, width)`` stopped at the last whole bin, so
+    the top few lags (44-45 samples at 20 kHz, 54-67 at 30 kHz) had no bin.
+    Any ``width``-sample window lies inside two neighbouring bins here, so
+    "best single bin or best neighbouring pair" is a superset of what the
+    sliding adjudicator can accept.
+    """
+    width = 2 * halfbin + 1
+    window = maxlag + halfbin
+    n_bins = -(-(2 * window + 1) // width)
+    return -window + width * np.arange(n_bins + 1)
 
 
 @njit(cache=True)
@@ -1143,8 +1256,7 @@ def _coincidence_candidate_partners(target_label, target_times,
     order = np.argsort(other_times, kind='stable')
     other_times = other_times[order]
     other_labels = other_labels[order]
-    edges = np.arange(-maxlag - halfbin, maxlag + halfbin + 1,
-                      2 * halfbin + 1)
+    edges = _coincidence_vote_edges(maxlag, halfbin)
     counts = _coincidence_target_vote_counts(
         np.asarray(target_times, dtype=np.int64), other_times, other_labels,
         target_index, len(label_values), maxlag, halfbin, len(edges) - 1)
@@ -1210,8 +1322,7 @@ def _coincidence_candidate_pairs(cluster_times, fs, frac_thresh,
         min(len(cluster_times[k]), int(max_samples_per_cluster))
         if max_samples_per_cluster is not None else len(cluster_times[k])
         for k in labels], dtype=np.int64)
-    edges = np.arange(-maxlag - halfbin, maxlag + halfbin + 1,
-                      2 * halfbin + 1)
+    edges = _coincidence_vote_edges(maxlag, halfbin)
     counts = _coincidence_vote_counts(
         all_times, label_indices, cluster_sizes, len(label_values), maxlag,
         halfbin, len(edges) - 1)
