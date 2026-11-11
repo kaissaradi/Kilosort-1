@@ -67,7 +67,7 @@ def _present(tc, tu, shift):
     return float(near.mean())
 
 
-def find_collision_templates(waveforms, positions, trains):
+def find_collision_templates(waveforms, positions, trains, near_misses=None):
     """Indices of collision templates, with the pair that explains each.
 
     waveforms : (n_units, nt, n_channels) array, one common amplitude unit.
@@ -76,6 +76,8 @@ def find_collision_templates(waveforms, positions, trains):
 
     Returns a list of dicts: unit, a, b, shift_a, shift_b, r2, r2_single, n.
     shift_x is where unit x's spike lies relative to C's spike time.
+    near_misses : optional list; units whose best pair fit reaches R2 >= 0.80
+    but which fail a rule are appended to it with the rule, for diagnosis.
     """
     wf = np.asarray(waveforms, dtype=np.float64)
     n_units = wf.shape[0]
@@ -113,14 +115,24 @@ def find_collision_templates(waveforms, positions, trains):
         r2 = np.where(ok, (wi * g[:, None] + wj * g[None, :]) / yy, -1.0)
         i, j = np.unravel_index(int(r2.argmax()), r2.shape)
         best = float(r2[i, j])
-        if best < R2_MIN or best - r1 < GAIN:
+        if best < 0.80:
             continue
         a, b = int(nb[owner[i]]), int(nb[owner[j]])
         sa, sb = int(shift_of[i]), int(shift_of[j])
-        if (_present(trains[c], trains[a], sa) < PRESENT
-                and _present(trains[c], trains[b], sb) < PRESENT):
-            found.append(dict(unit=int(c), a=a, b=b, shift_a=sa, shift_b=sb,
-                              r2=best, r2_single=r1, n=int(counts[c])))
+        row = dict(unit=int(c), a=a, b=b, shift_a=sa, shift_b=sb,
+                   r2=best, r2_single=r1, n=int(counts[c]))
+        if best < R2_MIN:
+            why = 'r2'
+        elif best - r1 < GAIN:
+            why = 'gain'
+        elif not (_present(trains[c], trains[a], sa) < PRESENT
+                  and _present(trains[c], trains[b], sb) < PRESENT):
+            why = 'present'
+        else:
+            found.append(row)
+            continue
+        if near_misses is not None:
+            near_misses.append(dict(row, failed=why))
     return found
 
 
@@ -154,12 +166,20 @@ def resolve_collision_units(ops, Wall, clu, st, tF):
     trains = [np.sort(times[r]) for r in rows]
     W = ops['wPCA'].to(Wall.device).float()
     wf = torch.einsum('icp,pt->itc', torch.nan_to_num(Wall.float()), W)
+    # The fit uses the whitened waveforms as they are. A fit on unwhitened
+    # waveforms was tried (2026-11-10): it caught no further known collision
+    # unit on the hybrids and resolved 3 more units on recordings without
+    # forced collisions, which could not be verified. Not adopted.
     positions = np.stack([np.asarray(ops['xc']), np.asarray(ops['yc'])], axis=1)
-    found = find_collision_templates(wf.cpu().numpy(), positions, trains)
+    near = []
+    found = find_collision_templates(wf.cpu().numpy(), positions, trains,
+                                     near_misses=near)
     # A unit named as a member of one pair cannot itself be resolved away.
     members = {f['a'] for f in found} | {f['b'] for f in found}
+    near += [dict(f, failed='member') for f in found if f['unit'] in members]
     found = [f for f in found if f['unit'] not in members]
     ops['collision_units'] = found
+    ops['collision_near_misses'] = near
     if not found:
         logger.info('collision units: none found')
         return Wall, clu, st, tF
